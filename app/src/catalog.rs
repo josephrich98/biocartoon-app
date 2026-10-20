@@ -25,11 +25,14 @@ pub enum Req {
     /// Icon counts of every category and subcategory of `crate::taxonomy::TAXONOMY`.
     Taxonomy { sources: Vec<String> },
     Sources,
-    Variants { source: String, title: String },
+    /// Style presets of the asset with this id.
+    Variants { id: String },
     /// The rows with these ids (to fill in credits of documents saved before they were stored).
     Lookup { ids: Vec<String> },
     /// Record a user-generated asset (already written to `png_local`).
     InsertUser { row: AssetRow },
+    /// Take one of the user's own assets back out of the local catalog.
+    RemoveUser { id: String },
     /// An asset was placed on a canvas; feeds `IconSort::Popular`.
     RecordUse { source: String, title: String },
     /// Star counts the Worker reported (or the user's own click, ahead of the Worker's answer);
@@ -47,6 +50,7 @@ pub enum Resp {
     Variants { req_id: u64, rows: Vec<AssetRow> },
     Lookup { req_id: u64, rows: Vec<AssetRow> },
     Inserted { req_id: u64, result: Result<(), String> },
+    Removed { req_id: u64, result: Result<(), String> },
     /// Reply to requests with nothing to report.
     Done { req_id: u64 },
     Error { req_id: u64, message: String },
@@ -127,7 +131,7 @@ fn handle(w: &Worker, req_id: u64, req: Req) -> Resp {
             Ok(sources) => Resp::Sources { req_id, sources },
             Err(e) => err(e),
         },
-        Req::Variants { source, title } => match w.variants(&source, &title) {
+        Req::Variants { id } => match w.variants(&id) {
             Ok(rows) => Resp::Variants { req_id, rows },
             Err(e) => err(e),
         },
@@ -136,6 +140,7 @@ fn handle(w: &Worker, req_id: u64, req: Req) -> Resp {
             Err(e) => err(e),
         },
         Req::InsertUser { row } => Resp::Inserted { req_id, result: w.insert_user(&row).map_err(|e| e.to_string()) },
+        Req::RemoveUser { id } => Resp::Removed { req_id, result: w.remove_user(&id).map(|_| ()).map_err(|e| e.to_string()) },
         Req::RecordUse { source, title } => {
             if let Err(e) = w.record_use(&source, &title) {
                 log::warn!("record use: {e}");

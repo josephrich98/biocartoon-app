@@ -245,8 +245,8 @@ pub struct IconsState {
     pub mode: IconsMode,
     pub query: String,
     pub last_sent_query: String,
-    /// Search: the one database to search, or all.
-    pub source_filter: Option<String>,
+    /// Search: the databases to search; empty searches them all.
+    pub source_filter: Vec<String>,
     pub results: Vec<AssetRow>,
     /// How many colours the `results` that come in several have, by result id (the others are
     /// picked in Edit once one is placed).
@@ -259,10 +259,10 @@ pub struct IconsState {
     pub db: Option<String>,
     pub db_cat: Option<Pick>,
     /// Browse categories: one of BioCartoon's categories, then a subcategory
-    /// (see `crate::taxonomy`), and the one database to show, or all.
+    /// (see `crate::taxonomy`), and the databases to show (empty shows them all).
     pub taxon_cat: Option<Pick>,
     pub taxon_sub: Option<Pick>,
-    pub taxon_filter: Option<String>,
+    pub taxon_filter: Vec<String>,
     pub taxa: Option<Vec<TaxonCount>>,
     pub taxa_req: u64,
     pub browse_offset: usize,
@@ -280,7 +280,7 @@ impl Default for IconsState {
             mode: IconsMode::Home,
             query: String::new(),
             last_sent_query: "\u{0}".into(),
-            source_filter: None,
+            source_filter: Vec::new(),
             results: Vec::new(),
             colors: HashMap::new(),
             results_req: 0,
@@ -290,7 +290,7 @@ impl Default for IconsState {
             db_cat: None,
             taxon_cat: None,
             taxon_sub: None,
-            taxon_filter: None,
+            taxon_filter: Vec::new(),
             taxa: None,
             taxa_req: 0,
             browse_offset: 0,
@@ -441,6 +441,8 @@ pub enum Action {
     InsertAsset(AssetRow),
     /// Add or remove this install's star on an asset.
     ToggleStar(AssetRow),
+    /// Remove one of the user's own assets from their library (its PNG stays on disk).
+    RemoveUserAsset(AssetRow),
     InsertFile(PathBuf),
     InsertText { text: String, size: f32, bold: bool },
     /// Arm (or disarm) the Text tool: the next click on the canvas places a text box.
@@ -1557,9 +1559,9 @@ impl BioCartoon {
                         crate::credits::fill(d.slides.iter_mut(), &rows);
                     }
                 }
-                Resp::Inserted { result, .. } => match result {
+                Resp::Inserted { result, .. } | Resp::Removed { result, .. } => match result {
                     Ok(()) => {
-                        // Counts changed; the new asset may also belong in what's on screen.
+                        // Counts changed; the asset may also belong in (or leave) what's on screen.
                         self.icons.categories.remove("user");
                         self.catalog.send(Req::Sources);
                         self.icons.taxa = None;
@@ -1571,7 +1573,7 @@ impl BioCartoon {
                             self.request_browse();
                         }
                     }
-                    Err(e) => self.toast_err(format!("upload failed: {e}")),
+                    Err(e) => self.toast_err(format!("library update failed: {e}")),
                 },
                 Resp::Done { .. } => {}
                 Resp::Error { req_id, message } => {
@@ -1650,7 +1652,7 @@ impl BioCartoon {
 
     /// Load (or, past offset 0, extend) the results of the current search.
     fn request_search_page(&mut self) {
-        let sources = self.icons.source_filter.clone().map(|s| vec![s]).unwrap_or_default();
+        let sources = self.icons.source_filter.clone();
         self.icons.loading = true;
         self.icons.results_req = self.catalog.send(Req::Search {
             query: self.icons.query.clone(),
@@ -1686,7 +1688,7 @@ impl BioCartoon {
                 Req::BrowseTaxon {
                     cat: name(&self.icons.taxon_cat),
                     sub: name(&self.icons.taxon_sub),
-                    sources: self.icons.taxon_filter.clone().into_iter().collect(),
+                    sources: self.icons.taxon_filter.clone(),
                     offset,
                     limit: RESULTS_PAGE,
                     sort,
@@ -1705,7 +1707,7 @@ impl BioCartoon {
     /// Ask for the icon counts of BioCartoon's categories under the current database filter.
     pub fn request_taxa(&mut self) {
         self.icons.taxa = None;
-        self.icons.taxa_req = self.catalog.send(Req::Taxonomy { sources: self.icons.taxon_filter.clone().into_iter().collect() });
+        self.icons.taxa_req = self.catalog.send(Req::Taxonomy { sources: self.icons.taxon_filter.clone() });
     }
 
     /// Re-run whatever produced the current results (after the sort order changed).
@@ -1719,14 +1721,14 @@ impl BioCartoon {
         }
     }
 
-    pub fn request_variants(&mut self, source: &str, title: &str) {
-        let key = format!("{source}\u{1}{title}");
-        if self.variants_for.as_deref() == Some(&key) {
+    pub fn request_variants(&mut self, id: &str) {
+        // Picking a preset swaps to an id already in the strip: keep it rather than reload.
+        if self.variants_for.as_deref() == Some(id) || self.variants.iter().any(|v| v.id == id) {
             return;
         }
-        self.variants_for = Some(key);
+        self.variants_for = Some(id.into());
         self.variants.clear();
-        self.variants_req = self.catalog.send(Req::Variants { source: source.into(), title: title.into() });
+        self.variants_req = self.catalog.send(Req::Variants { id: id.into() });
     }
 
     // ---------- generate / upload ----------
@@ -2906,6 +2908,16 @@ impl BioCartoon {
         match a {
             Action::InsertAsset(row) => self.insert_asset(&row),
             Action::ToggleStar(row) => self.toggle_star(&row),
+            Action::RemoveUserAsset(row) => {
+                // Out of the results now; the reply refreshes counts and browse views.
+                let before = self.icons.results.len();
+                self.icons.results.retain(|r| r.id != row.id);
+                if self.icons.results.len() < before {
+                    self.icons.total = self.icons.total.map(|n| (n - 1).max(0));
+                }
+                self.catalog.send(Req::RemoveUser { id: row.id.clone() });
+                self.toast(format!("Removed \"{}\" from your library", row.title));
+            }
             Action::InsertFile(p) => self.insert_file(&p),
             Action::InsertText { text, size, bold } => {
                 let id = self.doc.alloc_id();
@@ -4127,6 +4139,7 @@ impl BioCartoon {
                         self.icons.mode = IconsMode::Databases;
                         self.icons.db = Some(theme::BIOCARTOON_SOURCE.into());
                         self.icons.db_cat = None;
+                        self.catalog.send(crate::catalog::Req::Categories { source: theme::BIOCARTOON_SOURCE.into() });
                     }
                     "savetemplate" => self.open_upload_dialog(self.template_target(self.cur_slide)),
                     "aisetup" => self.open_ai_setup(None),

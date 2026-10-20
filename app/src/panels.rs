@@ -154,8 +154,9 @@ impl BioCartoon {
     /// Every database, BioCartoon's own included, as (source, abbreviation, name), in order of
     /// abbreviation.
     fn databases(&self) -> Vec<(String, &'static str, String)> {
+        // BioCartoon is listed even before it has icons: its templates are in it.
         let mut dbs: Vec<_> = std::iter::once(theme::BIOCARTOON_SOURCE.to_string())
-            .chain(self.icons.sources.iter().map(|s| s.source.clone()))
+            .chain(self.icons.sources.iter().map(|s| s.source.clone()).filter(|s| s != theme::BIOCARTOON_SOURCE))
             .map(|s| (theme::source_badge(&s).0, self.source_name(&s), s))
             .map(|(abbr, name, s)| (s, abbr, name))
             .collect();
@@ -170,7 +171,8 @@ impl BioCartoon {
             return Vec::new();
         }
         // Templates belong to BioCartoon: another database's filter leaves them out.
-        let filtered_out = self.icons.source_filter.as_deref().is_some_and(|s| s != theme::BIOCARTOON_SOURCE);
+        let filter = &self.icons.source_filter;
+        let filtered_out = !filter.is_empty() && !filter.iter().any(|s| s == theme::BIOCARTOON_SOURCE);
         if filtered_out && matches!(self.icons.mode, IconsMode::Search | IconsMode::Categories) {
             return Vec::new();
         }
@@ -229,25 +231,30 @@ impl BioCartoon {
         self.icons.db_cat = None;
         self.icons.results.clear();
         self.icons.total = None;
-        if source != theme::BIOCARTOON_SOURCE && !self.icons.categories.contains_key(source) {
+        if !self.icons.categories.contains_key(source) {
             self.catalog.send(crate::catalog::Req::Categories { source: source.to_string() });
         }
     }
 
     /// "All", then one button per database (BioCartoon's own and Community, i.e. user uploads,
-    /// included), as in Search. Returns true when the choice changed.
-    fn source_filter_row(&self, ui: &mut egui::Ui, filter: &mut Option<String>) -> bool {
+    /// included), as in Search. The databases toggle independently, so several can be on at once;
+    /// none on means all. Returns true when the choice changed.
+    fn source_filter_row(&self, ui: &mut egui::Ui, filter: &mut Vec<String>) -> bool {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
-            if ui.selectable_label(filter.is_none(), "All").clicked() && filter.is_some() {
-                *filter = None;
+            if ui.selectable_label(filter.is_empty(), "All").clicked() && !filter.is_empty() {
+                filter.clear();
                 changed = true;
             }
             for (source, abbr, name) in self.databases() {
                 let name = if source == "user" { "Community and user-generated: your uploads and approved contributions".to_string() } else { name };
-                let on = filter.as_deref() == Some(source.as_str());
+                let on = filter.iter().any(|s| *s == source);
                 if ui.selectable_label(on, abbr).on_hover_text(name).clicked() {
-                    *filter = if on { None } else { Some(source.to_string()) };
+                    if on {
+                        filter.retain(|s| *s != source);
+                    } else {
+                        filter.push(source.to_string());
+                    }
                     changed = true;
                 }
             }
@@ -332,7 +339,7 @@ impl BioCartoon {
                     if !sources.is_empty() {
                         let icons: i64 = sources.iter().map(|s| s.icons).sum();
                         // The upstream collections plus BioCartoon's own (uploads are not one).
-                        let dbs = sources.iter().filter(|s| s.source != "user").count() + 1;
+                        let dbs = sources.iter().filter(|s| s.source != "user" && s.source != theme::BIOCARTOON_SOURCE).count() + 1;
                         ui.label(egui::RichText::new(format!("{} icons in {dbs} databases", thousands(icons))).small().color(theme::text_dim()));
                     }
                 });
@@ -340,6 +347,7 @@ impl BioCartoon {
                     for (source, abbr, name) in self.databases() {
                         let col = theme::source_badge(&source).1;
                         let hover = match sources.iter().find(|s| s.source == source) {
+                            Some(s) if source == theme::BIOCARTOON_SOURCE => format!("{name}: {} icons, {} templates", thousands(s.icons), self.template_rows.len()),
                             _ if source == theme::BIOCARTOON_SOURCE => format!("{name}: {} templates", self.template_rows.len()),
                             Some(s) => format!("{name}: {} icons ({} images), {}", thousands(s.icons), thousands(s.count), s.licenses),
                             None => name.clone(),
@@ -422,9 +430,10 @@ impl BioCartoon {
                     for (source, abbr, name) in self.databases() {
                         let col = theme::source_badge(&source).1;
                         let detail = match sources.iter().find(|s| s.source == source) {
-                            _ if source == theme::BIOCARTOON_SOURCE => {
+                            found if source == theme::BIOCARTOON_SOURCE => {
                                 let n = self.template_rows.len();
-                                format!("{} template{}  ·  your own and shared slide templates", thousands(n as i64), if n == 1 { "" } else { "s" })
+                                let icons = found.map_or(String::new(), |s| format!("{} icon{}, ", thousands(s.icons), if s.icons == 1 { "" } else { "s" }));
+                                format!("{icons}{} template{}  ·  BioCartoon's own icons, and your own and shared slide templates", thousands(n as i64), if n == 1 { "" } else { "s" })
                             }
                             Some(s) => format!("{} icons  ·  {}", thousands(s.icons), s.licenses),
                             None => String::new(),
@@ -449,16 +458,19 @@ impl BioCartoon {
                     self.save_template_button(ui);
                     ui.add_space(6.0);
                     let rows = self.template_rows.clone();
-                    if row_button_count(ui, ph::SQUARES_FOUR, "All", rows.len() as i64).clicked() {
+                    // BioCartoon's own icons, listed with its templates.
+                    let icons = self.icons.sources.iter().find(|s| s.source == db).map_or(0, |s| s.icons);
+                    if row_button_count(ui, ph::SQUARES_FOUR, "All", rows.len() as i64 + icons).clicked() {
                         self.icons.db_cat = Some(Pick::All);
+                        self.open_results();
                     }
-                    // One row per category the templates use, alphabetical.
+                    // One row per category the templates and icons use, alphabetical.
                     let mut cats: Vec<(String, i64)> = Vec::new();
-                    for r in &rows {
-                        let c = r.meta.category.trim();
+                    let icon_cats = self.icons.categories.get(&db).cloned().unwrap_or_default();
+                    for (c, k) in rows.iter().map(|r| (r.meta.category.trim(), 1)).chain(icon_cats.iter().map(|c| (c.name.trim(), c.count))) {
                         match cats.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(c)) {
-                            Some((_, n)) => *n += 1,
-                            None => cats.push((c.to_string(), 1)),
+                            Some((_, n)) => *n += k,
+                            None => cats.push((c.to_string(), k)),
                         }
                     }
                     cats.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
@@ -466,9 +478,10 @@ impl BioCartoon {
                         let label = if c.is_empty() { "(uncategorized)".to_string() } else { c.clone() };
                         if row_button_count(ui, ph::FOLDER_OPEN, &label, n).clicked() {
                             self.icons.db_cat = Some(Pick::One(c));
+                            self.open_results();
                         }
                     }
-                    if rows.is_empty() {
+                    if rows.is_empty() && icons == 0 {
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("No templates yet. Save the current slide as one.").color(theme::text_dim()));
                     }
@@ -585,8 +598,10 @@ impl BioCartoon {
         egui::Grid::new("results").spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
                 let colors = self.icons.colors.get(&row.id).copied().unwrap_or(1);
-                let (r, star) = asset_tile(ui, row, row.png_local.as_deref(), &mut self.images, hold, colors);
-                if star {
+                let (r, star, remove) = asset_tile(ui, row, row.png_local.as_deref(), &mut self.images, hold, colors);
+                if remove {
+                    self.actions.push(Action::RemoveUserAsset(row.clone()));
+                } else if star {
                     self.actions.push(Action::ToggleStar(row.clone()));
                 } else if r.clicked() {
                     picked = Some(row.clone());
@@ -1125,8 +1140,8 @@ impl BioCartoon {
         match &mut edited.kind {
             ItemKind::Image { source, overlay, .. } => {
                 // Presets: other colour variants of the same asset.
-                if let ImageSource::Asset { source: src, title, id: aid, .. } = source {
-                    self.request_variants(src, title);
+                if let ImageSource::Asset { id: aid, .. } = source {
+                    self.request_variants(aid);
                     let variants = self.variants.clone();
                     if variants.len() > 1 {
                         ui.label(egui::RichText::new("Style presets").strong());
@@ -1700,10 +1715,11 @@ fn info_ui(r: egui::Response, info: impl Fn(&mut egui::Ui)) -> egui::Response {
 }
 
 /// `hold` draws the tile as still loading even if its image is ready. The second value is true
-/// when the click landed on the star (add / remove the user's star) rather than the tile.
+/// when the click landed on the star (add / remove the user's star) rather than the tile; the
+/// third when the user picked "Remove from library" on one of their own uploads.
 /// A catalog asset's tile. `colors` > 1 marks it with a colour wheel in the lower-right corner
 /// (the colours are picked in Edit once it is placed); the star count moves left of it.
-fn asset_tile(ui: &mut egui::Ui, row: &AssetRow, local: Option<&str>, images: &mut crate::assets::ImageCache, hold: bool, colors: usize) -> (egui::Response, bool) {
+fn asset_tile(ui: &mut egui::Ui, row: &AssetRow, local: Option<&str>, images: &mut crate::assets::ImageCache, hold: bool, colors: usize) -> (egui::Response, bool, bool) {
     let state = images.asset(&row.png_key, local);
     let loading = ImgState::Loading;
     let state = if hold { &loading } else { state };
@@ -1716,7 +1732,7 @@ fn asset_tile(ui: &mut egui::Ui, row: &AssetRow, local: Option<&str>, images: &m
     }
     let star_rect = star_corner(ui, star_area, row.stars, row.starred, r.hover_pos());
     let star_clicked = r.clicked() && r.interact_pointer_pos().is_some_and(|q| star_rect.contains(q));
-    let r = info_ui(r, |ui| {
+    let info = |ui: &mut egui::Ui| {
         ui.label(egui::RichText::new(&row.title).strong());
         if !row.variant.is_empty() {
             ui.label(format!("Variant: {}", row.variant));
@@ -1735,12 +1751,29 @@ fn asset_tile(ui: &mut egui::Ui, row: &AssetRow, local: Option<&str>, images: &m
             (n, false) => format!("{} {n} star{}. Click the star to add yours.", ph::STAR, if n == 1 { "" } else { "s" }),
         };
         ui.label(egui::RichText::new(stars).small().color(theme::text_dim()));
-    });
+    };
+    // The user's own uploads (published ones have no local copy) get a context menu, which a long
+    // press opens too, so the info goes there.
+    let mut remove = false;
+    let r = if row.source == "user" && row.png_local.is_some() {
+        let r = r.on_hover_ui(info);
+        r.context_menu(|ui| {
+            info(ui);
+            ui.separator();
+            if ui.button("Remove from library").clicked() {
+                remove = true;
+                ui.close();
+            }
+        });
+        r
+    } else {
+        info_ui(r, info)
+    };
     if let ImgState::Failed(e) = images.get(&format!("asset:{}", row.png_key)).unwrap_or(&ImgState::Loading) {
         let e = e.clone();
-        return (r.on_hover_text(e), star_clicked);
+        return (r.on_hover_text(e), star_clicked, remove);
     }
-    (r, star_clicked)
+    (r, star_clicked, remove)
 }
 
 /// A small colour wheel: the mark of an icon that comes in several colours.
