@@ -3488,7 +3488,6 @@ impl BioCartoon {
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    crate::download_app_button(ui);
                     if ui.add(egui::Button::new(egui::RichText::new("Export").color(Color32::WHITE)).fill(theme::accent())).clicked() {
                         self.actions.push(Action::OpenExport);
                     }

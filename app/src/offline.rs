@@ -92,8 +92,8 @@ fn source_sql() -> String {
     format!("CASE WHEN source = 'user' AND author = '{BIOCARTOON_AUTHOR}' THEN '{BIOCARTOON_SOURCE}' ELSE source END")
 }
 
-/// Every collection (User-generated always listed, even when empty), in order of the
-/// databases' two-letter badges.
+/// Every collection (User-generated always listed, even when empty): BioCartoon first, then
+/// the rest in order of the databases' two-letter badges.
 fn collections(conn: &Connection) -> Result<Vec<Collection>, String> {
     let mut st = conn
         .prepare(&format!(
@@ -125,7 +125,7 @@ fn collections(conn: &Connection) -> Result<Vec<Collection>, String> {
             c.name = name.into();
         }
     }
-    cols.sort_by_key(|c| crate::theme::source_badge(&c.source).0);
+    cols.sort_by_key(|c| (c.source != crate::theme::BIOCARTOON_SOURCE, crate::theme::source_badge(&c.source).0));
     Ok(cols)
 }
 

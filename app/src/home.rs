@@ -249,7 +249,7 @@ impl BioCartoon {
                     self.actions.push(Action::Open);
                 }
                 if ui.add(egui::Button::new(egui::RichText::new(ph::GEAR).size(18.0)).frame(false)).on_hover_text("Settings").clicked() {
-                    self.open_settings(crate::app::SettingsTab::Ai);
+                    self.open_settings(crate::app::SettingsTab::General);
                 }
                 if ui.add(egui::Button::new(egui::RichText::new(ph::INFO).size(18.0)).frame(false)).on_hover_text("About BioCartoon").clicked() {
                     self.show_about = true;
