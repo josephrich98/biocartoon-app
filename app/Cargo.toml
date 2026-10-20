@@ -1,0 +1,102 @@
+[package]
+name = "biocartoon"
+version = "0.1.0"
+edition = "2021"
+description = "A free, AI-centered scientific illustration editor built on egui"
+license = "AGPL-3.0-or-later"
+default-run = "biocartoon-app"
+
+[lib]
+name = "biocartoon"
+path = "src/lib.rs"
+
+# The editor. The command line takes the short name, `biocartoon`.
+[[bin]]
+name = "biocartoon-app"
+path = "src/main.rs"
+
+[[bin]]
+name = "biocartoon"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "make_icon"
+path = "src/bin/make_icon.rs"
+
+[dependencies]
+# The asset catalog's search engine, sync and command line, from the biocartoon repository (a
+# checkout next to this one; see README.md).
+biocartoon-catalog = { path = "../../biocartoon/catalog" }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "links", "persistence", "wayland", "x11"] }
+egui = "0.36"
+egui-phosphor = "0.14"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+dirs = "6"
+chrono = "0.4"
+flate2 = "1"
+resvg = "0.45"
+svg2pdf = "0.13"
+tiff = "0.11"
+base64 = "0.22"
+spellbook = "0.4.2"
+
+# Desktop only: the web build (wasm32) stubs these out, see src/platform.rs and src/storage.rs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+ureq = "3"
+rfd = "0.17"
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+idb = "0.6"
+sqlite-wasm-rs = "0.5"
+js-sys = "0.3"
+rusqlite = { version = "0.40", features = ["serialize"] }
+ehttp = "0.5"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Document", "Window", "Element", "HtmlCanvasElement", "HtmlInputElement", "HtmlAnchorElement", "FileList", "File", "Blob", "Url", "Crypto", "Navigator", "StorageManager", "Location", "History"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Desktop installers: `cargo packager --release` (cargo install cargo-packager --locked) builds the
+# binaries, then a .dmg on macOS, an NSIS setup .exe on Windows, an AppImage and .deb on Linux,
+# into target/packages/. .github/workflows/release.yml runs it for every v* tag.
+[package.metadata.packager]
+product-name = "BioCartoon"
+identifier = "com.biocartoon.app"
+description = "A free, AI-centered scientific illustration editor"
+homepage = "https://github.com/josephrich98/biocartoon-app"
+publisher = "Pachter Lab"
+copyright = "© 2026 Joseph Rich. Licensed under the GNU AGPL v3.0."
+category = "GraphicsAndDesign"
+before-packaging-command = "cargo build --release --bin biocartoon-app --bin biocartoon"
+binaries-dir = "target/release"
+out-dir = "target/packages"
+# icon.icns and icon.png are made from icon.svg by `cargo run --bin make_icon`; Linux uses the .png.
+icons = ["assets/icon.icns", "assets/icon.png"]
+# The command line / MCP server ships next to the app (inside BioCartoon.app/Contents/MacOS on macOS).
+binaries = [{ path = "biocartoon-app", main = true }, { path = "biocartoon" }]
+# Credits.html fills the text box in the macOS standard About panel.
+resources = [{ src = "assets/Credits.html", target = "Credits.html" }]
+file-associations = [{ extensions = ["biocartoon"], name = "BioCartoon document", description = "BioCartoon document", mime-type = "application/x-biocartoon" }]
+
+[package.metadata.packager.macos]
+minimum-system-version = "12.0"
+# "-" is an ad-hoc signature. The release workflow swaps in a Developer ID when one is configured.
+signing-identity = "-"
+
+[package.metadata.packager.nsis]
+installer-icon = "assets/icon.ico"
+installer-mode = "currentUser"
+
+[package.metadata.packager.deb]
+depends = ["libxkbcommon0", "libgl1"]

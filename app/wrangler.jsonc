@@ -1,0 +1,8 @@
+// The web build (trunk build --release -> dist/), served as static assets. No Worker code, no bindings.
+//   cd app && trunk build --release && npx wrangler deploy
+{
+  "name": "biocartoon",
+  "compatibility_date": "2026-10-01",
+  "routes": [{ "pattern": "app.biocartoon.com", "custom_domain": true }],
+  "assets": { "directory": "./dist", "not_found_handling": "single-page-application" }
+}

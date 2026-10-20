@@ -1,0 +1,4 @@
+# Links from before the landing page, when every path forwarded to the editor.
+/download       https://app.biocartoon.com/download       302
+/download.html  https://app.biocartoon.com/download.html  302
+/app            https://app.biocartoon.com/               302

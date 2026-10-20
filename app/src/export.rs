@@ -1,0 +1,868 @@
+//! Slide export. The slide (or each image on it) is written out as SVG, which is then either saved
+//! as-is, rasterised with resvg (PNG / JPEG / TIFF at any DPI) or converted with svg2pdf (PDF).
+//! Geometry mirrors `canvas::draw_item` at zoom 1, and text is laid out with egui's own fonts so
+//! line breaks match the canvas. Runs on a worker thread.
+
+use crate::assets::{fetch, Request};
+use crate::canvas::{corners, head_geom, line_paths, shape_polygons, HeadGeom};
+use crate::doc::{Item, ItemKind, Slide, TextAlign, TextFont, DPI};
+use base64::Engine;
+use egui::{Color32, FontId, Pos2, Rect, Vec2};
+use image::RgbaImage;
+use resvg::usvg::{self, fontdb};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, OnceLock};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExportFormat {
+    Png,
+    Jpg,
+    Tif,
+    Pdf,
+    Svg,
+}
+
+impl ExportFormat {
+    pub const ALL: [ExportFormat; 5] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg];
+    pub fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Png => "PNG",
+            ExportFormat::Jpg => "JPG",
+            ExportFormat::Tif => "TIFF",
+            ExportFormat::Pdf => "PDF",
+            ExportFormat::Svg => "SVG",
+        }
+    }
+    pub fn ext(self) -> &'static str {
+        match self {
+            ExportFormat::Png => "png",
+            ExportFormat::Jpg => "jpg",
+            ExportFormat::Tif => "tif",
+            ExportFormat::Pdf => "pdf",
+            ExportFormat::Svg => "svg",
+        }
+    }
+    pub fn is_raster(self) -> bool {
+        matches!(self, ExportFormat::Png | ExportFormat::Jpg | ExportFormat::Tif)
+    }
+    pub fn from_ext(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "png" => Some(ExportFormat::Png),
+            "jpg" | "jpeg" => Some(ExportFormat::Jpg),
+            "tif" | "tiff" => Some(ExportFormat::Tif),
+            "pdf" => Some(ExportFormat::Pdf),
+            "svg" => Some(ExportFormat::Svg),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExportOptions {
+    pub format: ExportFormat,
+    /// Raster formats only.
+    pub dpi: u32,
+    /// PNG only: leave the slide background out.
+    pub transparent: bool,
+    /// One file per image item, cropped to its bounding box, instead of the whole slide.
+    pub individual: bool,
+    /// Whole-slide export only: crop the canvas to the combined bounds of the image items.
+    pub crop: bool,
+    /// Also write the library artwork's credits to `<name>-credits.txt` beside the export.
+    pub save_credits: bool,
+    /// Every slide of the document, one file (or set of image files) each, instead of just one.
+    /// Starts off each session.
+    #[serde(skip)]
+    pub all_slides: bool,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, save_credits: false, all_slides: false }
+    }
+}
+
+pub const MIN_DPI: u32 = 10;
+pub const MAX_DPI: u32 = 2400;
+
+/// Pixel size of a document-space rect rendered at `dpi`.
+pub fn pixel_size(r: Rect, dpi: u32) -> [u32; 2] {
+    let s = dpi as f32 / DPI;
+    [((r.width() * s).round() as u32).max(1), ((r.height() * s).round() as u32).max(1)]
+}
+
+/// Combined bounds of the slide's image items, if it has any.
+pub fn images_bounds(slide: &Slide) -> Option<Rect> {
+    slide.items.iter().filter(|it| matches!(it.kind, ItemKind::Image { .. })).map(item_bounds).reduce(|a, b| a.union(b))
+}
+
+/// Axis-aligned document-space bounds of an item as drawn (rotation included where the canvas
+/// applies it).
+pub fn item_bounds(it: &Item) -> Rect {
+    match it.kind {
+        ItemKind::Line { .. } | ItemKind::Table { .. } | ItemKind::Code { .. } => it.rect(),
+        _ => {
+            let mut r = Rect::NOTHING;
+            for p in corners(it) {
+                r.extend_with(p);
+            }
+            r
+        }
+    }
+}
+
+pub struct ExportJob {
+    pub path: PathBuf,
+    pub opts: ExportOptions,
+    /// The slides to export, each with its 1-based number. With more than one, each file's name
+    /// gets `-slide<N>`.
+    pub slides: Vec<(usize, Slide)>,
+    pub page: Rect,
+    pub background: [u8; 4],
+    /// Cache key -> where to load the full-resolution original from.
+    pub requests: HashMap<String, Request>,
+    /// Cache key -> the decoded (possibly downscaled) copy, used if the original can't be loaded.
+    pub fallbacks: HashMap<String, Arc<RgbaImage>>,
+}
+
+/// Run an export on a worker thread. The receiver yields a status message when it is done.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn start(ctx: egui::Context, job: ExportJob) -> Receiver<Result<String, String>> {
+    let (tx, rx) = channel();
+    crate::platform::spawn("export", move || {
+        let res = run(&ctx, job);
+        let _ = tx.send(res);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+/// Web build: there are no blocking fetches, so first download every full-resolution original
+/// (in parallel), put them in place of the cached copies, then run the export.
+#[cfg(target_arch = "wasm32")]
+pub fn start(ctx: egui::Context, job: ExportJob) -> Receiver<Result<String, String>> {
+    use std::sync::Mutex;
+    let (tx, rx) = channel();
+    let urls: Vec<(String, String)> = job
+        .requests
+        .iter()
+        .filter_map(|(k, r)| match r {
+            Request::Url(u) => Some((k.clone(), u.clone())),
+            Request::Path(_) => None,
+        })
+        .collect();
+    if urls.is_empty() {
+        let _ = tx.send(run(&ctx, job));
+        return rx;
+    }
+    let pending = Arc::new(Mutex::new((Some((ctx, job, tx)), urls.len())));
+    for (key, url) in urls {
+        let pending = pending.clone();
+        ehttp::fetch(ehttp::Request::get(&url), move |res| {
+            let full = res.and_then(|r| if r.ok { Ok(r.bytes) } else { Err(format!("{} {}", r.status, r.status_text)) }).and_then(|b| image::load_from_memory(&b).map_err(|e| e.to_string()));
+            let mut g = pending.lock().unwrap();
+            match (full, g.0.as_mut()) {
+                (Ok(img), Some((_, job, _))) => {
+                    job.fallbacks.insert(key, Arc::new(img.to_rgba8()));
+                }
+                (Err(e), _) => log::warn!("export: {url}: {e}; using the cached copy"),
+                _ => {}
+            }
+            g.1 -= 1;
+            if g.1 == 0 {
+                if let Some((ctx, job, tx)) = g.0.take() {
+                    drop(g);
+                    let _ = tx.send(run(&ctx, job));
+                    ctx.request_repaint();
+                }
+            }
+        });
+    }
+    rx
+}
+
+pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
+    let opts = &job.opts;
+    let mut images: HashMap<String, RgbaImage> = HashMap::new();
+    let mut missing = 0;
+    for (key, req) in &job.requests {
+        let full = match req {
+            // Web build: `start` already downloaded the original into `fallbacks`.
+            #[cfg(target_arch = "wasm32")]
+            Request::Url(_) if job.fallbacks.contains_key(key) => Ok((*job.fallbacks[key]).clone()),
+            _ => fetch(req).and_then(|b| image::load_from_memory(&b).map_err(|e| e.to_string())).map(|i| i.to_rgba8()),
+        };
+        match full {
+            Ok(img) => {
+                images.insert(key.clone(), img);
+            }
+            Err(e) => match job.fallbacks.get(key) {
+                Some(img) => {
+                    log::warn!("export: using cached copy of {key}: {e}");
+                    images.insert(key.clone(), (**img).clone());
+                }
+                None => {
+                    log::warn!("export: {key}: {e}");
+                    missing += 1;
+                }
+            },
+        }
+    }
+
+    let bg = if opts.format == ExportFormat::Png && opts.transparent { None } else { Some(job.background) };
+    let mut written = Vec::new();
+    let multi = job.slides.len() > 1;
+    let dir = job.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = job.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+    for (n, slide) in &job.slides {
+        let stem = if multi { format!("{stem}-slide{n}") } else { stem.clone() };
+        if opts.individual {
+            let pics: Vec<&Item> = slide.items.iter().filter(|it| matches!(it.kind, ItemKind::Image { .. })).collect();
+            for (i, it) in pics.iter().enumerate() {
+                let region = item_bounds(it);
+                let svg = build_svg(ctx, &[it], region, bg, &images);
+                let name = crate::app::BioCartoon::slugify(&it.name);
+                let path = dir.join(format!("{stem}-{:02}-{name}.{}", i + 1, opts.format.ext()));
+                write_file(&svg, region, opts, &path, &crate::credits::for_items(&[it]))?;
+                written.push(path);
+            }
+        } else {
+            // Cropping to images skips the slides that have none.
+            let region = if opts.crop {
+                match images_bounds(slide) {
+                    Some(r) => r,
+                    None => continue,
+                }
+            } else {
+                job.page
+            };
+            let items: Vec<&Item> = slide.items.iter().collect();
+            let svg = build_svg(ctx, &items, region, bg, &images);
+            let path = if multi { dir.join(format!("{stem}.{}", opts.format.ext())) } else { job.path.clone() };
+            write_file(&svg, region, opts, &path, &crate::credits::for_items(&items))?;
+            written.push(path);
+        }
+    }
+    if written.is_empty() {
+        return Err(if multi { "There are no images on these slides" } else { "There are no images on this slide" }.into());
+    }
+
+    if opts.save_credits {
+        let items: Vec<&Item> = job.slides.iter().flat_map(|(_, s)| &s.items).collect();
+        let credits = crate::credits::for_items(&items);
+        if !credits.is_empty() {
+            let path = job.path.with_file_name(format!("{stem}-credits.txt"));
+            crate::platform::write_output(&path, format!("{credits}\n").as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+    }
+
+    let mut msg = match written.as_slice() {
+        [one] => format!("Exported {}", one.display()),
+        many => format!("Exported {} {} to {}", many.len(), if opts.individual { "images" } else { "slides" }, many[0].parent().map(|p| p.display().to_string()).unwrap_or_default()),
+    };
+    if missing > 0 {
+        let _ = write!(msg, " ({missing} image(s) could not be loaded and were left out)");
+    }
+    Ok(msg)
+}
+
+/// A small preview of a slide (longest side `max_side` px) for project tiles and version history.
+/// Images come from `cached` when present, otherwise from `requests`; missing ones are left out.
+pub fn thumbnail(
+    ctx: &egui::Context,
+    slide: &Slide,
+    page: Rect,
+    background: [u8; 4],
+    requests: &HashMap<String, Request>,
+    cached: &HashMap<String, Arc<RgbaImage>>,
+    max_side: u32,
+) -> Result<RgbaImage, String> {
+    let mut images: HashMap<String, RgbaImage> = HashMap::new();
+    for (key, req) in requests {
+        let img = match cached.get(key) {
+            Some(img) => Ok((**img).clone()),
+            None => fetch(req).and_then(|b| image::load_from_memory(&b).map_err(|e| e.to_string())).map(|i| i.to_rgba8()),
+        };
+        match img {
+            Ok(img) => {
+                images.insert(key.clone(), img);
+            }
+            Err(e) => log::warn!("thumbnail: {key}: {e}"),
+        }
+    }
+    let items: Vec<&Item> = slide.items.iter().collect();
+    let svg = build_svg(ctx, &items, page, Some(background), &images);
+    let dpi = ((max_side as f32 * DPI / page.width().max(page.height()).max(1.0)).round() as u32).max(1);
+    rasterise(&parse(&svg)?, page, dpi)
+}
+
+// ---------- SVG ----------
+
+fn n(v: f32) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" { "0".into() } else { s.into() }
+}
+
+fn hex(c: [u8; 4]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+/// `fill="#rrggbb" fill-opacity="a"` (or `stroke`), folding in the item opacity.
+fn paint(attr: &str, c: [u8; 4], op: f32) -> String {
+    let a = c[3] as f32 / 255.0 * op;
+    if a >= 0.999 {
+        format!(r#"{attr}="{}""#, hex(c))
+    } else {
+        format!(r#"{attr}="{}" {attr}-opacity="{}""#, hex(c), n(a))
+    }
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn points(pts: &[Pos2]) -> String {
+    pts.iter().map(|p| format!("{},{}", n(p.x), n(p.y))).collect::<Vec<_>>().join(" ")
+}
+
+fn rotate_attr(it: &Item, c: Pos2) -> String {
+    if it.rotation == 0.0 {
+        String::new()
+    } else {
+        format!(r#" transform="rotate({} {} {})""#, n(it.rotation.to_degrees()), n(c.x), n(c.y))
+    }
+}
+
+/// Font family names used in the SVG: the egui font first (it is what the canvas shows and what
+/// the PDF / raster renderers load), then common fallbacks for other SVG viewers.
+fn font_family() -> String {
+    format!("'{}', Ubuntu, Helvetica, Arial, sans-serif", fonts().family)
+}
+
+/// Lay out text with egui (at zoom 1) and emit one `<text>` per row.
+fn text_rows(out: &mut String, ctx: &egui::Context, text: &str, size: f32, wrap: f32, origin: Pos2, align: TextAlign, box_w: f32) {
+    let galley = ctx.fonts_mut(|f| f.layout(text.to_string(), FontId::proportional(size.max(1.0)), Color32::WHITE, wrap.max(4.0)));
+    let gw = galley.size().x;
+    let x0 = match align {
+        TextAlign::Left | TextAlign::Justify => origin.x,
+        TextAlign::Center => origin.x + box_w / 2.0 - gw / 2.0,
+        TextAlign::Right => origin.x + box_w - gw,
+    };
+    for prow in &galley.rows {
+        let row = &prow.row;
+        let Some(g0) = row.glyphs.first() else { continue };
+        let s: String = row.glyphs.iter().map(|g| g.chr).collect();
+        let x = x0 + prow.pos.x + g0.pos.x;
+        let y = origin.y + prow.pos.y + g0.pos.y;
+        let _ = writeln!(out, r#"<text x="{}" y="{}">{}</text>"#, n(x), n(y), esc(&s));
+    }
+}
+
+/// A text item's rows, laid out as the canvas lays them out, one `<text>` each.
+fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item) {
+    let ItemKind::Text { text, italic, align, .. } = &it.kind else { return };
+    let r = it.rect();
+    let job = crate::canvas::text_job(ctx, text, &it.kind, 1.0, r.width(), Color32::WHITE);
+    let galley = ctx.fonts_mut(|f| f.layout_job(job));
+    let o = crate::canvas::text_origin(&galley, r, &it.kind);
+    let last = galley.rows.len().saturating_sub(1);
+    for (i, prow) in galley.rows.iter().enumerate() {
+        let row = &prow.row;
+        let (Some(g0), Some(g1)) = (row.glyphs.first(), row.glyphs.last()) else { continue };
+        let s: String = row.glyphs.iter().map(|g| g.chr).collect();
+        let x = o.x + prow.pos.x + g0.pos.x;
+        let y = o.y + prow.pos.y + g0.pos.y;
+        // Justified rows are stretched to the box, as egui stretches them.
+        let fit = if *align == TextAlign::Justify && i != last && !prow.ends_with_newline {
+            format!(r#" textLength="{}" lengthAdjust="spacing""#, n(g1.max_x() - g0.pos.x))
+        } else {
+            String::new()
+        };
+        // Slant rather than font-style="italic": the bundled font has no italic face.
+        let slant = if *italic { format!(r#" transform="translate({} {}) skewX(-12) translate({} {})""#, n(x), n(y), n(-x), n(-y)) } else { String::new() };
+        let _ = writeln!(out, r#"<text x="{}" y="{}"{fit}{slant}>{}</text>"#, n(x), n(y), esc(&s));
+    }
+}
+
+/// Crop, flip and tint an image the way the canvas draws it, as PNG bytes.
+fn prepared_png(img: &RgbaImage, crop: [f32; 4], overlay: [u8; 4], flip_h: bool, flip_v: bool) -> Option<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let span = |a: f32, b: f32, len: u32| {
+        let lo = ((a.clamp(0.0, 1.0) * len as f32).round() as u32).min(len - 1);
+        let hi = ((b.clamp(0.0, 1.0) * len as f32).round() as u32).clamp(lo + 1, len);
+        (lo, hi - lo)
+    };
+    let (x0, cw) = span(crop[0], crop[2], w);
+    let (y0, ch) = span(crop[1], crop[3], h);
+    let mut out = image::imageops::crop_imm(img, x0, y0, cw, ch).to_image();
+    if flip_h {
+        image::imageops::flip_horizontal_in_place(&mut out);
+    }
+    if flip_v {
+        image::imageops::flip_vertical_in_place(&mut out);
+    }
+    if overlay[3] > 0 {
+        let s = overlay[3] as f32 / 255.0;
+        let tint = [0, 1, 2].map(|i| (1.0 - s) + overlay[i] as f32 / 255.0 * s);
+        for p in out.pixels_mut() {
+            for i in 0..3 {
+                p.0[i] = (p.0[i] as f32 * tint[i]).round() as u8;
+            }
+        }
+    }
+    let mut buf = Vec::new();
+    out.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).ok()?;
+    Some(buf)
+}
+
+pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[u8; 4]>, images: &HashMap<String, RgbaImage>) -> String {
+    let mut s = String::new();
+    let (w, h) = (region.width(), region.height());
+    let _ = writeln!(
+        s,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{}in" height="{}in" viewBox="{} {} {} {}">"#,
+        n(w / DPI),
+        n(h / DPI),
+        n(region.min.x),
+        n(region.min.y),
+        n(w),
+        n(h)
+    );
+    if let Some(c) = bg.filter(|c| c[3] > 0) {
+        let _ = writeln!(s, r#"<rect x="{}" y="{}" width="{}" height="{}" {}/>"#, n(region.min.x), n(region.min.y), n(w), n(h), paint("fill", c, 1.0));
+    }
+    // Clip to the region, as the canvas clips to the page.
+    let _ = writeln!(s, r#"<clipPath id="page"><rect x="{}" y="{}" width="{}" height="{}"/></clipPath>"#, n(region.min.x), n(region.min.y), n(w), n(h));
+    let _ = writeln!(s, r#"<g clip-path="url(#page)">"#);
+    let family = font_family();
+    let mut clip_id = 0;
+    for it in items {
+        let op = it.opacity.clamp(0.0, 1.0);
+        let r = it.rect();
+        let c = r.center();
+        match &it.kind {
+            ItemKind::Image { source, crop, overlay } => {
+                let Some(png) = images.get(&source.cache_key()).and_then(|img| prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v)) else { continue };
+                let op_attr = if op < 1.0 { format!(r#" opacity="{}""#, n(op)) } else { String::new() };
+                let _ = writeln!(
+                    s,
+                    r#"<image x="{}" y="{}" width="{}" height="{}" preserveAspectRatio="none"{op_attr}{} xlink:href="data:image/png;base64,{}"/>"#,
+                    n(r.min.x),
+                    n(r.min.y),
+                    n(r.width()),
+                    n(r.height()),
+                    rotate_attr(it, c),
+                    base64::engine::general_purpose::STANDARD.encode(png)
+                );
+            }
+            ItemKind::Text { size, color, bold, underline, font, .. } => {
+                let stroke = if *bold { format!(r#" {} stroke-width="0.6" stroke-linejoin="round""#, paint("stroke", *color, op)) } else { String::new() };
+                let deco = if *underline { r#" text-decoration="underline""# } else { "" };
+                let family = match font {
+                    TextFont::Sans => family.clone(),
+                    TextFont::Mono => "Hack, Menlo, Consolas, monospace".into(),
+                    TextFont::Tinos => "Tinos, 'Times New Roman', Times, serif".into(),
+                    TextFont::Cousine => "Cousine, 'Courier New', Courier, monospace".into(),
+                    TextFont::SourceSerif | TextFont::EbGaramond => format!("'{}', Georgia, serif", font.embedded_name().unwrap_or_default()),
+                    f => format!("'{}', {family}", f.embedded_name().unwrap_or_default()),
+                };
+                let _ = writeln!(
+                    s,
+                    r#"<g{} font-family="{}" font-size="{}" font-weight="300" {}{stroke}{deco} xml:space="preserve">"#,
+                    rotate_attr(it, c),
+                    esc(&family),
+                    n(*size),
+                    paint("fill", *color, op)
+                );
+                text_item_rows(&mut s, ctx, it);
+                s.push_str("</g>\n");
+            }
+            ItemKind::Shape { shape, fill, stroke, stroke_width } => {
+                let (_, outline) = shape_polygons(*shape, r);
+                let pts: Vec<Pos2> = outline
+                    .iter()
+                    .map(|p| Pos2::new(if it.flip_h { 2.0 * c.x - p.x } else { p.x }, if it.flip_v { 2.0 * c.y - p.y } else { p.y }))
+                    .collect();
+                let st = if *stroke_width > 0.0 && stroke[3] > 0 {
+                    format!(r#" {} stroke-width="{}""#, paint("stroke", *stroke, op), n(*stroke_width))
+                } else {
+                    String::new()
+                };
+                let fl = if fill[3] > 0 { paint("fill", *fill, op) } else { r#"fill="none""#.into() };
+                let _ = writeln!(s, r#"<polygon points="{}" {fl}{st}{}/>"#, points(&pts), rotate_attr(it, c));
+            }
+            ItemKind::Line { color, width, style, .. } => {
+                let w = width.max(0.5);
+                let dash = style.dash(w).map(|(d, g)| format!(r#" stroke-dasharray="{} {}""#, n(d), n(g))).unwrap_or_default();
+                let head = (w * 4.0).max(6.0);
+                for path in line_paths(it) {
+                    if path.pts.len() < 2 {
+                        continue;
+                    }
+                    let _ = writeln!(s, r#"<polyline points="{}" fill="none" {} stroke-width="{}"{dash}/>"#, points(&path.pts), paint("stroke", *color, op), n(w));
+                    for (at_end, h) in [(false, path.start), (true, path.end)] {
+                        match head_geom(&path.pts, at_end, h, head) {
+                            Some(HeadGeom::Polygon(tri)) => {
+                                let _ = writeln!(s, r#"<polygon points="{}" {}/>"#, points(&tri), paint("fill", *color, op));
+                            }
+                            Some(HeadGeom::Segment(a, b)) => {
+                                let _ = writeln!(s, r#"<line x1="{}" y1="{}" x2="{}" y2="{}" {} stroke-width="{}"/>"#, n(a.x), n(a.y), n(b.x), n(b.y), paint("stroke", *color, op), n(w * 1.2));
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+            ItemKind::Table { rows, cols, cells, header, border, fill, header_fill, text_color, font_size } => {
+                let (rows, cols) = ((*rows).max(1), (*cols).max(1));
+                let cw = r.width() / cols as f32;
+                let ch = r.height() / rows as f32;
+                let _ = writeln!(s, r#"<rect x="{}" y="{}" width="{}" height="{}" {}/>"#, n(r.min.x), n(r.min.y), n(r.width()), n(r.height()), paint("fill", *fill, op));
+                if *header {
+                    let _ = writeln!(s, r#"<rect x="{}" y="{}" width="{}" height="{}" {}/>"#, n(r.min.x), n(r.min.y), n(r.width()), n(ch), paint("fill", *header_fill, op));
+                }
+                let bs = paint("stroke", *border, op);
+                for i in 0..=rows {
+                    let y = r.min.y + i as f32 * ch;
+                    let _ = writeln!(s, r#"<line x1="{}" y1="{}" x2="{}" y2="{}" {bs} stroke-width="1"/>"#, n(r.min.x), n(y), n(r.max.x), n(y));
+                }
+                for j in 0..=cols {
+                    let x = r.min.x + j as f32 * cw;
+                    let _ = writeln!(s, r#"<line x1="{}" y1="{}" x2="{}" y2="{}" {bs} stroke-width="1"/>"#, n(x), n(r.min.y), n(x), n(r.max.y));
+                }
+                for i in 0..rows {
+                    for j in 0..cols {
+                        let Some(t) = cells.get(i * cols + j).filter(|t| !t.is_empty()) else { continue };
+                        let cell = Rect::from_min_size(Pos2::new(r.min.x + j as f32 * cw, r.min.y + i as f32 * ch), Vec2::new(cw, ch));
+                        clip_id += 1;
+                        let _ = writeln!(s, r#"<clipPath id="cell{clip_id}"><rect x="{}" y="{}" width="{}" height="{}"/></clipPath>"#, n(cell.min.x), n(cell.min.y), n(cw), n(ch));
+                        let wrap = (cw - 8.0).max(4.0);
+                        let gh = ctx.fonts_mut(|f| f.layout(t.clone(), FontId::proportional(font_size.max(1.0)), Color32::WHITE, wrap)).size().y;
+                        let origin = Pos2::new(cell.min.x + 4.0, cell.center().y - gh / 2.0);
+                        let _ = writeln!(
+                            s,
+                            r#"<g clip-path="url(#cell{clip_id})" font-family="{}" font-size="{}" font-weight="300" {} xml:space="preserve">"#,
+                            esc(&family),
+                            n(*font_size),
+                            paint("fill", *text_color, op)
+                        );
+                        text_rows(&mut s, ctx, t, *font_size, wrap, origin, TextAlign::Left, wrap);
+                        s.push_str("</g>\n");
+                    }
+                }
+            }
+            ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded } => {
+                let pal = theme.palette();
+                let fill = |c: [u8; 3]| paint("fill", [c[0], c[1], c[2], 255], op);
+                let fs = font_size.max(1.0);
+                let font = FontId::monospace(fs);
+                let (char_w, line_h, baseline) = ctx.fonts_mut(|f| {
+                    let g = f.layout_no_wrap("0".into(), font.clone(), Color32::WHITE);
+                    (f.glyph_width(&font, '0'), f.row_height(&font), g.rows.first().and_then(|r| r.row.glyphs.first()).map_or(fs * 0.8, |gl| gl.pos.y))
+                });
+                let lines = crate::code::highlight(code, language.resolve(code));
+                let lay = crate::code::BlockLayout::new(fs, lines.len(), *line_numbers, *window, char_w, line_h);
+                let _ = writeln!(s, r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}" {}/>"#, n(r.min.x), n(r.min.y), n(r.width()), n(r.height()), n(if *rounded { lay.radius } else { 0.0 }), fill(pal.bg));
+                if *window {
+                    for (c, rad, rgb) in lay.dots(fs) {
+                        let _ = writeln!(s, r#"<circle cx="{}" cy="{}" r="{}" {}/>"#, n(r.min.x + c[0]), n(r.min.y + c[1]), n(rad), fill(rgb));
+                    }
+                }
+                clip_id += 1;
+                let _ = writeln!(s, r#"<clipPath id="cell{clip_id}"><rect x="{}" y="{}" width="{}" height="{}"/></clipPath>"#, n(r.min.x + 1.0), n(r.min.y + 1.0), n((r.width() - 2.0).max(0.0)), n((r.height() - 2.0).max(0.0)));
+                let _ = writeln!(s, r#"<g clip-path="url(#cell{clip_id})" font-family="Hack, Menlo, Consolas, monospace" font-size="{}" xml:space="preserve">"#, n(fs));
+                let o = lay.text_origin();
+                for (i, spans) in lines.iter().enumerate() {
+                    let y = r.min.y + o[1] + i as f32 * line_h;
+                    if y > r.max.y {
+                        break;
+                    }
+                    if *line_numbers {
+                        let _ = writeln!(s, r#"<text x="{}" y="{}" text-anchor="end" {}>{}</text>"#, n(r.min.x + o[0] - fs * 1.4), n(y + baseline), fill(pal.line_number), i + 1);
+                    }
+                    // Place each run at its column so the layout matches the canvas whatever font the viewer substitutes.
+                    let mut col = 0usize;
+                    for (t, k) in spans {
+                        let body = t.trim_start();
+                        let lead = t.chars().count() - body.chars().count();
+                        if !body.is_empty() {
+                            let _ = writeln!(s, r#"<text x="{}" y="{}" {}>{}</text>"#, n(r.min.x + o[0] + (col + lead) as f32 * char_w), n(y + baseline), fill(pal.color(*k)), esc(body));
+                        }
+                        col += lead + body.chars().count();
+                    }
+                }
+                s.push_str("</g>\n");
+            }
+        }
+    }
+    s.push_str("</g>\n</svg>\n");
+    s
+}
+
+// ---------- rendering ----------
+
+struct Fonts {
+    db: Arc<fontdb::Database>,
+    family: String,
+}
+
+/// egui's bundled fonts (so text matches the canvas), plus system fonts for missing glyphs.
+fn fonts() -> &'static Fonts {
+    static FONTS: OnceLock<Fonts> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let defs = egui::FontDefinitions::default();
+        let mut family = "Ubuntu".to_string();
+        for name in ["Ubuntu-Light", "Hack", "NotoEmoji-Regular", "emoji-icon-font"] {
+            let Some(data) = defs.font_data.get(name) else { continue };
+            let ids = db.load_font_source(fontdb::Source::Binary(Arc::new(data.font.to_vec())));
+            if name == "Ubuntu-Light" {
+                if let Some(f) = ids.first().and_then(|id| db.face(*id)).and_then(|f| f.families.first()) {
+                    family = f.0.clone();
+                }
+            }
+        }
+        for (_, _, bytes) in TextFont::EMBEDDED {
+            db.load_font_source(fontdb::Source::Binary(Arc::new(bytes.to_vec())));
+        }
+        db.set_sans_serif_family(&family);
+        Fonts { db: Arc::new(db), family }
+    })
+}
+
+fn parse(svg: &str) -> Result<usvg::Tree, String> {
+    let f = fonts();
+    let opts = usvg::Options { fontdb: f.db.clone(), font_family: f.family.clone(), ..Default::default() };
+    usvg::Tree::from_str(svg, &opts).map_err(|e| format!("svg: {e}"))
+}
+
+fn rasterise(tree: &usvg::Tree, region: Rect, dpi: u32) -> Result<RgbaImage, String> {
+    let [pw, ph] = pixel_size(region, dpi);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(pw, ph).ok_or_else(|| format!("{pw} x {ph} px is too large to render; lower the DPI"))?;
+    let size = tree.size();
+    let t = resvg::tiny_skia::Transform::from_scale(pw as f32 / size.width(), ph as f32 / size.height());
+    resvg::render(tree, t, &mut pixmap.as_mut());
+    let mut raw = Vec::with_capacity((pw * ph * 4) as usize);
+    for p in pixmap.pixels() {
+        let c = p.demultiply();
+        raw.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    RgbaImage::from_raw(pw, ph, raw).ok_or_else(|| "render failed".to_string())
+}
+
+/// Insert a pHYs chunk (pixels per metre) right after IHDR so viewers and journals see the DPI.
+fn png_with_dpi(png: Vec<u8>, dpi: u32) -> Vec<u8> {
+    const IHDR_END: usize = 8 + 8 + 13 + 4;
+    if png.len() < IHDR_END {
+        return png;
+    }
+    let ppm = (dpi as f64 / 0.0254).round() as u32;
+    let mut chunk = Vec::with_capacity(21);
+    chunk.extend_from_slice(&9u32.to_be_bytes());
+    let mut body = b"pHYs".to_vec();
+    body.extend_from_slice(&ppm.to_be_bytes());
+    body.extend_from_slice(&ppm.to_be_bytes());
+    body.push(1); // unit: metre
+    let mut crc = flate2::Crc::new();
+    crc.update(&body);
+    chunk.extend_from_slice(&body);
+    chunk.extend_from_slice(&crc.sum().to_be_bytes());
+    let mut out = Vec::with_capacity(png.len() + chunk.len());
+    out.extend_from_slice(&png[..IHDR_END]);
+    out.extend_from_slice(&chunk);
+    out.extend_from_slice(&png[IHDR_END..]);
+    out
+}
+
+/// Composite onto white (for formats without alpha).
+fn flatten(img: &RgbaImage) -> image::RgbImage {
+    image::RgbImage::from_fn(img.width(), img.height(), |x, y| {
+        let p = img.get_pixel(x, y).0;
+        let a = p[3] as f32 / 255.0;
+        image::Rgb([0, 1, 2].map(|i| (p[i] as f32 * a + 255.0 * (1.0 - a)).round() as u8))
+    })
+}
+
+/// Put the credits of the artwork in a figure into the SVG, as its `<desc>`.
+fn svg_with_credits(svg: &str, credits: &str) -> String {
+    let Some(end) = svg.find('>') else { return svg.to_string() };
+    format!("{}\n<desc>Image credits:\n{}</desc>{}", &svg[..=end], esc(credits), &svg[end + 1..])
+}
+
+/// Add an iTXt chunk (UTF-8 text, keyword "Comment") with the credits before IEND.
+fn png_with_credits(png: Vec<u8>, credits: &str) -> Vec<u8> {
+    if png.len() < 12 {
+        return png;
+    }
+    let mut body = b"iTXt".to_vec();
+    body.extend_from_slice(b"Comment\0\0\0\0\0"); // keyword, no compression, no language or translation
+    body.extend_from_slice(format!("Image credits:\n{credits}").as_bytes());
+    let mut crc = flate2::Crc::new();
+    crc.update(&body);
+    let iend = png.len() - 12;
+    let mut out = Vec::with_capacity(png.len() + body.len() + 8);
+    out.extend_from_slice(&png[..iend]);
+    out.extend_from_slice(&((body.len() - 4) as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
+    out.extend_from_slice(&png[iend..]);
+    out
+}
+
+/// `credits` (one per line, possibly empty) go into SVG and PNG files as metadata.
+fn write_file(svg: &str, region: Rect, opts: &ExportOptions, path: &Path, credits: &str) -> Result<(), String> {
+    let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let dpi = opts.dpi.clamp(MIN_DPI, MAX_DPI);
+    let bytes = match opts.format {
+        ExportFormat::Svg if !credits.is_empty() => svg_with_credits(svg, credits).into_bytes(),
+        ExportFormat::Svg => svg.as_bytes().to_vec(),
+        ExportFormat::Pdf => {
+            let tree = parse(svg)?;
+            svg2pdf::to_pdf(&tree, svg2pdf::ConversionOptions::default(), svg2pdf::PageOptions { dpi: DPI }).map_err(|e| err(&e))?
+        }
+        ExportFormat::Png => {
+            let img = rasterise(&parse(svg)?, region, dpi)?;
+            let mut buf = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).map_err(|e| err(&e))?;
+            let png = png_with_dpi(buf, dpi);
+            if credits.is_empty() { png } else { png_with_credits(png, credits) }
+        }
+        ExportFormat::Jpg => {
+            let img = flatten(&rasterise(&parse(svg)?, region, dpi)?);
+            let mut buf = Vec::new();
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 95);
+            enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(dpi.min(u16::MAX as u32) as u16));
+            enc.encode_image(&img).map_err(|e| err(&e))?;
+            buf
+        }
+        ExportFormat::Tif => {
+            use tiff::encoder::{colortype, Compression, Rational, TiffEncoder};
+            let img = rasterise(&parse(svg)?, region, dpi)?;
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut enc = TiffEncoder::new(&mut buf).map_err(|e| err(&e))?.with_compression(Compression::Lzw);
+            let (w, h) = img.dimensions();
+            let res = Rational { n: dpi, d: 1 };
+            if img.pixels().all(|p| p.0[3] == 255) {
+                let rgb = flatten(&img);
+                let mut im = enc.new_image::<colortype::RGB8>(w, h).map_err(|e| err(&e))?;
+                im.resolution(tiff::tags::ResolutionUnit::Inch, res);
+                im.write_data(rgb.as_raw()).map_err(|e| err(&e))?;
+            } else {
+                let mut im = enc.new_image::<colortype::RGBA8>(w, h).map_err(|e| err(&e))?;
+                im.resolution(tiff::tags::ResolutionUnit::Inch, res);
+                im.write_data(img.as_raw()).map_err(|e| err(&e))?;
+            }
+            buf.into_inner()
+        }
+    };
+    // A download in the browser.
+    crate::platform::write_output(path, &bytes).map_err(|e| err(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::{ImageSource, ShapeKind};
+
+    /// Exports a slide with every item kind in every format. Set BIOCARTOON_EXPORT_TEST_DIR to
+    /// keep the files for inspection.
+    #[test]
+    fn exports_every_format() {
+        let ctx = egui::Context::default();
+        let mut defs = egui::FontDefinitions::default();
+        TextFont::install(&mut defs);
+        ctx.set_fonts(defs);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let dir = std::env::var("BIOCARTOON_EXPORT_TEST_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("biocartoon-export-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let icon = dir.join("icon.png");
+        std::fs::write(&icon, crate::ICON_PNG).unwrap();
+
+        let mut slide = Slide::default();
+        let src = ImageSource::file(icon.display().to_string());
+        // An AI edit of a catalog asset: exports still credit the original.
+        let catalog = ImageSource::Asset { id: "servier/cell".into(), key: "x".into(), title: "Cell".into(), source: "servier".into(), credit: "\"Cell\", Servier Medical Art, CC-BY-4.0 & co".into(), license: "CC-BY-4.0".into() };
+        let edited = catalog.derived(icon.display().to_string());
+        let mut img = Item::new(1, "Cell icon", ItemKind::Image { source: edited, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4] }, Pos2::new(40.0, 40.0), Vec2::splat(200.0));
+        img.rotation = 0.3;
+        slide.items.push(img);
+        slide.items.push(Item::new(2, "Tinted", ItemKind::Image { source: src.clone(), crop: [0.25, 0.25, 0.75, 0.75], overlay: [255, 0, 0, 128] }, Pos2::new(300.0, 40.0), Vec2::splat(120.0)));
+        slide.items.push(Item::new(3, "Title", ItemKind::text("Hello BioCartoon, a fairly long title that wraps", 28.0, [20, 20, 20, 255], TextAlign::Center, true), Pos2::new(450.0, 40.0), Vec2::new(400.0, 80.0)));
+        slide.items.push(Item::new(4, "Star", ItemKind::Shape { shape: ShapeKind::Star, fill: [47, 128, 237, 255], stroke: [0, 0, 0, 255], stroke_width: 2.0 }, Pos2::new(450.0, 200.0), Vec2::splat(150.0)));
+        slide.items.push(Item::new(5, "Arrow", ItemKind::Line { kind: crate::doc::LineKind::BentArrow, color: [200, 50, 50, 255], width: 3.0, style: Default::default(), points: Vec::new() }, Pos2::new(100.0, 400.0), Vec2::new(300.0, 150.0)));
+        slide.items.push(Item::new(6, "Inhibit", ItemKind::Line { kind: crate::doc::LineKind::Inhibitor, color: [0, 0, 0, 255], width: 2.0, style: Default::default(), points: Vec::new() }, Pos2::new(100.0, 600.0), Vec2::new(200.0, 0.0)));
+        slide.items.push(Item::new(7, "Table", ItemKind::Table { rows: 2, cols: 2, cells: vec!["Gene".into(), "Fold".into(), "TP53".into(), "2.4".into()], header: true, border: [100, 100, 100, 255], fill: [255, 255, 255, 255], header_fill: [220, 230, 250, 255], text_color: [0, 0, 0, 255], font_size: 14.0 }, Pos2::new(650.0, 450.0), Vec2::new(240.0, 80.0)));
+        slide.items.push(Item::new(8, "Code", ItemKind::Code { code: "def f(x):\n    return x * 2  # double\n".into(), language: crate::doc::CodeLang::Auto, theme: crate::doc::CodeTheme::Dracula, font_size: 14.0, line_numbers: true, window: true, rounded: true }, Pos2::new(600.0, 200.0), Vec2::new(300.0, 140.0)));
+
+        let page = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 672.0));
+        let mut requests = HashMap::new();
+        requests.insert(src.cache_key(), Request::Path(icon.clone()));
+        let job = |format, dpi, transparent, individual, name: &str| ExportJob {
+            path: dir.join(name),
+            opts: ExportOptions { format, dpi, transparent, individual, crop: false, save_credits: false, all_slides: false },
+            slides: vec![(1, slide.clone())],
+            page,
+            background: [250, 245, 235, 255],
+            requests: requests.clone(),
+            fallbacks: HashMap::new(),
+        };
+        for (f, name) in [(ExportFormat::Png, "slide.png"), (ExportFormat::Jpg, "slide.jpg"), (ExportFormat::Tif, "slide.tif"), (ExportFormat::Pdf, "slide.pdf"), (ExportFormat::Svg, "slide.svg")] {
+            run(&ctx, job(f, 150, false, false, name)).unwrap();
+        }
+        run(&ctx, job(ExportFormat::Png, 300, true, false, "transparent.png")).unwrap();
+        let msg = run(&ctx, job(ExportFormat::Png, 300, true, true, "each.png")).unwrap();
+        assert!(msg.contains("2 images"), "{msg}");
+
+        let png = image::open(dir.join("slide.png")).unwrap();
+        assert_eq!((png.width(), png.height()), (1500, 1050));
+        let mut crop = job(ExportFormat::Png, 150, false, false, "cropped.png");
+        crop.opts.crop = true;
+        run(&ctx, crop).unwrap();
+        let [w, h] = pixel_size(images_bounds(&slide).unwrap(), 150);
+        let cropped = image::open(dir.join("cropped.png")).unwrap();
+        assert_eq!((cropped.width(), cropped.height()), (w, h));
+        assert!(w < 1500 && h < 1050);
+        let t = image::open(dir.join("transparent.png")).unwrap().to_rgba8();
+        assert_eq!(t.get_pixel(5, 5).0[3], 0, "background should be transparent");
+        // The rotated image's tight box is larger than its unrotated 200 x 200.
+        let each = image::open(dir.join("each-01-cell-icon.png")).unwrap();
+        assert!(each.width() > 625 && each.width() == each.height());
+        let each2 = image::open(dir.join("each-02-tinted.png")).unwrap();
+        assert_eq!((each2.width(), each2.height()), (375, 375));
+        let bytes = std::fs::read(dir.join("slide.png")).unwrap();
+        assert!(bytes.windows(4).any(|w| w == b"pHYs"));
+        assert!(bytes.windows(12).any(|w| w == b"Servier Medi"), "PNG should carry the credits");
+        let svg = std::fs::read_to_string(dir.join("slide.svg")).unwrap();
+        assert!(svg.contains("<desc>Image credits:\n&quot;Cell&quot;, Servier Medical Art, CC-BY-4.0 &amp; co</desc>"), "{}", &svg[..300]);
+        // The credits chunk leaves a valid PNG.
+        assert_eq!(image::open(dir.join("transparent.png")).unwrap().width(), 3000);
+
+        // All slides: one file per slide; cropping skips the slide without images.
+        let text_only = Slide { name: "Text".into(), items: vec![slide.items[2].clone()] };
+        let mut all = job(ExportFormat::Png, 72, false, false, "deck.png");
+        all.slides = vec![(1, slide.clone()), (2, text_only.clone())];
+        all.opts.save_credits = true;
+        let msg = run(&ctx, all).unwrap();
+        assert!(msg.contains("2 slides"), "{msg}");
+        assert!(dir.join("deck-slide1.png").exists() && dir.join("deck-slide2.png").exists() && dir.join("deck-credits.txt").exists());
+        let mut each = job(ExportFormat::Png, 72, false, true, "deckeach.png");
+        each.slides = vec![(1, slide.clone()), (2, text_only.clone())];
+        run(&ctx, each).unwrap();
+        assert!(dir.join("deckeach-slide1-01-cell-icon.png").exists());
+        let mut crop = job(ExportFormat::Png, 72, false, false, "deckcrop.png");
+        crop.slides = vec![(1, slide.clone()), (2, text_only)];
+        crop.opts.crop = true;
+        run(&ctx, crop).unwrap();
+        assert!(dir.join("deckcrop-slide1.png").exists() && !dir.join("deckcrop-slide2.png").exists());
+    }
+}

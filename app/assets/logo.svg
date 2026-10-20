@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="768" height="768" viewBox="0 0 768 768" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">BioCartoon — the cell palette</title>
+  <desc id="desc">A warm tan artist's palette with a subtly B-shaped silhouette and an open thumb hole. Seven individually editable biological motifs replace paint: a multilobed immune cell, striated muscle fiber, branching neuron, adipocyte, hexagonal hepatocyte, spiky osteocyte, and red blood cells. All artwork consists of native vector shapes; the background and thumb hole are transparent.</desc>
+  <defs>
+    <linearGradient id="wood" x1="186" y1="175" x2="522" y2="655" gradientUnits="userSpaceOnUse"><stop stop-color="#F6DFB8"/><stop offset=".52" stop-color="#EAC994"/><stop offset="1" stop-color="#D9AE76"/></linearGradient>
+    <linearGradient id="immune-fill" x1="173" y1="211" x2="255" y2="307" gradientUnits="userSpaceOnUse"><stop stop-color="#F2E7FA"/><stop offset="1" stop-color="#C7A7DF"/></linearGradient>
+    <linearGradient id="muscle-fill" x1="367" y1="184" x2="367" y2="236" gradientUnits="userSpaceOnUse"><stop stop-color="#F0A5BE"/><stop offset=".52" stop-color="#E78FAF"/><stop offset="1" stop-color="#CF7197"/></linearGradient>
+    <linearGradient id="neuron-fill" x1="477" y1="263" x2="521" y2="326" gradientUnits="userSpaceOnUse"><stop stop-color="#8AC9EC"/><stop offset="1" stop-color="#4E9CCD"/></linearGradient>
+    <radialGradient id="fat-fill" cx=".33" cy=".27" r=".8"><stop stop-color="#FFFDF0"/><stop offset=".75" stop-color="#FFF1AF"/><stop offset="1" stop-color="#F0D677"/></radialGradient>
+    <linearGradient id="liver-fill" x1="240" y1="506" x2="299" y2="614" gradientUnits="userSpaceOnUse"><stop stop-color="#A5DBC1"/><stop offset="1" stop-color="#59B394"/></linearGradient>
+    <linearGradient id="bone-fill" x1="337" y1="380" x2="396" y2="446" gradientUnits="userSpaceOnUse"><stop stop-color="#F8BE77"/><stop offset="1" stop-color="#E99747"/></linearGradient>
+    <radialGradient id="rbc-fill" cx=".46" cy=".42" r=".64"><stop stop-color="#C6515B"/><stop offset=".37" stop-color="#CF5D64"/><stop offset=".61" stop-color="#E47F80"/><stop offset=".83" stop-color="#D76570"/><stop offset="1" stop-color="#B94155"/></radialGradient>
+    <path id="palette-outline" fill-rule="evenodd" d="M540 400C540 379 592 367 615 338C673 266 620 209 531 170C415 115 236 136 145 214C100 263 82 441 114 544C151 644 306 705 437 665C540 637 613 594 610 531C608 481 568 455 547 426C541 417 540 408 540 400ZM525 438C508 427 487 438 477 459C466 482 469 505 485 514C501 523 521 511 531 489C541 466 540 448 525 438Z"/>
+    <path id="palette-edge-outline" fill-rule="evenodd" d="M540 400C540 379 592 367 615 338C673 266 620 209 531 170C415 115 236 136 145 214C100 263 82 441 114 544C151 644 306 705 437 665C540 637 613 594 610 531C608 481 568 455 547 426C541 417 540 408 540 400ZM525 438C508 427 487 438 477 459C466 482 469 505 485 514C501 523 521 511 531 489C541 466 540 448 525 438Z"/>
+    <path id="palette-shadow-outline" fill-rule="evenodd" d="M540 400C540 379 592 367 615 338C673 266 620 209 531 170C415 115 236 136 145 214C100 263 82 441 114 544C151 644 306 705 437 665C540 637 613 594 610 531C608 481 568 455 547 426C541 417 540 408 540 400ZM525 427C508 416 487 427 477 448C466 471 469 494 485 503C501 512 521 500 531 478C541 455 540 437 525 427Z"/>
+  </defs>
+
+  <!-- Palette: the thumb opening is an even-odd subpath, not a white ellipse. -->
+  <g id="palette" inkscape:label="Palette and open thumb hole" stroke-linecap="round" stroke-linejoin="round">
+    <use href="#palette-shadow-outline" transform="translate(0 11)" fill="#745236" opacity=".11"/>
+    <use href="#palette-edge-outline" transform="translate(0 6)" fill="#BB8B59" stroke="#A97B4D" stroke-width="3.5"/>
+    <use href="#palette-outline" fill="url(#wood)" stroke="#AC8053" stroke-width="3.5"/>
+
+    <g id="wood-grain" stroke="#BC925F" stroke-width="2" opacity=".18">
+      <path d="M278 285C316 268 354 262 392 266"/>
+      <path d="M115 356C138 340 160 332 184 329"/>
+      <path d="M235 454C255 459 275 461 294 459"/>
+      <path d="M326 511C366 522 410 524 449 514"/>
+      <path d="M192 623C205 631 222 637 240 641"/>
+    </g>
+  </g>
+
+  <!-- Neutrophil: pale granular cytoplasm and three connected nuclear lobes. -->
+  <g id="immune-cell" transform="translate(0 12)" inkscape:label="Immune cell — multilobed neutrophil" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M209 204C239 200 268 222 271 251C276 284 252 312 222 316C190 321 160 300 155 270C149 239 176 208 209 204Z" fill="#8D664F" opacity=".12" transform="translate(0 4)"/>
+    <path d="M209 204C239 200 268 222 271 251C276 284 252 312 222 316C190 321 160 300 155 270C149 239 176 208 209 204Z" fill="url(#immune-fill)" stroke="#9272AB" stroke-width="3"/>
+
+    <path d="M193 244C204 247 215 256 225 263C231 270 232 279 225 285" stroke="#795596" stroke-width="8"/>
+    <path d="M185 230C175 235 176 251 184 258C193 266 206 258 206 247C207 236 197 225 185 230Z" fill="#8760A6" stroke="#6F4C8A" stroke-width="2"/>
+    <path d="M231 240C221 238 214 247 216 258C218 271 229 276 239 268C250 260 244 243 231 240Z" fill="#8760A6" stroke="#6F4C8A" stroke-width="2"/>
+    <path d="M207 274C198 276 196 287 203 295C211 303 225 300 229 291C234 279 219 270 207 274Z" fill="#8760A6" stroke="#6F4C8A" stroke-width="2"/>
+    <g fill="#AC83BE" opacity=".8"><circle cx="215" cy="221" r="2.4"/><circle cx="238" cy="226" r="2.4"/><circle cx="253" cy="244" r="2"/><circle cx="253" cy="273" r="2.4"/><circle cx="239" cy="292" r="2"/><circle cx="184" cy="285" r="2.6"/><circle cx="171" cy="268" r="2"/><circle cx="194" cy="310" r="1.6"/><circle cx="217" cy="306" r="2"/><circle cx="205" cy="266" r="2"/><circle cx="167" cy="252" r="1.8"/></g>
+  </g>
+
+  <!-- Skeletal muscle fiber: cylindrical segment, transverse sarcomere bands,
+       fine longitudinal myofibrils and elongated peripheral nuclei. -->
+  <g id="muscle-cell" inkscape:label="Muscle — striated skeletal muscle fiber" transform="rotate(-9 367 211)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M289 185C331 183 408 186 451 185C465 184 466 234 452 235C409 237 331 233 289 235C277 236 277 186 289 185Z" fill="#8D664F" opacity=".12" transform="translate(0 4)"/>
+    <path d="M289 185C331 183 408 186 451 185C465 184 466 234 452 235C409 237 331 233 289 235C277 236 277 186 289 185Z" fill="url(#muscle-fill)" stroke="#B56084" stroke-width="3"/>
+    <g id="muscle-sarcomere-bands" fill="#B95783" opacity=".32">
+      <path d="M299 190Q302 210 299 230L306 230Q309 210 306 190Z"/>
+      <path d="M315 190Q318 210 315 230L322 230Q325 210 322 190Z"/>
+      <path d="M331 190Q334 210 331 230L338 230Q341 210 338 190Z"/>
+      <path d="M347 190Q350 210 347 230L354 230Q357 210 354 190Z"/>
+      <path d="M363 190Q366 210 363 230L370 230Q373 210 370 190Z"/>
+      <path d="M379 190Q382 210 379 230L386 230Q389 210 386 190Z"/>
+      <path d="M395 190Q398 210 395 230L402 230Q405 210 402 190Z"/>
+      <path d="M411 190Q414 210 411 230L418 230Q421 210 418 190Z"/>
+      <path d="M427 190Q430 210 427 230L434 230Q437 210 434 190Z"/>
+    </g>
+    <g id="muscle-z-lines" stroke="#A74F79" stroke-width="1.2" opacity=".65">
+      <path d="M295 191Q298 210 295 230"/>
+      <path d="M311 191Q314 210 311 230"/>
+      <path d="M327 191Q330 210 327 230"/>
+      <path d="M343 191Q346 210 343 230"/>
+      <path d="M359 191Q362 210 359 230"/>
+      <path d="M375 191Q378 210 375 230"/>
+      <path d="M391 191Q394 210 391 230"/>
+      <path d="M407 191Q410 210 407 230"/>
+      <path d="M423 191Q426 210 423 230"/>
+      <path d="M439 191Q442 210 439 230"/>
+    </g>
+    <g id="muscle-myofibrils" stroke="#BD6288" stroke-width="1.4" opacity=".6">
+      <path d="M288 198C332 196 401 200 449 198"/>
+      <path d="M287 210C332 208 401 212 448 210"/>
+      <path d="M288 222C332 220 401 224 449 222"/>
+    </g>
+    <g id="muscle-peripheral-nuclei" fill="#99547D" stroke="#89466E" stroke-width="1">
+      <ellipse cx="307" cy="189" rx="9" ry="3.2"/>
+      <ellipse cx="390" cy="189" rx="10" ry="3.2"/>
+      <ellipse cx="337" cy="230" rx="9" ry="3.1"/>
+      <ellipse cx="423" cy="231" rx="9" ry="3.1"/>
+    </g>
+    <g id="muscle-fiber-end" inkscape:label="Fiber cross section">
+      <ellipse cx="452" cy="210" rx="9" ry="24" fill="#EBA1BC" stroke="#B56084" stroke-width="2"/>
+      <g fill="#C56C93" opacity=".85">
+        <ellipse cx="451" cy="195" rx="2.2" ry="3"/>
+        <ellipse cx="448" cy="205" rx="2" ry="2.8"/>
+        <ellipse cx="455" cy="204" rx="2" ry="2.8"/>
+        <ellipse cx="448" cy="215" rx="2" ry="2.8"/>
+        <ellipse cx="455" cy="215" rx="2" ry="2.8"/>
+        <ellipse cx="451" cy="225" rx="2.2" ry="3"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- Neuron: branching dendrites, an irregular soma, nucleus and long axon. -->
+  <g id="neuron" transform="translate(-154 77)" inkscape:label="Neuron — soma, dendrites and axon" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#3C7CA6" stroke-width="8"><path d="M484 278L469 259L461 235M471 260L447 253M500 274L507 250L523 236M507 251L502 230M518 288L544 277L559 257M543 278L568 284M519 310L543 323L559 343M543 324L565 318M488 317L472 336L449 342M474 334L470 351M477 294L453 290L439 276M453 290L438 302M502 321C500 345 512 350 508 370C505 388 488 389 488 405M489 400L478 409M489 400L498 409"/></g>
+    <g stroke="#78B9DF" stroke-width="4.5"><path d="M484 278L469 259L461 235M471 260L447 253M500 274L507 250L523 236M507 251L502 230M518 288L544 277L559 257M543 278L568 284M519 310L543 323L559 343M543 324L565 318M488 317L472 336L449 342M474 334L470 351M477 294L453 290L439 276M453 290L438 302M502 321C500 345 512 350 508 370C505 388 488 389 488 405M489 400L478 409M489 400L498 409"/></g>
+    <path d="M484 273C490 278 496 279 503 271C505 282 511 287 523 287C516 297 517 305 526 314C514 313 507 317 502 328C497 319 489 316 478 322C482 309 478 304 469 297C480 292 484 286 484 273Z" fill="url(#neuron-fill)" stroke="#397BA6" stroke-width="2.5"/>
+    <ellipse cx="497" cy="298" rx="13" ry="14" fill="#C0E1F3" stroke="#588FAF" stroke-width="2"/>
+    <circle cx="500" cy="299" r="4.5" fill="#457FA8"/>
+
+  </g>
+
+  <!-- Adipocyte: a single large lipid droplet with the nucleus pushed to the rim. -->
+  <g id="adipocyte" inkscape:label="Adipocyte — large lipid droplet and peripheral nucleus" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="170" cy="422" r="59" fill="#8D664F" opacity=".12" transform="translate(0 5)"/>
+    <circle cx="170" cy="422" r="59" fill="#EBD17A" stroke="#BA9E46" stroke-width="3"/>
+    <path d="M216 414C219 439 204 466 178 471C148 477 125 458 122 433C118 405 134 376 164 374C191 371 213 389 216 414Z" fill="url(#fat-fill)" stroke="#D7BB65" stroke-width="2"/>
+
+    <path d="M208 449C210 440 216 434 223 432C222 445 217 458 207 466C203 462 204 456 208 449Z" fill="#9C7B55" stroke="#846748" stroke-width="1.5"/>
+  </g>
+
+  <!-- Osteocyte: one continuous stellate cell with long canalicular processes. -->
+  <g id="osteocyte" transform="translate(126 -117)" inkscape:label="Osteocyte — stellate bone cell" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M360 348L368 379Q373 387 382 380L407 359L394 389Q391 397 402 398L437 392L410 410Q403 415 410 423L435 445L403 435Q394 432 392 442L393 475L375 450Q370 443 362 451L341 473L348 441Q350 433 339 432L307 440L331 419Q338 413 329 405L303 386L338 394Q347 396 348 385Z" fill="#8D664F" opacity=".12" transform="translate(0 4)"/>
+    <path d="M360 348L368 379Q373 387 382 380L407 359L394 389Q391 397 402 398L437 392L410 410Q403 415 410 423L435 445L403 435Q394 432 392 442L393 475L375 450Q370 443 362 451L341 473L348 441Q350 433 339 432L307 440L331 419Q338 413 329 405L303 386L338 394Q347 396 348 385Z" fill="url(#bone-fill)" stroke="#B67534" stroke-width="2.8"/>
+
+    <ellipse cx="371" cy="415" rx="17" ry="20" transform="rotate(-17 371 415)" fill="#BE7A42" stroke="#9B5E2F" stroke-width="2"/>
+    <ellipse cx="376" cy="418" rx="5" ry="6" fill="#8B542C"/>
+    <g stroke="#B67534" stroke-width="2"><path d="M356 367L345 359M401 367L413 368M423 401L432 410M423 441L426 453M391 462L402 470M345 459L333 459M319 430L312 420M319 390L317 378"/></g>
+  </g>
+
+  <!-- Hepatocyte: softly rounded hexagonal outline, central nucleus, small organelles. -->
+  <g id="hepatocyte" inkscape:label="Hepatocyte — hexagonal liver cell" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M249 502Q255 499 261 503L303 528Q309 531 309 538L308 583Q308 590 302 594L261 618Q255 622 249 618L209 594Q203 590 203 583L204 538Q204 532 210 528Z" fill="#8D664F" opacity=".12" transform="translate(0 4)"/>
+    <path d="M249 502Q255 499 261 503L303 528Q309 531 309 538L308 583Q308 590 302 594L261 618Q255 622 249 618L209 594Q203 590 203 583L204 538Q204 532 210 528Z" fill="url(#liver-fill)" stroke="#418B74" stroke-width="3"/>
+
+    <circle cx="256" cy="560" r="23" fill="#538F86" stroke="#397469" stroke-width="2.5"/>
+    <circle cx="260" cy="563" r="7" fill="#326B66"/>
+
+    <g fill="#9FD0A5" stroke="#4F9C7C" stroke-width="1.7"><path d="M223 550C216 553 215 562 221 565C226 567 232 559 230 554C229 551 227 550 223 550Z"/><path d="M282 528C276 530 275 535 280 539C285 543 293 541 294 537C296 531 286 526 282 528Z"/><path d="M280 585C275 586 271 593 275 597C279 601 289 596 290 592C292 587 285 583 280 585Z"/></g>
+    <g stroke="#3C8D77" stroke-width="2" opacity=".65"><path d="M218 579L229 584M220 584L231 589M223 589L232 594M287 551L294 555M285 557L295 562M285 563L292 567"/></g>
+    <g fill="#3D9178" opacity=".7"><circle cx="245" cy="594" r="2"/><circle cx="239" cy="526" r="2.2"/><circle cx="270" cy="523" r="1.7"/><circle cx="293" cy="578" r="2"/><circle cx="239" cy="605" r="1.8"/></g>
+  </g>
+
+  <!-- Erythrocytes: shaded biconcave discs, deliberately without nuclei. -->
+  <g id="red-blood-cells" inkscape:label="Red blood cells — biconcave discs" stroke-linecap="round">
+    <g transform="translate(391 560) rotate(-23)">
+      <ellipse cy="4" rx="35" ry="27" fill="#8D664F" opacity=".12"/>
+      <ellipse rx="35" ry="27" fill="url(#rbc-fill)" stroke="#A93E50" stroke-width="2.7"/>
+      <ellipse rx="16" ry="10" fill="#AD4056" opacity=".36"/>
+
+    </g>
+    <g transform="translate(440 601) rotate(-35)">
+      <ellipse cy="4" rx="32" ry="25" fill="#8D664F" opacity=".12"/>
+      <ellipse rx="32" ry="25" fill="url(#rbc-fill)" stroke="#A93E50" stroke-width="2.7"/>
+      <ellipse rx="14" ry="9" fill="#AD4056" opacity=".36"/>
+
+    </g>
+    <g transform="translate(366 615) rotate(21)">
+      <ellipse rx="25" ry="17" fill="url(#rbc-fill)" stroke="#A93E50" stroke-width="2.4"/>
+      <ellipse rx="12" ry="6" fill="#AD4056" opacity=".4"/>
+
+    </g>
+  </g>
+
+</svg>

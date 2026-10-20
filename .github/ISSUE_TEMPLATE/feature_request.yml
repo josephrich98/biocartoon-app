@@ -1,0 +1,11 @@
+name: Feature request
+description: Suggest something the editor should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What you'd like
+      description: The figure you're trying to make, and what would make it easier.
+    validations:
+      required: true

@@ -1,0 +1,354 @@
+//! Attributions: who made the artwork a document uses, and the text that credits them in a figure
+//! legend. Each catalog image carries its credit line in the document (see
+//! [`ImageSource::Asset`]); documents saved before that are filled in from the catalog.
+
+use crate::app::BioCartoon;
+use crate::doc::{Document, ImageSource, Item, ItemKind, Slide};
+use crate::theme;
+use biocartoon_catalog::catalog::AssetRow;
+use egui::Vec2;
+use egui_phosphor::regular as ph;
+
+/// One asset the document uses, however many times.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Credit {
+    pub id: String,
+    pub title: String,
+    /// The ready-to-print attribution line; empty while it is being looked up.
+    pub credit: String,
+    pub license: String,
+    /// Its license requires the credit (CC BY, CC BY-SA, MIT, BSD...), rather than just welcoming it.
+    pub required: bool,
+    /// Some uses are edited copies (an AI edit), which still owe the original's credit.
+    pub derived: bool,
+    /// 1-based numbers of the slides it appears on.
+    pub slides: Vec<usize>,
+}
+
+/// Public domain and CC0 ask for nothing; anything else (or an unknown license) wants credit.
+pub fn license_needs_credit(license: &str) -> bool {
+    !matches!(license, "PD" | "CC0-1.0")
+}
+
+/// The credit line for one of a template's own images; keep in step with `creditLine` in the
+/// biocartoon repository's worker/src/validate.ts, which sets it on published templates.
+pub fn template_credit(title: &str, author: &str, license: &str, template: &str) -> String {
+    let by = if author.is_empty() || author == "anonymous" { String::new() } else { format!(" by {author}") };
+    let lic = match license {
+        "CC0-1.0" => "CC0".to_string(),
+        "CC-BY-4.0" => "CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)".to_string(),
+        l => l.to_string(),
+    };
+    format!("\"{title}\"{by}, template \"{template}\", {lic}")
+}
+
+/// The asset an image item is, or was made from.
+fn origin(it: &Item) -> Option<(&ImageSource, bool)> {
+    let ItemKind::Image { source, .. } = &it.kind else { return None };
+    let o = source.origin()?;
+    matches!(o, ImageSource::Asset { id, .. } if !id.is_empty()).then_some((o, !matches!(source, ImageSource::Asset { .. })))
+}
+
+/// The assets on `slides` (numbered from `first`), in order of first appearance.
+pub fn collect<'a>(slides: impl IntoIterator<Item = &'a Slide>, first: usize) -> Vec<Credit> {
+    let mut out: Vec<Credit> = Vec::new();
+    for (n, slide) in slides.into_iter().enumerate() {
+        for it in &slide.items {
+            let Some((ImageSource::Asset { id, title, credit, license, .. }, derived)) = origin(it) else { continue };
+            let n = n + first;
+            match out.iter_mut().find(|c| &c.id == id) {
+                Some(c) => {
+                    c.derived |= derived;
+                    if c.slides.last() != Some(&n) {
+                        c.slides.push(n);
+                    }
+                }
+                None => out.push(Credit {
+                    id: id.clone(),
+                    title: title.clone(),
+                    credit: credit.clone(),
+                    license: license.clone(),
+                    // Not known until the credit is looked up: assume it is needed.
+                    required: license.is_empty() || license_needs_credit(license),
+                    derived,
+                    slides: vec![n],
+                }),
+            }
+        }
+    }
+    out
+}
+
+/// The credits of a set of items, one per line (embedded in exported files).
+pub fn for_items(items: &[&Item]) -> String {
+    let slide = Slide { name: String::new(), items: items.iter().map(|it| (*it).clone()).collect() };
+    collect([&slide], 1).iter().filter(|c| !c.credit.is_empty()).map(|c| c.credit.clone()).collect::<Vec<_>>().join("\n")
+}
+
+/// A figure-legend sentence: "Image credits: <line>; <line>."
+pub fn caption(credits: &[Credit], only_required: bool) -> String {
+    let lines: Vec<&str> = credits.iter().filter(|c| !only_required || c.required).map(|c| c.credit.as_str()).filter(|c| !c.is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("Image credits: {}.", lines.join("; "))
+}
+
+/// Ids of catalog assets in `doc` that don't carry their credit yet (documents saved before
+/// credits were stored). Template images are left out: their credit comes with the template.
+pub fn missing(doc: &Document) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for it in doc.slides.iter().flat_map(|s| &s.items) {
+        if let Some((ImageSource::Asset { id, source, credit, .. }, _)) = origin(it) {
+            if credit.is_empty() && source != "template" && !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// Copy credit lines from catalog rows into every image of `slides` that uses them.
+pub fn fill<'a>(slides: impl IntoIterator<Item = &'a mut Slide>, rows: &[AssetRow]) {
+    for it in slides.into_iter().flat_map(|s| s.items.iter_mut()) {
+        let ItemKind::Image { source, .. } = &mut it.kind else { continue };
+        if let Some(ImageSource::Asset { id, credit, license, .. }) = source.origin_mut() {
+            if let Some(r) = rows.iter().find(|r| &r.id == id) {
+                *credit = r.credit.clone();
+                *license = r.license.clone();
+            }
+        }
+    }
+}
+
+impl BioCartoon {
+    /// The title and credit line a library image (or an edit of one) owes; the credit is looked up
+    /// in the loaded catalog rows when the document doesn't carry it yet.
+    pub fn item_credit(&self, it: &Item) -> Option<(String, String)> {
+        let (ImageSource::Asset { id, title, credit, .. }, _) = origin(it)? else { return None };
+        let credit = Some(credit.clone())
+            .filter(|c| !c.is_empty())
+            .or_else(|| self.icons.results.iter().chain(self.variants.iter()).find(|r| &r.id == id).map(|r| r.credit.clone()))
+            .unwrap_or_else(|| format!("Asset {id}"));
+        Some((title.clone(), credit))
+    }
+
+    /// Right-click > Show credit: one image's credit, with a button to copy it.
+    pub fn credit_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.credit_item else { return };
+        let Some((title, credit)) = self.item(id).and_then(|it| self.item_credit(it)) else {
+            self.credit_item = None;
+            return;
+        };
+        let mut open = true;
+        let mut copied = false;
+        let center = ctx.content_rect().center();
+        egui::Window::new(format!("{}  Credit", ph::QUOTES))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .default_pos(center - Vec2::new(180.0, 80.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(&title).strong());
+                ui.add(egui::Label::new(&credit).selectable(true));
+                ui.add_space(6.0);
+                if ui.button(format!("{}  Copy credit", ph::COPY)).clicked() {
+                    ui.ctx().copy_text(credit.clone());
+                    copied = true;
+                }
+            });
+        if copied {
+            self.toast("Copied the credit");
+        }
+        if !open {
+            self.credit_item = None;
+        }
+    }
+
+    /// File > Attributions: every asset in the document (or one slide, from the canvas's
+    /// right-click menu) with its credit line, and a ready-made sentence for the figure legend.
+    pub fn attributions_window(&mut self, ctx: &egui::Context) {
+        if !self.show_attributions {
+            return;
+        }
+        let (credits, title) = match self.attributions_slide.filter(|&i| i < self.doc.slides.len()) {
+            Some(i) => (collect([&self.doc.slides[i]], i + 1), format!("{}  Attributions: slide {}", ph::QUOTES, i + 1)),
+            None => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES)),
+        };
+        let mut open = true;
+        let mut copied: Option<String> = None;
+        let center = ctx.content_rect().center();
+        egui::Window::new(title)
+            .id(egui::Id::new("attributions_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_size([480.0, 460.0])
+            .default_pos(center - Vec2::new(240.0, 230.0))
+            .show(ctx, |ui| {
+                copied = attributions_ui(ui, &credits, &mut self.attributions_required_only);
+            });
+        if let Some(text) = copied {
+            ctx.copy_text(text);
+            self.toast("Copied the credits");
+        }
+        self.show_attributions = open;
+    }
+
+    /// The Attributions popup as a modal, for opening over another modal (the export dialog),
+    /// which an ordinary window can't sit above. Returns false once it is closed.
+    pub fn attributions_modal(&mut self, ctx: &egui::Context, credits: &[Credit]) -> bool {
+        let mut open = true;
+        let mut copied: Option<String> = None;
+        let modal = egui::Modal::new(egui::Id::new("attributions_modal")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.horizontal(|ui| {
+                ui.heading(format!("{}  Attributions", ph::QUOTES));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(ph::X).on_hover_text("Close").clicked() {
+                        open = false;
+                    }
+                });
+            });
+            ui.set_max_height(ctx.content_rect().height() * 0.7);
+            copied = attributions_ui(ui, credits, &mut self.attributions_required_only);
+        });
+        if modal.should_close() {
+            open = false;
+        }
+        if let Some(text) = copied {
+            ctx.copy_text(text);
+            self.toast("Copied the credits");
+        }
+        open
+    }
+}
+
+/// The body of the Attributions popup. Returns the text to copy, if a copy button was clicked.
+fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Option<String> {
+    let mut copied = None;
+    let pending = credits.iter().filter(|c| c.credit.is_empty()).count();
+    let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
+    if credits.is_empty() {
+        ui.label("There is no library artwork here, so there is no one to credit.");
+        ui.label(dim("Images you uploaded or generated yourself are listed here once they are in the library."));
+        return None;
+    }
+    let required = credits.iter().filter(|c| c.required).count();
+    ui.label(format!(
+        "{} {} from the library; {required} {} credit.",
+        credits.len(),
+        if credits.len() == 1 { "piece of artwork" } else { "pieces of artwork" },
+        if required == 1 { "requires" } else { "require" }
+    ));
+    ui.label(dim("Paste the caption into your figure legend. Exported SVG and PNG files carry the same credits."));
+    ui.checkbox(only, "Only the credits the licenses require")
+        .on_hover_text("Public-domain and CC0 artwork needs no credit, but artists still appreciate it.");
+    if pending > 0 {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(dim(&format!("Looking up {pending} credit{} in the catalog...", if pending == 1 { "" } else { "s" })));
+        });
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let caption = caption(credits, *only);
+        if ui.add_enabled(!caption.is_empty(), egui::Button::new(format!("{}  Copy caption", ph::COPY))).clicked() {
+            copied = Some(caption);
+        }
+        let list: Vec<&str> = credits.iter().filter(|c| !*only || c.required).map(|c| c.credit.as_str()).filter(|c| !c.is_empty()).collect();
+        if ui.add_enabled(!list.is_empty(), egui::Button::new("Copy as list")).on_hover_text("One credit per line").clicked() {
+            copied = Some(list.join("\n"));
+        }
+    });
+    ui.separator();
+    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+        for c in credits.iter().filter(|c| !*only || c.required) {
+            ui.label(egui::RichText::new(&c.title).strong());
+            if c.credit.is_empty() {
+                ui.label(dim("Credit not found yet."));
+            } else {
+                ui.add(egui::Label::new(&c.credit).selectable(true));
+            }
+            let slides = c.slides.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+            let mut note = format!("{} {slides}", if c.slides.len() == 1 { "Slide" } else { "Slides" });
+            note.push_str(if c.required { "  ·  credit required" } else { "  ·  credit optional" });
+            if c.derived {
+                note.push_str("  ·  includes an edited copy, which still needs this credit");
+            }
+            ui.label(dim(&note));
+            ui.add_space(6.0);
+        }
+    });
+    copied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Pos2, Vec2};
+
+    fn asset(id: &str, credit: &str, license: &str) -> ImageSource {
+        ImageSource::Asset { id: id.into(), key: format!("{id}.png"), title: id.into(), source: "servier".into(), credit: credit.into(), license: license.into() }
+    }
+
+    fn image(n: u64, source: ImageSource) -> Item {
+        Item::new(n, "img", ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4] }, Pos2::ZERO, Vec2::splat(10.0))
+    }
+
+    #[test]
+    fn collects_dedupes_and_follows_edits() {
+        let cell = asset("servier/cell", "\"Cell\", Servier Medical Art, CC-BY-4.0", "CC-BY-4.0");
+        let tube = asset("bioart/tube", "\"Tube\", NIAID NIH BioArt Source, public domain", "PD");
+        let s1 = Slide { name: String::new(), items: vec![image(1, cell.clone()), image(2, tube.clone()), image(3, cell.clone())] };
+        let s2 = Slide { name: String::new(), items: vec![image(4, cell.derived("/tmp/edit.png".into())), image(5, ImageSource::file("/tmp/own.png".into()))] };
+        let c = collect([&s1, &s2], 1);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].slides, vec![1, 2]);
+        assert!(c[0].derived && c[0].required);
+        assert!(!c[1].required);
+        assert_eq!(caption(&c, true), "Image credits: \"Cell\", Servier Medical Art, CC-BY-4.0.");
+        assert!(caption(&c, false).contains("; \"Tube\""));
+        // An edit of an edit still points at the catalog asset.
+        let twice = ImageSource::file("/tmp/a.png".into()).derived("/tmp/b.png".into());
+        assert!(twice.origin().is_none());
+        let twice = cell.derived("/tmp/a.png".into());
+        let twice = twice.derived("/tmp/b.png".into());
+        assert_eq!(twice.origin(), Some(&cell));
+    }
+
+    #[test]
+    fn fills_missing_credits() {
+        let mut doc = Document::default();
+        doc.slides[0].items.push(image(1, asset("servier/cell", "", "")));
+        doc.slides[0].items.push(image(2, asset("servier/cell", "", "").derived("/tmp/e.png".into())));
+        assert_eq!(missing(&doc), vec!["servier/cell".to_string()]);
+        let row = AssetRow {
+            id: "servier/cell".into(),
+            source: "servier".into(),
+            source_name: "Servier Medical Art".into(),
+            title: "Cell".into(),
+            variant: String::new(),
+            category: String::new(),
+            license: "CC-BY-4.0".into(),
+            credit: "\"Cell\", Servier".into(),
+            author: String::new(),
+            png_key: String::new(),
+            png_local: None,
+            png_width: 1,
+            png_height: 1,
+            stars: 0,
+            starred: false,
+        };
+        fill(doc.slides.iter_mut(), &[row]);
+        assert!(missing(&doc).is_empty());
+        let c = collect(&doc.slides, 1);
+        assert_eq!(c[0].credit, "\"Cell\", Servier");
+        assert!(c[0].derived);
+    }
+
+    #[test]
+    fn template_credit_matches_the_worker() {
+        assert_eq!(template_credit("pic", "ann", "CC0-1.0", "Pathway"), "\"pic\" by ann, template \"Pathway\", CC0");
+    }
+}

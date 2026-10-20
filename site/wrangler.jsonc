@@ -1,0 +1,14 @@
+// biocartoon.com and www.biocartoon.com: the landing page, served as static assets from public/.
+// No Worker code, no bindings. public/_redirects keeps old links working
+// (biocartoon.com/download -> the editor's download page).
+//   cd site && npx wrangler deploy
+{
+  "name": "biocartoon-site",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "biocartoon.com", "custom_domain": true },
+    { "pattern": "www.biocartoon.com", "custom_domain": true }
+  ],
+  "assets": { "directory": "./public", "not_found_handling": "404-page" }
+}

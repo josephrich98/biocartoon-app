@@ -1,0 +1,61 @@
+# Builds the desktop app and the web app on every push, so a change can't quietly break either.
+name: build
+on:
+  push:
+  pull_request:
+
+jobs:
+  desktop:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: biocartoon-app/app
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: biocartoon-app
+      # The catalog crate (app/Cargo.toml: path = "../../biocartoon/catalog").
+      - uses: actions/checkout@v5
+        with:
+          repository: josephrich98/biocartoon
+          path: biocartoon
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: biocartoon-app/app
+      - run: cargo test --release
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: biocartoon-app/app
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: biocartoon-app
+      # The catalog crate (app/Cargo.toml: path = "../../biocartoon/catalog").
+      - uses: actions/checkout@v5
+        with:
+          repository: josephrich98/biocartoon
+          path: biocartoon
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: biocartoon-app/app
+      # SQLite is compiled from C for wasm32. The runner's clang can target it; these override
+      # the Homebrew paths in app/.cargo/config.toml.
+      - name: Use the runner's clang for wasm32
+        run: |
+          echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$(ls /usr/bin/llvm-ar* | sort -V | tail -1)" >> "$GITHUB_ENV"
+      - name: Install trunk
+        run: |
+          curl -fsSL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C "$HOME/.cargo/bin"
+      - run: trunk build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: biocartoon-app/app/dist

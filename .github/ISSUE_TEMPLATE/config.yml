@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Icon database, search results or the command line
+    url: https://github.com/josephrich98/biocartoon/issues
+    about: Problems with the icon catalog, its licenses or credits, or the `biocartoon` CLI belong in the biocartoon repository.
+  - name: Security problem
+    url: https://github.com/josephrich98/biocartoon-app/security/advisories/new
+    about: Report security problems privately, not as an issue.

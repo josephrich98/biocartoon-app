@@ -1,0 +1,137 @@
+# Builds the desktop installers and publishes them as a GitHub Release.
+#
+#   Release:  bump `version` in app/Cargo.toml, commit, then  git tag v0.2.0 && git push origin v0.2.0
+#   Dry run:  Actions -> release -> Run workflow (builds the installers as workflow artifacts only)
+#
+# The assets keep the same names in every release, so these links always point at the newest one
+# (app/download.html uses them):
+#   https://github.com/josephrich98/biocartoon-app/releases/latest/download/BioCartoon-macOS.dmg
+#
+# Signing is optional and turns on when these repository secrets exist:
+#   macOS (Developer ID + notarization): APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+#     APPLE_SIGNING_IDENTITY ("Developer ID Application: Name (TEAMID)"), APPLE_ID, APPLE_PASSWORD
+#     (an app-specific password), APPLE_TEAM_ID
+# Without them the Mac app is ad-hoc signed and the Windows installer is unsigned, so first launch
+# shows a Gatekeeper / SmartScreen warning (download.html explains how to get past it).
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+          - os: windows-latest
+          # The oldest supported Ubuntu, so the AppImage runs on older glibc versions too.
+          - os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: biocartoon-app/app
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: biocartoon-app
+      # The catalog crate (app/Cargo.toml: path = "../../biocartoon/catalog").
+      - uses: actions/checkout@v5
+        with:
+          repository: josephrich98/biocartoon
+          path: biocartoon
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: biocartoon-app/app
+          key: release
+
+      - name: Check the tag matches app/Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "::error::tag is $GITHUB_REF_NAME but app/Cargo.toml says $v"; exit 1; }
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev libfuse2
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Package (macOS, universal)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          bins="--bin biocartoon-app --bin biocartoon"
+          cargo build --release $bins
+          cargo build --release --target x86_64-apple-darwin $bins
+          mkdir -p target/universal
+          for b in biocartoon-app biocartoon; do
+            lipo -create -output target/universal/$b target/release/$b target/x86_64-apple-darwin/release/$b
+          done
+          # Missing secrets arrive as empty strings, which cargo-packager would take as set (and
+          # then fail to import a certificate or notarize), so drop them.
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!v}" ] || unset "$v"
+          done
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            sed -i '' "s|^signing-identity = \"-\"|signing-identity = \"$APPLE_SIGNING_IDENTITY\"|" Cargo.toml
+          fi
+          # (cargo-packager 0.11's --binaries-dir flag is ignored, so point the config at them.)
+          sed -i '' 's|^binaries-dir = "target/release"|binaries-dir = "target/universal"|' Cargo.toml
+          cargo packager --release -f dmg
+          mkdir -p out && cp target/packages/*.dmg out/BioCartoon-macOS.dmg
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cargo packager --release -f nsis
+          mkdir -p out && cp target/packages/*-setup.exe out/BioCartoon-Windows-setup.exe
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          cargo packager --release -f appimage,deb
+          mkdir -p out
+          cp target/packages/*.AppImage out/BioCartoon-Linux-x86_64.AppImage
+          cp target/packages/*.deb out/BioCartoon-Linux-amd64.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ runner.os }}
+          path: biocartoon-app/app/out/*
+          if-no-files-found: error
+
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: out
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
+            --title "BioCartoon ${GITHUB_REF_NAME#v}" --generate-notes

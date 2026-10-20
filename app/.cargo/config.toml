@@ -1,0 +1,5 @@
+# The web build compiles SQLite (via sqlite-wasm-rs) to wasm32, which Apple's clang can't target.
+# Homebrew's LLVM can: `brew install llvm`.
+[env]
+CC_wasm32_unknown_unknown = "/opt/homebrew/opt/llvm/bin/clang"
+AR_wasm32_unknown_unknown = "/opt/homebrew/opt/llvm/bin/llvm-ar"
