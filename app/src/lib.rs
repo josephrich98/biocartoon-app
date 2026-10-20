@@ -44,11 +44,27 @@ pub fn icon_data() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: img.into_raw(), width: w, height: h })
 }
 
-/// The logo shown in the top bars, `size` points square (loaded once, from the 180 px icon).
+/// The logo shown in the top bars, `size` points square (loaded once, from the transparent 1024 px icon,
+/// cropped to its drawn bounds and downscaled to 180 px).
 pub fn logo(ctx: &egui::Context, size: f32) -> egui::Image<'static> {
     let id = egui::Id::new("biocartoon_logo");
     let tex = ctx.data_mut(|d| d.get_temp::<egui::TextureHandle>(id)).unwrap_or_else(|| {
-        let img = image::load_from_memory(include_bytes!("../assets/apple-touch-icon.png")).expect("bundled logo").to_rgba8();
+        let mut img = image::load_from_memory(ICON_PNG).expect("bundled logo").to_rgba8();
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for (x, y, p) in img.enumerate_pixels() {
+            if p[3] > 8 {
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+        }
+        if x0 <= x1 {
+            // A centered square around the art, with the same 3% margin the touch icon had.
+            let side = ((x1 - x0 + 1).max(y1 - y0 + 1) as f32 / 0.94) as u32;
+            let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+            let mut sq = image::RgbaImage::new(side, side);
+            image::imageops::overlay(&mut sq, &img, side as i64 / 2 - cx as i64, side as i64 / 2 - cy as i64);
+            img = sq;
+        }
+        let img = image::imageops::resize(&img, 180, 180, image::imageops::FilterType::Lanczos3);
         let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
         let tex = ctx.load_texture("biocartoon_logo", ci, egui::TextureOptions::LINEAR);
         ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
