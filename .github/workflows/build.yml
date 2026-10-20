@@ -1,4 +1,5 @@
 # Builds the desktop app and the web app on every push, so a change can't quietly break either.
+# Pushes to main also deploy the web app.
 name: build
 on:
   push:
@@ -59,3 +60,12 @@ jobs:
         with:
           name: web-dist
           path: biocartoon-app/app/dist
+      # Pushes to main go live at app.biocartoon.com (same secrets as deploy-site.yml).
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: biocartoon-app/app
+          # The action's default wrangler is too old for an assets-only Worker.
+          wranglerVersion: "4.151.2"
