@@ -175,9 +175,22 @@ impl BioCartoon {
             return;
         }
         let stem = BioCartoon::slugify(&self.doc.title);
-        let (credits, title, stem) = match self.attributions_slide.filter(|&i| i < self.doc.slides.len()) {
-            Some(i) => (collect([&self.doc.slides[i]], i + 1), format!("{}  Attributions: slide {}", ph::QUOTES, i + 1), format!("{stem}-slide{}", i + 1)),
-            None => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES), stem),
+        let (credits, title, stem) = match (&self.attributions_export, self.attributions_slide.filter(|&i| i < self.doc.slides.len())) {
+            // Just after an export: the credits of what was exported.
+            (Some((credits, stem)), _) => {
+                // Fill in credits that were still being looked up when the export started.
+                let live = collect(&self.doc.slides, 1);
+                let credits = credits
+                    .iter()
+                    .map(|c| match live.iter().find(|l| l.id == c.id && c.credit.is_empty()) {
+                        Some(l) => Credit { credit: l.credit.clone(), required: l.required, ..c.clone() },
+                        None => c.clone(),
+                    })
+                    .collect();
+                (credits, format!("{}  Credits for your export", ph::QUOTES), stem.clone())
+            }
+            (None, Some(i)) => (collect([&self.doc.slides[i]], i + 1), format!("{}  Attributions: slide {}", ph::QUOTES, i + 1), format!("{stem}-slide{}", i + 1)),
+            (None, None) => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES), stem),
         };
         let mut open = true;
         let mut action = None;
@@ -195,43 +208,9 @@ impl BioCartoon {
             self.credits_action(ctx, a, &credits, &stem);
         }
         self.show_attributions = open;
-    }
-
-    /// The Attributions popup as a modal, for opening over another modal (the export dialog),
-    /// which an ordinary window can't sit above. `stem` names saved credit files. Returns false
-    /// once it is closed.
-    pub fn attributions_modal(&mut self, ctx: &egui::Context, credits: &[Credit], stem: &str) -> bool {
-        let mut open = true;
-        let mut action = None;
-        let id = egui::Id::new("attributions_modal");
-        // egui remembers a closed modal's place in the stacking order, so a reopened one would sit
-        // under the export dialog; keep it on top.
-        ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
-        let modal = egui::Modal::new(id).show(ctx, |ui| {
-            ui.set_width(480.0);
-            // Sides sizes the row to the taller heading; a right-to-left layout nested in a
-            // horizontal row didn't, so the next line drew over the heading.
-            egui::containers::Sides::new().show(
-                ui,
-                |ui| {
-                    ui.heading(format!("{}  Attributions", ph::QUOTES));
-                },
-                |ui| {
-                    if ui.button(ph::X).on_hover_text("Close").clicked() {
-                        open = false;
-                    }
-                },
-            );
-            ui.set_max_height(ctx.content_rect().height() * 0.7);
-            action = attributions_ui(ui, credits, &mut self.attributions_required_only);
-        });
-        if modal.should_close() {
-            open = false;
+        if !open {
+            self.attributions_export = None;
         }
-        if let Some(a) = action {
-            self.credits_action(ctx, a, credits, stem);
-        }
-        open
     }
 
     /// Copy or save the credit list (one per line), as a button of the Attributions popup asked.

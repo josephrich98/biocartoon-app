@@ -73,10 +73,6 @@ pub struct ExportOptions {
     pub individual: bool,
     /// Whole-slide export only: crop the canvas to the combined bounds of the image items.
     pub crop: bool,
-    /// Also write the library artwork's credits to `<name>-credits.txt` beside the export.
-    pub save_credits: bool,
-    /// As `save_credits`, but only the credits the licenses require (`save_credits` wins).
-    pub save_required_credits: bool,
     /// Every slide of the document, one file (or set of image files) each, instead of just one.
     /// Starts off each session.
     #[serde(skip)]
@@ -85,7 +81,7 @@ pub struct ExportOptions {
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, save_credits: false, save_required_credits: false, all_slides: false }
+        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false }
     }
 }
 
@@ -250,15 +246,6 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
     }
     if written.is_empty() {
         return Err(if multi { "There are no images on these slides" } else { "There are no images on this slide" }.into());
-    }
-
-    if opts.save_credits || opts.save_required_credits {
-        let items: Vec<&Item> = job.slides.iter().flat_map(|(_, s)| &s.items).collect();
-        let credits = crate::credits::for_items(&items, !opts.save_credits);
-        if !credits.is_empty() {
-            let path = job.path.with_file_name(format!("{stem}-credits.txt"));
-            crate::platform::write_output(&path, format!("{credits}\n").as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
-        }
     }
 
     let mut msg = match written.as_slice() {
@@ -1111,7 +1098,7 @@ mod tests {
         requests.insert(src.cache_key(), Request::Path(icon.clone()));
         let job = |format, dpi, transparent, individual, name: &str| ExportJob {
             path: dir.join(name),
-            opts: ExportOptions { format, dpi, transparent, individual, crop: false, save_credits: false, save_required_credits: false, all_slides: false },
+            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false },
             slides: vec![(1, slide.clone())],
             page,
             background: [250, 245, 235, 255],
@@ -1154,10 +1141,9 @@ mod tests {
         let text_only = Slide { name: "Text".into(), items: vec![slide.items[2].clone()] };
         let mut all = job(ExportFormat::Png, 72, false, false, "deck.png");
         all.slides = vec![(1, slide.clone()), (2, text_only.clone())];
-        all.opts.save_credits = true;
         let msg = run(&ctx, all).unwrap();
         assert!(msg.contains("2 slides"), "{msg}");
-        assert!(dir.join("deck-slide1.png").exists() && dir.join("deck-slide2.png").exists() && dir.join("deck-credits.txt").exists());
+        assert!(dir.join("deck-slide1.png").exists() && dir.join("deck-slide2.png").exists());
         let mut each = job(ExportFormat::Png, 72, false, true, "deckeach.png");
         each.slides = vec![(1, slide.clone()), (2, text_only.clone())];
         run(&ctx, each).unwrap();

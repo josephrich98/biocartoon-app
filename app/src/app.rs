@@ -771,6 +771,11 @@ pub struct BioCartoon {
     pub show_attributions: bool,
     /// The slide (0-based) the Attributions window is limited to, or the whole document.
     pub attributions_slide: Option<usize>,
+    /// The credits of what was just exported, and the stem for saving them: the Attributions
+    /// window shows these instead of the document's while set.
+    pub attributions_export: Option<(Vec<crate::credits::Credit>, String)>,
+    /// The credits of the export that is running, shown once it finishes.
+    pub export_credits: Option<(Vec<crate::credits::Credit>, String)>,
     /// The image whose credit the Credit window shows (right-click > Show credit).
     pub credit_item: Option<ItemId>,
     /// The Attributions window lists only credits the licenses require.
@@ -935,6 +940,8 @@ impl BioCartoon {
             credit_lookups: HashSet::new(),
             show_attributions: false,
             attributions_slide: None,
+            attributions_export: None,
+            export_credits: None,
             credit_item: None,
             attributions_required_only: false,
             drag: None,
@@ -3047,7 +3054,7 @@ impl BioCartoon {
             return self.toast_err(format!("email: {e}"));
         }
         let png = dir.join(format!("{slug}.png"));
-        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, save_credits: false, save_required_credits: false, all_slides: false };
+        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false };
         self.pending_email = Some((doc.title.clone(), vec![png.clone(), file]));
         let job = self.export_job_for(&doc, &[0], png, opts);
         self.export_job = Some(crate::export::start(ctx.clone(), job));
@@ -3138,6 +3145,10 @@ impl BioCartoon {
             None => (self.doc.clone(), self.cur_slide),
         };
         let slides: Vec<usize> = if self.settings.export.all_slides { (0..doc.slides.len()).collect() } else { vec![slide] };
+        // Its credits pop up once it is done.
+        let credits = if slides.len() > 1 { crate::credits::collect(&doc.slides, 1) } else { crate::credits::collect([&doc.slides[slide]], slide + 1) };
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| Self::slugify(&doc.title));
+        self.export_credits = (!credits.is_empty()).then_some((credits, stem));
         let job = self.export_job_for(&doc, &slides, path, self.settings.export.clone());
         self.export_job = Some(crate::export::start(ctx.clone(), job));
         self.toast("Exporting...");
@@ -3167,6 +3178,7 @@ impl BioCartoon {
         match rx.try_recv() {
             Ok(res) => {
                 self.export_job = None;
+                let credits = self.export_credits.take();
                 if let Some((subject, files)) = self.pending_email.take() {
                     // Without the PNG, still send the project file.
                     let files: Vec<PathBuf> = files.into_iter().filter(|f| f.exists()).collect();
@@ -3177,7 +3189,13 @@ impl BioCartoon {
                     return;
                 }
                 match res {
-                    Ok(msg) => self.toast(msg),
+                    Ok(msg) => {
+                        self.toast(msg);
+                        if credits.is_some() {
+                            self.attributions_export = credits;
+                            self.show_attributions = true;
+                        }
+                    }
                     Err(e) => self.toast_err(format!("export: {e}")),
                 }
             }
@@ -3185,6 +3203,7 @@ impl BioCartoon {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.export_job = None;
                 self.pending_email = None;
+                self.export_credits = None;
                 self.toast_err("export failed");
             }
         }
@@ -3209,11 +3228,6 @@ impl BioCartoon {
             (None, true) => "Export slides".into(),
             (None, false) => "Export slide".into(),
         };
-        let credits = if all { crate::credits::collect(&doc.slides, 1) } else { crate::credits::collect([&doc.slides[slide]], slide + 1) };
-        let stem = Self::slugify(&doc.title);
-        // Show credits opens the Attributions popup as a modal over this one.
-        let show_id = egui::Id::new("export_show_credits");
-        let mut show_credits = ctx.data(|d| d.get_temp::<bool>(show_id)).unwrap_or(false);
         let opts = &mut self.settings.export;
         let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
             ui.set_width(440.0);
@@ -3292,33 +3306,6 @@ impl BioCartoon {
                 ui.checkbox(&mut opts.all_slides, format!("Export all slides ({n_slides})"))
                     .on_hover_text("Save every slide, one file each, named <name>-slide1, <name>-slide2, ...");
             });
-            if !credits.is_empty() {
-                ui.add_space(8.0);
-                ui.separator();
-                let required = credits.iter().filter(|c| c.required).count();
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{}  Credits", ph::QUOTES)).strong());
-                    ui.label(format!("{} {} of library artwork, {required} requiring credit", credits.len(), if credits.len() == 1 { "piece" } else { "pieces" }));
-                });
-                ui.horizontal(|ui| {
-                    if ui.button(format!("{}  Show credits", ph::QUOTES)).clicked() {
-                        show_credits = true;
-                    }
-                    // One credits file at most: checking either unchecks the other.
-                    if ui.checkbox(&mut opts.save_required_credits, "Save required credits")
-                        .on_hover_text("Also save the credits the licenses require as a text file next to the export, one per line")
-                        .changed() && opts.save_required_credits
-                    {
-                        opts.save_credits = false;
-                    }
-                    if ui.checkbox(&mut opts.save_credits, "Save all credits")
-                        .on_hover_text("Also save every credit as a text file next to the export, one per line")
-                        .changed() && opts.save_credits
-                    {
-                        opts.save_required_credits = false;
-                    }
-                });
-            }
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can = !((opts.individual || opts.crop) && n_images == 0);
@@ -3329,10 +3316,6 @@ impl BioCartoon {
         if modal.should_close() {
             open = false;
         }
-        if show_credits {
-            show_credits = self.attributions_modal(ctx, &credits, &stem);
-        }
-        ctx.data_mut(|d| d.insert_temp(show_id, show_credits && open && !go && !cancel));
         if n_images == 0 {
             self.settings.export.individual = false;
             self.settings.export.crop = false;
@@ -3993,7 +3976,7 @@ impl BioCartoon {
                         if ui.button("Check spelling and grammar...").clicked() { self.show_spell_window = true; ui.close(); }
                         ui.separator();
                         if ui.button("Export slide...").clicked() { self.actions.push(Action::OpenExport); ui.close(); }
-                        if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = None; ui.close(); }
+                        if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = None; self.attributions_export = None; ui.close(); }
                         ui.separator();
                         if ui.button("Settings...").clicked() { self.open_settings(SettingsTab::General); ui.close(); }
                         if ui.button(if cfg!(target_arch = "wasm32") { "Bulk download..." } else { "Download..." }).clicked() { self.open_settings(SettingsTab::Offline); ui.close(); }
@@ -4521,7 +4504,7 @@ impl BioCartoon {
     /// Headless-ish smoke test: `BIOCARTOON_SCREENSHOT=out.png` captures the window after a
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
-    /// settings, about, templates, savetemplate, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
+    /// settings, about, templates, savetemplate, export=<path>, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
     /// fav=<id>, open=<project id>, rail=<text|lines|shapes|table|edit|slides|page|none|icons|noicons|uploads|favorites|library>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
@@ -4679,6 +4662,8 @@ impl BioCartoon {
                     "exportindividual" => self.settings.export.individual = true,
                     "exportcrop" => self.settings.export.crop = true,
                     "exportdialog" => { self.show_settings = false; self.show_export = true; }
+                    // Export the slide to a path, to see the credits pop up afterwards.
+                    s if s.starts_with("export=") => { self.show_attributions = false; self.start_export(ctx, PathBuf::from(&s[7..])); }
                     // Library images saved without their credits (an older document), one of them
                     // AI-edited, and the Attributions window that looks the credits up.
                     "attributions" => {
