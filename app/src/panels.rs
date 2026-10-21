@@ -653,10 +653,15 @@ impl BioCartoon {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.label(dim("Didn't find what you were looking for? "));
-            if ui.add(link("Generate a figure with AI")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            if ui.add(link("Upload an image")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.icons.mode = IconsMode::Uploads;
+                self.actions.push(Action::PickUploads);
+            }
+            ui.label(dim(", "));
+            if ui.add(link("Generate an image with AI")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.icons.mode = IconsMode::Generate;
             }
-            ui.label(dim(" or "));
+            ui.label(dim(", or "));
             if ui.add(link("Submit a suggestion")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.actions.push(Action::OpenSuggest(self.icons.query.trim().to_string()));
             }
