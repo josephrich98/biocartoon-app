@@ -509,14 +509,12 @@ impl BioCartoon {
                             let r = ui.add(egui::Button::new(egui::RichText::new(format!("{added} added")).small()).frame(false));
                             if r.on_hover_text(format!("{}\nClick to remove the words you added", self.settings.custom_words.join(", "))).clicked() {
                                 self.settings.custom_words.clear();
-                                self.settings_draft.custom_words.clear();
                             }
                         });
                     }
                 });
             });
         self.settings.check_grammar = grammar;
-        self.settings_draft.check_grammar = grammar;
         match cmd {
             Some(Cmd::Fix(k, fix)) => {
                 if let Some(is) = st.issues.get(k).cloned() {
@@ -537,8 +535,7 @@ impl BioCartoon {
             Some(Cmd::AddWord(w)) => {
                 let w = normalize(&w);
                 if !self.settings.custom_words.contains(&w) {
-                    self.settings.custom_words.push(w.clone());
-                    self.settings_draft.custom_words.push(w);
+                    self.settings.custom_words.push(w);
                 }
             }
             Some(Cmd::Show(place)) => {

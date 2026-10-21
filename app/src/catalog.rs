@@ -2,7 +2,7 @@
 //! responses), and the published catalog is downloaded in the background. The search itself is
 //! [`biocartoon_catalog::catalog::Worker`], shared with the command line.
 
-pub use biocartoon_catalog::catalog::{AssetRow, CategoryInfo, Facets, Filter, IconSort, SourceInfo, StarUpdate, TaxonCount, Worker};
+pub use biocartoon_catalog::catalog::{AssetRow, CategoryInfo, Facets, Filter, IconSort, SourceInfo, StarUpdate, TaxonCount, Worker, FORMAT_PNG, FORMAT_SVG};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;

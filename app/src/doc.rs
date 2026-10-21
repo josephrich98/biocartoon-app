@@ -523,6 +523,12 @@ pub struct Item {
     pub locked: bool,
     pub opacity: f32,
     pub group: Option<u64>,
+    /// Images: the rect frames the picture as it is drawn, an SVG trimmed to its drawing
+    /// ([`crate::export::Vector`]). Unset for items placed before their picture had loaded and
+    /// for documents from before SVGs were trimmed; the editor fits those once the picture is
+    /// loaded (see [`fit_to_drawing`]).
+    #[serde(default)]
+    pub fitted: bool,
 }
 
 impl Item {
@@ -539,6 +545,7 @@ impl Item {
             locked: false,
             opacity: 1.0,
             group: None,
+            fitted: false,
         }
     }
 
@@ -731,9 +738,114 @@ pub fn c4(c: Color32) -> [u8; 4] {
     c.to_srgba_unmultiplied()
 }
 
+/// How far an image item's proportions may be from a picture's and still count as sized for it.
+const ASPECT_TOLERANCE: f32 = 0.02;
+
+/// Where an image item placed when its SVG was drawn whole (the artboard and all) goes now that
+/// the file is drawn trimmed to `content`, the drawing's box on the `artboard` (both in the
+/// file's units): the part of the item's rect that the drawing covers, with the crop
+/// re-expressed on the drawing, so that the drawing stays exactly where it was. The rect is
+/// moved so that turning it about its own centre, as the canvas does, lands where the old
+/// rect's rotation put it. `None` when the item is not sized for the whole artboard (it already
+/// frames the drawing, or was stretched on purpose), or when the crop shows none of the drawing.
+pub fn fit_to_drawing(it: &Item, artboard: Vec2, content: Rect) -> Option<(Rect, [f32; 4])> {
+    let ItemKind::Image { crop, .. } = &it.kind else { return None };
+    let r = it.rect();
+    let (cw, ch) = ((crop[2] - crop[0]).max(1e-3), (crop[3] - crop[1]).max(1e-3));
+    if r.width() <= 0.0 || r.height() <= 0.0 || artboard.min_elem() <= 0.0 || content.width() <= 0.0 || content.height() <= 0.0 {
+        return None;
+    }
+    let for_artboard = (artboard.x * cw) / (artboard.y * ch);
+    if ((r.width() / r.height()) / for_artboard - 1.0).abs() > ASPECT_TOLERANCE {
+        return None;
+    }
+    let x = fit_axis(r.min.x, r.width(), crop[0], crop[2], it.flip_h, artboard.x, content.min.x, content.max.x)?;
+    let y = fit_axis(r.min.y, r.height(), crop[1], crop[3], it.flip_v, artboard.y, content.min.y, content.max.y)?;
+    let shown = Rect::from_min_size(Pos2::new(x.0, y.0), Vec2::new(x.1, y.1));
+    let center = r.center() + egui::emath::Rot2::from_angle(it.rotation) * (shown.center() - r.center());
+    Some((Rect::from_center_size(center, shown.size()), [x.2, y.2, x.3, y.3]))
+}
+
+/// One axis of [`fit_to_drawing`]: the item spans `len` from `min` and shows texture
+/// coordinates `c0..c1` of the artboard (mirrored when `flip`); the drawing spans `d0..d1` of
+/// the artboard's `art`. The part of the item the drawing covers (start, length) and the crop
+/// of the drawing it shows.
+fn fit_axis(min: f32, len: f32, c0: f32, c1: f32, flip: bool, art: f32, d0: f32, d1: f32) -> Option<(f32, f32, f32, f32)> {
+    let cl = (c1 - c0).max(1e-3);
+    // Page position of a texture coordinate.
+    let page = |t: f32| if flip { min + (c1 - t) / cl * len } else { min + (t - c0) / cl * len };
+    let (mut a, mut b) = (page(d0 / art), page(d1 / art));
+    if flip {
+        std::mem::swap(&mut a, &mut b);
+    }
+    let (s0, s1) = (a.max(min), b.min(min + len));
+    if s1 - s0 <= 1e-3 {
+        return None;
+    }
+    let dl = b - a;
+    let crop = if flip { ((b - s1) / dl, (b - s0) / dl) } else { ((s0 - a) / dl, (s1 - a) / dl) };
+    Some((s0, s1 - s0, crop.0, crop.1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_item(pos: Pos2, size: Vec2, crop: [f32; 4]) -> Item {
+        Item::new(1, "i", ItemKind::Image { source: ImageSource::file("a.svg".into()), crop, overlay: [0; 4] }, pos, size)
+    }
+
+    fn close(r: Rect, want: Rect) -> bool {
+        (r.min - want.min).length() < 1e-3 && (r.max - want.max).length() < 1e-3
+    }
+
+    /// An item sized for a 100 x 100 artboard whose drawing is the left half: the item's rect
+    /// shrinks onto the drawing and its crop is re-expressed on the drawing; flips and rotation
+    /// keep the drawing where it was; an item not sized for the artboard is left alone.
+    #[test]
+    fn fits_items_onto_the_drawing() {
+        let art = Vec2::splat(100.0);
+        let drawing = Rect::from_min_max(Pos2::ZERO, Pos2::new(50.0, 100.0));
+        let full = [0.0, 0.0, 1.0, 1.0];
+
+        let (r, crop) = fit_to_drawing(&image_item(Pos2::ZERO, Vec2::splat(200.0), full), art, drawing).unwrap();
+        assert!(close(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 200.0))), "{r:?}");
+        assert_eq!(crop, full);
+
+        // The right half of the artboard shown (crop), of which the drawing covers nothing.
+        assert!(fit_to_drawing(&image_item(Pos2::ZERO, Vec2::new(100.0, 200.0), [0.5, 0.0, 1.0, 1.0]), art, drawing).is_none());
+        // The middle half shown: the drawing covers the left half of the item, i.e. its right half.
+        let (r, crop) = fit_to_drawing(&image_item(Pos2::ZERO, Vec2::new(100.0, 200.0), [0.25, 0.0, 0.75, 1.0]), art, drawing).unwrap();
+        assert!(close(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(50.0, 200.0))), "{r:?}");
+        assert_eq!(crop, [0.5, 0.0, 1.0, 1.0]);
+
+        // Mirrored: the drawing is on the item's right.
+        let mut flipped = image_item(Pos2::ZERO, Vec2::splat(200.0), full);
+        flipped.flip_h = true;
+        let (r, crop) = fit_to_drawing(&flipped, art, drawing).unwrap();
+        assert!(close(r, Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(200.0, 200.0))), "{r:?}");
+        assert_eq!(crop, full);
+        flipped.kind = ItemKind::Image { source: ImageSource::file("a.svg".into()), crop: [0.25, 0.0, 0.75, 1.0], overlay: [0; 4] };
+        flipped.size = [100.0, 200.0];
+        let (r, crop) = fit_to_drawing(&flipped, art, drawing).unwrap();
+        assert!(close(r, Rect::from_min_max(Pos2::new(50.0, 0.0), Pos2::new(100.0, 200.0))), "{r:?}");
+        assert_eq!(crop, [0.5, 0.0, 1.0, 1.0]);
+
+        // Turned a quarter: the drawing's centre, (50, 100) before turning about (100, 100), is
+        // at (100, 50) on the page, and that is the new rect's centre.
+        let mut turned = image_item(Pos2::ZERO, Vec2::splat(200.0), full);
+        turned.rotation = std::f32::consts::FRAC_PI_2;
+        let (r, _) = fit_to_drawing(&turned, art, drawing).unwrap();
+        assert!(close(r, Rect::from_center_size(Pos2::new(100.0, 50.0), Vec2::new(100.0, 200.0))), "{r:?}");
+
+        // Already the drawing's shape, or stretched: not sized for the artboard.
+        assert!(fit_to_drawing(&image_item(Pos2::ZERO, Vec2::new(100.0, 200.0), full), art, drawing).is_none());
+        assert!(fit_to_drawing(&image_item(Pos2::ZERO, Vec2::new(150.0, 200.0), full), art, drawing).is_none());
+        // Within tolerance of the artboard counts.
+        assert!(fit_to_drawing(&image_item(Pos2::ZERO, Vec2::new(201.0, 200.0), full), art, drawing).is_some());
+        // Not an image.
+        assert!(fit_to_drawing(&Item::new(2, "t", ItemKind::text("x", 12.0, [0; 4], TextAlign::Left, false), Pos2::ZERO, Vec2::splat(100.0)), art, drawing).is_none());
+    }
 
     /// Documents saved before line styles existed used dashed / elbow / inhibit kinds.
     #[test]

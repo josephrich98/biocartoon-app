@@ -1,6 +1,6 @@
 //! Application state, top-level layout, commands (undo, clipboard, file IO, AI dispatch).
 
-use crate::ai::{AiClient, AiJob, AiOp, AiResult, BackendKind};
+use crate::ai::{AiClient, AiJob, AiOp, AiPrompts, AiResult, BackendKind};
 use crate::assets::{ImageCache, ImgState};
 use crate::catalog::{cached_catalog, AssetRow, CatalogClient, CatalogSync, CategoryInfo, Facets, Filter, IconSort, Req, Resp, SourceInfo, StarUpdate};
 use crate::stars::{StarsClient, StarsMsg};
@@ -38,6 +38,14 @@ pub struct Settings {
     pub ai_provider: BackendKind,
     pub ai_model: String,
     pub api_key: String,
+    /// The vLLM server's URL (only used with `BackendKind::Vllm`).
+    pub ai_base_url: String,
+    /// The prompt text sent with AI requests, editable in the AI settings.
+    pub ai_prompts: AiPrompts,
+    /// Every image generated with AI, most recent first (the Generate page's history).
+    pub generated: Vec<GeneratedImage>,
+    /// Generated images go into the user's library as soon as they arrive.
+    pub auto_library_generated: bool,
     pub uploads: Vec<String>,
     /// Ids of the assets the user starred (their favorites), most recent first. This is what
     /// counts as "mine": the star counts on the Worker follow it (see `pending_stars`).
@@ -98,9 +106,13 @@ impl Default for Settings {
             catalog_path: std::env::var("BIOCARTOON_DB").unwrap_or_default(),
             local_data_dir: String::new(),
             offline_dir: String::new(),
-            ai_provider: BackendKind::OpenAi,
-            ai_model: BackendKind::OpenAi.models()[0].into(),
+            ai_provider: BackendKind::Anthropic,
+            ai_model: BackendKind::Anthropic.models()[0].into(),
             api_key: String::new(),
+            ai_base_url: String::new(),
+            ai_prompts: AiPrompts::default(),
+            generated: Vec::new(),
+            auto_library_generated: false,
             uploads: Vec::new(),
             favorites: Vec::new(),
             pending_stars: Vec::new(),
@@ -134,6 +146,16 @@ impl Default for Settings {
     }
 }
 
+/// An image generated with AI, saved under `<app data>/generated`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeneratedImage {
+    pub path: String,
+    pub prompt: String,
+    /// Its id in the user's library, once added there.
+    pub library_id: Option<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
     Home,
@@ -156,6 +178,7 @@ pub struct AiSetup {
     pub provider: BackendKind,
     pub model: String,
     pub key: String,
+    pub base_url: String,
     /// The AI action that opened the dialog; it runs once a model is connected.
     pub pending: Option<Action>,
 }
@@ -259,6 +282,8 @@ pub struct SearchFilter {
     /// A database's own categories: (database, category), shown as "BA: Viruses".
     pub db_cats: Vec<(String, String)>,
     pub licenses: Vec<String>,
+    /// File types, `catalog::FORMAT_SVG` or `catalog::FORMAT_PNG`.
+    pub formats: Vec<String>,
 }
 
 impl SearchFilter {
@@ -268,7 +293,7 @@ impl SearchFilter {
 
     /// How many of the filters are set.
     pub fn active(&self) -> usize {
-        [!self.sources.is_empty(), !self.authors().is_empty(), !self.cats.is_empty() || !self.subs.is_empty(), !self.db_cats.is_empty(), !self.licenses.is_empty()]
+        [!self.sources.is_empty(), !self.authors().is_empty(), !self.cats.is_empty() || !self.subs.is_empty(), !self.db_cats.is_empty(), !self.licenses.is_empty(), !self.formats.is_empty()]
             .iter()
             .filter(|&&on| on)
             .count()
@@ -285,7 +310,14 @@ impl SearchFilter {
                 taxa.push((cat.to_string(), String::new()));
             }
         }
-        Filter { sources: self.sources.clone(), authors: self.authors(), licenses: self.licenses.clone(), taxa, db_cats: self.db_cats.clone() }
+        Filter {
+            sources: self.sources.clone(),
+            authors: self.authors(),
+            licenses: self.licenses.clone(),
+            taxa,
+            db_cats: self.db_cats.clone(),
+            formats: self.formats.clone(),
+        }
     }
 }
 
@@ -355,14 +387,13 @@ pub struct GenerateState {
     pub status: String,
     pub busy: bool,
     pub result: Option<(image::RgbaImage, egui::TextureHandle)>,
-    pub result_prompt: String,
+    /// Where the shown result was saved (its entry in `Settings::generated`).
+    pub result_path: Option<String>,
 }
 
 /// What the "add to library" dialog uploads.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UploadTarget {
-    /// The last AI-generated image.
-    Generated,
     /// An image file (from the Uploads tab).
     File(PathBuf),
     /// An icon of the user's library (with a local copy); the new copy replaces it.
@@ -620,19 +651,28 @@ pub enum Action {
     MoveSlide(usize, isize),
     GoSlide(usize),
     Generate(String),
-    AddGeneratedToCanvas,
+    /// Add the generated image at this path to the library (and, with `favorite`, Favorites).
+    GeneratedToLibrary { path: String, favorite: bool },
+    /// Open Contribute artwork with the generated image at this path picked.
+    ContributeGenerated(String),
     PickUploads,
     RemoveUpload(usize),
     ZoomFit,
     ZoomTo(f32),
     Toast(String),
-    ApplySettings,
     SyncCatalog,
     SetRail(Option<RailTab>),
     Commit,
     /// Add a guide across the middle of the page (vertical or horizontal) and pick it.
     AddGuide(bool),
     ClearGuides,
+}
+
+/// How an image item placed before its picture had loaded is sized once it has: by the
+/// picture's longer side (an insert) or by its area (a replacement keeps the old picture's).
+enum Fit {
+    Side(f32),
+    Area(f32),
 }
 
 pub struct BioCartoon {
@@ -662,7 +702,6 @@ pub struct BioCartoon {
     pub images: ImageCache,
     pub ai: AiClient,
     pub settings: Settings,
-    pub settings_draft: Settings,
     pub show_settings: bool,
     /// The theme last applied: dark or not, and the text size.
     applied_theme: Option<(bool, theme::TextSize)>,
@@ -672,8 +711,6 @@ pub struct BioCartoon {
     /// The Spelling and grammar window is open (it also shows squiggles while open).
     pub show_spell_window: bool,
     pub settings_tab: SettingsTab,
-    /// Settings dialog: "Use a local file" chosen for the catalog.
-    pub settings_local_catalog: bool,
     pub ai_setup: Option<AiSetup>,
     pub catalog_sync: Option<CatalogSync>,
     pub offline: crate::offline::OfflineState,
@@ -683,6 +720,8 @@ pub struct BioCartoon {
     /// The right-rail tab shown before a selection opened Edit, restored when it is cleared.
     pub rail_before_edit: Option<RailTab>,
     pub replace_target: Option<ItemId>,
+    /// Image items placed before their picture had loaded, to take its shape once it has.
+    pending_fit: Vec<(ItemId, Fit)>,
     pub crop_mode: bool,
     /// The Text tool is armed: the next click on the canvas places a text box.
     pub placing_text: bool,
@@ -815,7 +854,7 @@ impl BioCartoon {
             let offline_dir = if settings.offline_dir.is_empty() { app_dir.join(crate::offline::DIR_NAME) } else { PathBuf::from(&settings.offline_dir) };
             images.set_cache_dir(offline_dir.join("assets"));
         }
-        let ai = AiClient::new(settings.ai_provider);
+        let ai = AiClient::new(settings.ai_provider, &settings.ai_model, &settings.api_key, &settings.ai_base_url, &settings.ai_prompts);
         // Smoke-test runs (BIOCARTOON_SCREENSHOT) must not touch the real projects.
         let projects_dir = match std::env::var("BIOCARTOON_PROJECTS_DIR") {
             Ok(d) => PathBuf::from(d),
@@ -848,7 +887,6 @@ impl BioCartoon {
             offline: Default::default(),
             images,
             ai,
-            settings_draft: settings.clone(),
             settings,
             show_settings: false,
             applied_theme: None,
@@ -856,13 +894,13 @@ impl BioCartoon {
             spell: Default::default(),
             show_spell_window: false,
             settings_tab: SettingsTab::General,
-            settings_local_catalog: false,
             ai_setup: None,
             view: crate::canvas::View::default(),
             page: PageState::default(),
             ai_edit: None,
             rail_before_edit: None,
             replace_target: None,
+            pending_fit: Vec::new(),
             crop_mode: false,
             placing_text: false,
             drawing: false,
@@ -994,20 +1032,22 @@ impl BioCartoon {
     }
 
     pub fn open_settings(&mut self, tab: SettingsTab) {
-        self.settings_draft = self.settings.clone();
-        self.settings_local_catalog = !self.settings.catalog_path.is_empty();
         self.settings_tab = tab;
         self.show_settings = true;
     }
 
     /// True when AI tools can run without asking for a model first.
     pub fn ai_ready(&self) -> bool {
-        !self.settings.api_key.trim().is_empty() || std::env::var("BIOCARTOON_AI").as_deref() == Ok("placeholder")
+        let s = &self.settings;
+        let connected = if s.ai_provider.self_hosted() { !s.ai_base_url.trim().is_empty() } else { !s.api_key.trim().is_empty() };
+        connected || std::env::var("BIOCARTOON_AI").as_deref() == Ok("placeholder")
     }
 
     pub fn ai_status(&self) -> String {
         if self.ai_ready() {
-            format!("Model: {} · {}", self.settings.ai_provider.label(), self.settings.ai_model)
+            let s = &self.settings;
+            let model = if s.ai_provider.self_hosted() { &s.ai_base_url } else { &s.ai_model };
+            format!("Model: {} · {}", s.ai_provider.label(), model)
         } else {
             "You'll pick a model and enter an API key on first use.".into()
         }
@@ -1018,6 +1058,7 @@ impl BioCartoon {
             provider: self.settings.ai_provider,
             model: self.settings.ai_model.clone(),
             key: self.settings.api_key.clone(),
+            base_url: self.settings.ai_base_url.clone(),
             pending,
         });
     }
@@ -1219,10 +1260,16 @@ impl BioCartoon {
         self.crop_mode = false;
     }
 
+    /// The longer side of a newly inserted picture: a quarter of the page's shorter side.
+    fn insert_side(&self, fraction: f32) -> f32 {
+        (self.doc.width.min(self.doc.height) * fraction).max(60.0)
+    }
+
+    /// A catalog asset's size on insertion, from its PNG's proportions; the SVG that is drawn
+    /// may be proportioned differently, so the item is re-sized once it is loaded.
     fn asset_size(&self, row: &AssetRow) -> Vec2 {
         let (w, h) = (row.png_width.max(1) as f32, row.png_height.max(1) as f32);
-        let target = (self.doc.width.min(self.doc.height) * 0.25).max(60.0);
-        let s = target / w.max(h);
+        let s = self.insert_side(0.25) / w.max(h);
         Vec2::new(w * s, h * s)
     }
 
@@ -1252,6 +1299,7 @@ impl BioCartoon {
                     let area = it.size[0] * it.size[1];
                     let nw = (area * w / h).sqrt();
                     it.size = [nw, nw * h / w];
+                    self.pending_fit.push((target, Fit::Area(area)));
                 }
             }
             self.toast(format!("Replaced with {}", row.title));
@@ -1266,30 +1314,18 @@ impl BioCartoon {
             overlay: [255, 255, 255, 0],
         };
         let item = Item::new(id, row.title.clone(), kind, Pos2::ZERO, size);
+        self.pending_fit.push((id, Fit::Side(self.insert_side(0.25))));
         self.insert_item(item);
     }
 
     pub fn insert_file(&mut self, path: &Path) {
         let p = path.display().to_string();
-        // Size from the decoded image if it is already cached; otherwise a default square.
+        let target = self.insert_side(0.3);
+        // Size from the decoded image if it is already cached, else from the file's header; a
+        // square to be re-sized on loading when neither is readable.
         let size = match self.images.file(&p) {
-            ImgState::Ready { size, .. } => {
-                let (w, h) = (size[0] as f32, size[1] as f32);
-                let target = (self.doc.width.min(self.doc.height) * 0.3).max(60.0);
-                let s = target / w.max(h);
-                Vec2::new(w * s, h * s)
-            }
-            // Not decoded yet (e.g. just dropped): read the header for the aspect ratio.
-            _ => {
-                let target = (self.doc.width.min(self.doc.height) * 0.3).max(60.0);
-                match crate::storage::read(path).ok().and_then(|b| crate::assets::image_size(&b)) {
-                    Some((w, h)) if w > 0.0 && h > 0.0 => {
-                        let s = target / w.max(h);
-                        Vec2::new(w * s, h * s)
-                    }
-                    _ => Vec2::splat(target),
-                }
-            }
+            ImgState::Ready { size, .. } => Some((size[0] as f32, size[1] as f32)),
+            _ => crate::storage::read(path).ok().and_then(|b| crate::assets::image_size(&b)).filter(|(w, h)| *w > 0.0 && *h > 0.0),
         };
         let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Image".into());
         let id = self.doc.alloc_id();
@@ -1298,7 +1334,81 @@ impl BioCartoon {
             crop: [0.0, 0.0, 1.0, 1.0],
             overlay: [255, 255, 255, 0],
         };
-        self.insert_item(Item::new(id, name, kind, Pos2::ZERO, size));
+        let mut item = Item::new(id, name, kind, Pos2::ZERO, Vec2::splat(target));
+        match size {
+            Some((w, h)) => {
+                let s = target / w.max(h);
+                item.size = [w * s, h * s];
+                item.fitted = true;
+            }
+            None => self.pending_fit.push((id, Fit::Side(target))),
+        }
+        self.insert_item(item);
+    }
+
+    /// Give image items the shape of their picture once it has loaded.
+    ///
+    /// A catalog asset is placed with its PNG's proportions, which need not be those of the SVG
+    /// that is drawn (BioArt crops its PNGs to the drawing while its SVGs sit on a square
+    /// artboard), so items on `pending_fit` are re-sized to the loaded picture. Image items of
+    /// documents from before SVGs were trimmed to their drawing are moved onto the drawing
+    /// ([`crate::doc::fit_to_drawing`]), which changes nothing visible; the saved copy gets the
+    /// same change so that this does not count as an edit.
+    fn fit_images(&mut self) {
+        for (si, slide) in self.doc.slides.iter_mut().enumerate() {
+            for it in &mut slide.items {
+                let ItemKind::Image { source, .. } = &it.kind else { continue };
+                let pending = self.pending_fit.iter().position(|(id, _)| *id == it.id);
+                if it.fitted && pending.is_none() {
+                    continue;
+                }
+                let key = source.cache_key();
+                let size = match self.images.get(&key) {
+                    Some(ImgState::Ready { size, .. }) => Vec2::new(size[0] as f32, size[1] as f32),
+                    Some(ImgState::Failed(_)) => {
+                        if let Some(i) = pending {
+                            self.pending_fit.remove(i);
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let vector = self.images.vector(&key);
+                if let Some(i) = pending {
+                    let (_, fit) = self.pending_fit.remove(i);
+                    let pic = vector.as_ref().map_or(size, |v| v.size());
+                    let new = match fit {
+                        Fit::Side(side) => pic * (side / pic.max_elem()),
+                        Fit::Area(area) => {
+                            let w = (area * pic.x / pic.y).sqrt();
+                            Vec2::new(w, w * pic.y / pic.x)
+                        }
+                    };
+                    let c = it.rect().center();
+                    it.pos = [c.x - new.x / 2.0, c.y - new.y / 2.0];
+                    it.size = [new.x, new.y];
+                    it.fitted = true;
+                } else {
+                    let before = it.clone();
+                    if let Some((r, crop)) = vector.and_then(|v| crate::doc::fit_to_drawing(it, v.artboard(), v.content())) {
+                        it.pos = [r.min.x, r.min.y];
+                        it.size = [r.width(), r.height()];
+                        if let ItemKind::Image { crop: c, .. } = &mut it.kind {
+                            *c = crop;
+                        }
+                    }
+                    it.fitted = true;
+                    let saved = self.saved_doc.as_mut().and_then(|d| d.slides.get_mut(si)).and_then(|s| s.items.iter_mut().find(|s| s.id == before.id));
+                    if let Some(saved) = saved.filter(|s| **s == before) {
+                        *saved = it.clone();
+                    }
+                }
+            }
+        }
+        if !self.pending_fit.is_empty() {
+            let ids: std::collections::HashSet<ItemId> = self.doc.slides.iter().flat_map(|s| s.items.iter().map(|i| i.id)).collect();
+            self.pending_fit.retain(|(id, _)| ids.contains(id));
+        }
     }
 
     /// Images dropped on the canvas: remembered in Uploads and placed on the page, fanned out
@@ -1609,8 +1719,8 @@ impl BioCartoon {
                             let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
                             let tex = ctx.load_texture("generated", ci, egui::TextureOptions::LINEAR);
                             self.generate.status = format!("Generated with {}", self.ai.backend.name());
+                            self.generate.result_path = self.keep_generated(ctx, &img, &prompt);
                             self.generate.result = Some((img, tex));
-                            self.generate.result_prompt = prompt.clone();
                         }
                         Err(e) => {
                             self.generate.status = e.clone();
@@ -2006,23 +2116,101 @@ impl BioCartoon {
         out.trim_matches('-').chars().take(60).collect()
     }
 
-    fn save_generated(&mut self) -> Option<PathBuf> {
-        let (img, _) = self.generate.result.as_ref()?;
-        let path = self.app_dir.join("generated").join(format!("gen-{}.png", chrono::Utc::now().format("%Y%m%d%H%M%S")));
-        if let Err(e) = img.save(&path) {
-            self.toast_err(format!("save: {e}"));
+    /// Save a generated image to the history (and, with the setting on, the library); its path.
+    fn keep_generated(&mut self, ctx: &egui::Context, img: &image::RgbaImage, prompt: &str) -> Option<String> {
+        let now = chrono::Utc::now();
+        let path = self.app_dir.join("generated").join(format!("gen-{}{:03}.png", now.format("%Y%m%d%H%M%S"), now.timestamp_subsec_millis()));
+        let mut png = std::io::Cursor::new(Vec::new());
+        if let Err(e) = img.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string()).and_then(|_| crate::storage::write(&path, png.get_ref()).map_err(|e| e.to_string())) {
+            self.toast_err(format!("save generated image: {e}"));
             return None;
         }
-        Some(path)
+        let p = path.display().to_string();
+        // Seed the cache so it shows (and is sized when placed) right away.
+        self.images.insert_image(ctx, &format!("file:{p}"), img.clone());
+        self.settings.generated.insert(0, GeneratedImage { path: p.clone(), prompt: prompt.into(), library_id: None });
+        if self.settings.auto_library_generated {
+            self.generated_to_library(&p, false);
+        }
+        Some(p)
     }
 
-    fn add_generated_to_canvas(&mut self, ctx: &egui::Context) {
-        if let Some(p) = self.save_generated() {
-            // Seed the cache so the item renders (and is sized) immediately.
-            let img = self.generate.result.as_ref().unwrap().0.clone();
-            self.images.insert_image(ctx, &format!("file:{}", p.display()), img);
-            self.insert_file(&p);
+    /// The library id of the generated image at `path`, adding it to the library first if it
+    /// is not there yet (`true` when it was just added).
+    fn generated_library_id(&mut self, path: &str) -> Option<(String, bool)> {
+        let i = self.settings.generated.iter().position(|g| g.path == path)?;
+        if let Some(id) = &self.settings.generated[i].library_id {
+            return Some((id.clone(), false));
         }
+        let img = match read_image(Path::new(path)) {
+            Ok(img) => img,
+            Err(e) => {
+                self.toast_err(e);
+                return None;
+            }
+        };
+        let prompt = self.settings.generated[i].prompt.clone();
+        let mut name: String = prompt.trim().chars().take(60).collect();
+        if name.is_empty() {
+            name = "Generated image".into();
+        }
+        let author = self.settings.contributor_name.trim().to_string();
+        let mut row = AssetRow {
+            id: String::new(),
+            source: "user".into(),
+            source_name: "User-generated".into(),
+            credit: format!("\"{name}\" generated with BioCartoon. Prompt: {prompt}"),
+            title: name,
+            variant: String::new(),
+            category: String::new(),
+            license: UPLOAD_LICENSES[0].0.into(),
+            author,
+            png_key: String::new(),
+            png_local: None,
+            png_width: 0,
+            png_height: 0,
+            svg_key: None,
+            stars: 0,
+            starred: false,
+        };
+        if let Err(e) = self.save_user_png(img, &mut row) {
+            self.toast_err(e);
+            return None;
+        }
+        let id = row.id.clone();
+        self.catalog.send(Req::InsertUser { row });
+        self.settings.generated[i].library_id = Some(id.clone());
+        Some((id, true))
+    }
+
+    /// Add a generated image to the library and, with `favorite`, to Favorites.
+    fn generated_to_library(&mut self, path: &str, favorite: bool) {
+        let Some((id, added)) = self.generated_library_id(path) else { return };
+        let fav = favorite && !self.settings.favorites.contains(&id);
+        if fav {
+            self.toggle_favorite(id);
+        }
+        self.toast(match (added, fav) {
+            (true, true) => "Added to your library and favorites",
+            (true, false) => "Added to your library",
+            (false, true) => "Added to your favorites",
+            (false, false) if favorite => "Already in your favorites",
+            (false, false) => "Already in your library",
+        });
+    }
+
+    /// A library icon was replaced (`to`) or removed: generated images that pointed at `from` follow.
+    fn relink_generated(&mut self, from: &str, to: Option<String>) {
+        for g in self.settings.generated.iter_mut().filter(|g| g.library_id.as_deref() == Some(from)) {
+            g.library_id = to.clone();
+        }
+    }
+
+    /// Open Contribute artwork with a generated image picked (adding it to the library first).
+    fn contribute_generated(&mut self, path: &str) {
+        let Some((id, _)) = self.generated_library_id(path) else { return };
+        self.open_contribute();
+        self.contribute.library.insert(id);
     }
 
     /// The submission Worker, if one is configured.
@@ -2050,7 +2238,6 @@ impl BioCartoon {
         }
         let target = targets.remove(0);
         let (name, category, description) = match &target {
-            UploadTarget::Generated => (self.generate.result_prompt.chars().take(60).collect(), String::new(), String::new()),
             UploadTarget::File(p) => (p.file_stem().map(|s| s.to_string_lossy().replace(['_', '-'], " ")).unwrap_or_default(), String::new(), String::new()),
             UploadTarget::Library(row) => (row.title.clone(), row.category.clone(), String::new()),
             UploadTarget::Template(t) => match &t.saved {
@@ -2198,10 +2385,6 @@ impl BioCartoon {
             UploadTarget::Template(t) => self.save_template((**t).clone(), name, category, description, d.license, author, share),
             target => {
                 let img = match target {
-                    UploadTarget::Generated => match &self.generate.result {
-                        Some((img, _)) => Ok(img.clone()),
-                        None => Err("Nothing generated yet".to_string()),
-                    },
                     UploadTarget::File(p) => read_image(p),
                     UploadTarget::Library(row) => read_image(Path::new(row.png_local.as_deref().unwrap_or_default())),
                     UploadTarget::Template(_) => unreachable!(),
@@ -2210,11 +2393,7 @@ impl BioCartoon {
                     UploadTarget::Library(row) => Some(row.id.clone()),
                     _ => None,
                 };
-                let credit_line = match target {
-                    UploadTarget::Generated => format!("\"{name}\" generated with BioCartoon. Prompt: {}", self.generate.result_prompt),
-                    _ if author.is_empty() || author == "anonymous" => format!("\"{name}\", {}", d.license),
-                    _ => format!("\"{name}\" by {author}, {}", d.license),
-                };
+                let credit_line = if author.is_empty() || author == "anonymous" { format!("\"{name}\", {}", d.license) } else { format!("\"{name}\" by {author}, {}", d.license) };
                 let row = AssetRow {
                     id: String::new(),
                     source: "user".into(),
@@ -2281,22 +2460,15 @@ impl BioCartoon {
     /// Save an image to the library, and submit it if `share` says where. The library icon it
     /// `replaces`, if any, is removed once the new one is in.
     fn upload_asset(&mut self, img: image::RgbaImage, mut row: AssetRow, share: Option<(String, SubmitMeta)>, replaces: Option<String>) {
-        let (png, w, h) = match crate::templates::encode_png(img) {
-            Ok(v) => v,
+        let png = match self.save_user_png(img, &mut row) {
+            Ok(png) => png,
             Err(e) => return self.toast_err(e),
         };
-        let slug = Self::upload_slug(&row.title);
-        let abs = self.app_dir.join("user_generated").join(format!("{slug}.png"));
-        if let Err(e) = crate::storage::write(&abs, &png) {
-            return self.toast_err(format!("save: {e}"));
-        }
-        row.id = format!("user/{slug}");
-        row.png_key = format!("user/{slug}.png");
-        row.png_local = Some(abs.display().to_string());
-        row.png_width = w;
-        row.png_height = h;
         let Some((url, meta)) = share else {
             self.toast(format!("Added \"{}\" to your library", row.title));
+            if let Some(id) = &replaces {
+                self.relink_generated(id, Some(row.id.clone()));
+            }
             self.catalog.send(Req::InsertUser { row });
             if let Some(id) = replaces {
                 self.catalog.send(Req::RemoveUser { id });
@@ -2313,6 +2485,20 @@ impl BioCartoon {
             let _ = tx.send(LibraryMsg::AssetSubmitted { row, result, replaces });
             ctx.request_repaint();
         });
+    }
+
+    /// Write an image to the user's library folder and fill in `row`'s id and file; the PNG.
+    fn save_user_png(&self, img: image::RgbaImage, row: &mut AssetRow) -> Result<Vec<u8>, String> {
+        let (png, w, h) = crate::templates::encode_png(img)?;
+        let slug = Self::upload_slug(&row.title);
+        let abs = self.app_dir.join("user_generated").join(format!("{slug}.png"));
+        crate::storage::write(&abs, &png).map_err(|e| format!("save: {e}"))?;
+        row.id = format!("user/{slug}");
+        row.png_key = format!("user/{slug}.png");
+        row.png_local = Some(abs.display().to_string());
+        row.png_width = w;
+        row.png_height = h;
+        Ok(png)
     }
 
     /// Image loads for rendering `slide` off the UI thread: requests, and decoded copies we have.
@@ -2456,6 +2642,9 @@ impl BioCartoon {
                         }
                         Err(e) => self.toast_err(format!("\"{title}\" is in your library but was not submitted: {e}")),
                     }
+                    if let Some(id) = &replaces {
+                        self.relink_generated(id, Some(row.id.clone()));
+                    }
                     self.catalog.send(Req::InsertUser { row });
                     if let Some(id) = replaces {
                         self.catalog.send(Req::RemoveUser { id });
@@ -2516,6 +2705,7 @@ impl BioCartoon {
         self.ai_edit = None;
         self.page.last_edit = None;
         self.replace_target = None;
+        self.pending_fit.clear();
         self.crop_mode = false;
         self.dirty = false;
         self.view.fit_requested = true;
@@ -3253,6 +3443,7 @@ impl BioCartoon {
                     self.icons.total = self.icons.total.map(|n| (n - 1).max(0));
                 }
                 self.catalog.send(Req::RemoveUser { id: row.id.clone() });
+                self.relink_generated(&row.id, None);
                 self.toast(format!("Removed \"{}\" from your library", row.title));
             }
             Action::ToggleFavorite(id) => self.toggle_favorite(id),
@@ -3503,7 +3694,8 @@ impl BioCartoon {
                 }
             }
             Action::Generate(p) => self.start_generate(p),
-            Action::AddGeneratedToCanvas => self.add_generated_to_canvas(ctx),
+            Action::GeneratedToLibrary { path, favorite } => self.generated_to_library(&path, favorite),
+            Action::ContributeGenerated(path) => self.contribute_generated(&path),
             Action::OpenUploadDialog(target) => self.open_upload_dialog(target),
             Action::PickLibraryFile => {
                 let tx = self.action_tx.clone();
@@ -3570,30 +3762,6 @@ impl BioCartoon {
             Action::ZoomFit => self.view.fit_requested = true,
             Action::ZoomTo(z) => self.view.zoom = z.clamp(0.05, 8.0),
             Action::Toast(t) => self.toast(t),
-            Action::ApplySettings => {
-                let mut s = self.settings_draft.clone();
-                s.asset_base_url = s.asset_base_url.trim().trim_end_matches('/').to_string();
-                if !self.settings_local_catalog {
-                    s.catalog_path.clear();
-                }
-                let catalog_changed = s.catalog_path != self.settings.catalog_path
-                    || (s.catalog_path.is_empty() && s.asset_base_url != self.settings.asset_base_url);
-                let backend_changed = s.ai_provider != self.settings.ai_provider;
-                // Not edited in the dialog, and may have changed while it was open.
-                s.favorites = std::mem::take(&mut self.settings.favorites);
-                s.pending_stars = std::mem::take(&mut self.settings.pending_stars);
-                self.settings = s;
-                let local = if self.settings.local_data_dir.is_empty() { None } else { Some(PathBuf::from(&self.settings.local_data_dir)) };
-                self.images.configure(self.settings.asset_base_url.clone(), local);
-                if catalog_changed {
-                    self.open_catalog();
-                }
-                if backend_changed {
-                    self.ai.set_backend(self.settings.ai_provider);
-                }
-                self.show_settings = false;
-                self.toast("Settings saved");
-            }
             Action::SyncCatalog => self.open_catalog(),
             Action::SetRail(Some(RailTab::Text)) => self.apply(Action::ArmText(!self.placing_text), ctx),
             Action::SetRail(r) => {
@@ -3735,6 +3903,7 @@ impl BioCartoon {
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_control(&ctx);
         self.images.poll(&ctx);
+        self.fit_images();
         self.handle_catalog();
         self.lookup_credits();
         self.poll_stars();
@@ -3817,12 +3986,11 @@ impl BioCartoon {
                         let check = if view { ph::CHECK_SQUARE } else { ph::SQUARE };
                         if ui.add(egui::Button::new("View spelling and grammar").right_text(check)).on_hover_text("Underline mistakes in red (spelling) and blue (grammar) while you edit").clicked() {
                             self.settings.show_spelling = !view;
-                            self.settings_draft.show_spelling = !view;
                         }
                         if ui.button("Check spelling and grammar...").clicked() { self.show_spell_window = true; ui.close(); }
                         ui.separator();
                         if ui.button("Export slide...").clicked() { self.actions.push(Action::OpenExport); ui.close(); }
-                        if ui.button("Attributions...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = None; ui.close(); }
+                        if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = None; ui.close(); }
                         ui.separator();
                         if ui.button("Settings...").clicked() { self.open_settings(SettingsTab::General); ui.close(); }
                         if ui.button(if cfg!(target_arch = "wasm32") { "Bulk download..." } else { "Download..." }).clicked() { self.open_settings(SettingsTab::Offline); ui.close(); }
@@ -3923,7 +4091,6 @@ impl BioCartoon {
         // Settings
         if self.show_settings {
             let mut open = true;
-            let mut apply = false;
             egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).fixed_size([620.0, 0.0]).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::General, "General");
@@ -3931,7 +4098,9 @@ impl BioCartoon {
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Offline, crate::offline::TAB_LABEL);
                 });
                 ui.separator();
-                let d = &mut self.settings_draft;
+                // Edits apply (and are saved) right away, so there's no Save button.
+                let d = &mut self.settings;
+                let ai_before = (d.ai_provider, d.ai_model.clone(), d.api_key.clone(), d.ai_base_url.clone(), d.ai_prompts.clone());
                 match self.settings_tab {
                     SettingsTab::General => {
                         egui::Grid::new("general_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
@@ -3966,21 +4135,22 @@ impl BioCartoon {
                         });
                     }
                     SettingsTab::Ai => {
-                        ai_fields(ui, &mut d.ai_provider, &mut d.ai_model, &mut d.api_key);
+                        ai_fields(ui, &mut d.ai_provider, &mut d.ai_model, &mut d.api_key, &mut d.ai_base_url);
+                        ui.add_space(10.0);
+                        ui.checkbox(&mut d.auto_library_generated, "Automatically add images to your library").on_hover_text("Every image generated with AI goes into Your library as soon as it arrives");
+                        ui.add_space(10.0);
+                        ui.separator();
+                        let svg = d.ai_provider.draws_svg(&d.ai_model);
+                        ai_prompt_fields(ui, &mut d.ai_prompts, svg);
                     }
-                    // Acts right away, so it has no Save button.
                     SettingsTab::Offline => self.offline_tab(ui),
                 }
-                if self.settings_tab != SettingsTab::Offline {
-                    ui.add_space(10.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(egui::RichText::new("Save").color(Color32::WHITE)).fill(theme::accent())).clicked() { apply = true; }
-                        if ui.button("Cancel").clicked() { self.show_settings = false; }
-                    });
+                let d = &self.settings;
+                if (d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts) != (ai_before.0, &ai_before.1, &ai_before.2, &ai_before.3, &ai_before.4) {
+                    self.ai.set_backend(d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts);
                 }
             });
             if !open { self.show_settings = false; }
-            if apply { self.actions.push(Action::ApplySettings); }
         }
 
         // About
@@ -4012,12 +4182,16 @@ impl BioCartoon {
             let mut connect = false;
             let mut cancel = false;
             egui::Window::new("Connect an AI model").open(&mut open).collapsible(false).resizable(false).fixed_size([460.0, 0.0]).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-                ui.label(egui::RichText::new("AI tools run on a hosted model using your own API key. The key is stored only on this computer.").color(theme::text_dim()));
+                ui.label(egui::RichText::new("AI tools run on a hosted model with your own API key, or on your own vLLM server. Keys are stored only on this computer.").color(theme::text_dim()));
                 ui.add_space(8.0);
-                ai_fields(ui, &mut setup.provider, &mut setup.model, &mut setup.key);
+                ai_fields(ui, &mut setup.provider, &mut setup.model, &mut setup.key, &mut setup.base_url);
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let can = !setup.key.trim().is_empty() && !setup.model.trim().is_empty();
+                    let can = if setup.provider.self_hosted() {
+                        !setup.base_url.trim().is_empty()
+                    } else {
+                        !setup.key.trim().is_empty() && !setup.model.trim().is_empty()
+                    };
                     if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Connect").color(Color32::WHITE)).fill(theme::accent())).clicked() { connect = true; }
                     if ui.button("Cancel").clicked() { cancel = true; }
                 });
@@ -4027,7 +4201,9 @@ impl BioCartoon {
                 self.settings.ai_provider = setup.provider;
                 self.settings.ai_model = setup.model.trim().to_string();
                 self.settings.api_key = setup.key.trim().to_string();
-                self.ai.set_backend(self.settings.ai_provider);
+                self.settings.ai_base_url = setup.base_url.trim().to_string();
+                let s = &self.settings;
+                self.ai.set_backend(s.ai_provider, &s.ai_model, &s.api_key, &s.ai_base_url, &s.ai_prompts);
                 if let Some(a) = setup.pending {
                     self.actions.push(a);
                 }
@@ -4251,7 +4427,6 @@ impl BioCartoon {
             }
         }
         let content: Option<Vec2> = match &d.target {
-            UploadTarget::Generated => self.generate.result.as_ref().map(|(_, t)| t.size_vec2()),
             UploadTarget::File(_) | UploadTarget::Library(_) => match self.images.file(&d.target.image_path().unwrap_or_default()) {
                 ImgState::Ready { size, .. } => Some(Vec2::new(size[0] as f32, size[1] as f32)),
                 _ => None,
@@ -4283,11 +4458,6 @@ impl BioCartoon {
             let shown = Rect::from_center_size(rect.center() + d.view_pan, c * scale);
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             match &d.target {
-                UploadTarget::Generated => {
-                    if let Some((_, tex)) = &self.generate.result {
-                        painter.image(tex.id(), shown, uv, Color32::WHITE);
-                    }
-                }
                 UploadTarget::File(_) | UploadTarget::Library(_) => {
                     if let ImgState::Ready { tex, .. } = self.images.file(&d.target.image_path().unwrap_or_default()) {
                         painter.image(tex.id(), shown, uv, Color32::WHITE);
@@ -4347,9 +4517,9 @@ impl BioCartoon {
 impl BioCartoon {
     /// Headless-ish smoke test: `BIOCARTOON_SCREENSHOT=out.png` captures the window after a
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
-    /// (comma-separated: demo, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
+    /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, about, templates, savetemplate, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
-    /// fav=<id>, rail=<text|lines|shapes|table|edit|slides|page|none|icons|noicons|uploads|favorites|library>).
+    /// fav=<id>, open=<project id>, rail=<text|lines|shapes|table|edit|slides|page|none|icons|noicons|uploads|favorites|library>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -4389,6 +4559,8 @@ impl BioCartoon {
                             self.open_version_history(&p.id);
                         }
                     }
+                    // A project from the store (`BIOCARTOON_PROJECTS_DIR`), as it looks when opened.
+                    s if s.starts_with("open=") => self.open_project(&s["open=".len()..]),
                     "demo" => {
                         self.show_settings = false;
                         self.actions.push(Action::UseTemplate(3));
@@ -4398,6 +4570,16 @@ impl BioCartoon {
                         if image::load_from_memory(crate::ICON_PNG).ok().and_then(|i| i.save(&icon).ok()).is_some() {
                             self.actions.push(Action::InsertFile(icon));
                         }
+                    }
+                    // The logo SVG placed as an upload and zoomed far in: checks that SVGs draw sharp.
+                    "svgzoom" => {
+                        self.show_settings = false;
+                        let svg = self.app_dir.join("generated").join("demo-logo.svg");
+                        if crate::storage::write(&svg, include_bytes!("../assets/logo.svg")).is_ok() {
+                            self.actions.push(Action::InsertFile(svg));
+                        }
+                        self.view.fit_requested = false;
+                        self.actions.push(Action::ZoomTo(5.0));
                     }
                     // Text with spelling and grammar mistakes, and the Spelling and grammar window.
                     "spell" => {
@@ -4606,8 +4788,50 @@ impl BioCartoon {
     }
 }
 
+/// The AI settings tab's editors for the prompt text sent with each request. The system
+/// prompts are left out when the selected model is an image model, which never sees them.
+fn ai_prompt_fields(ui: &mut egui::Ui, prompts: &mut AiPrompts, svg: bool) {
+    let defaults = AiPrompts::default();
+    let dim = |t: &str| egui::RichText::new(t).color(theme::text_dim());
+    // A titled text box with a Reset button that's live once it differs from the default.
+    let field = |ui: &mut egui::Ui, title: &str, about: &str, text: &mut String, default: &str, rows: usize| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(text.as_str() != default, egui::Button::new("Reset")).clicked() {
+                    *text = default.into();
+                }
+            });
+        });
+        ui.label(dim(about));
+        ui.add(egui::TextEdit::multiline(text).desired_rows(rows).desired_width(f32::INFINITY));
+        ui.add_space(8.0);
+    };
+
+    egui::ScrollArea::vertical().min_scrolled_height(440.0).max_height(440.0).show(ui, |ui| {
+        ui.label(egui::RichText::new("Generate with AI").size(15.0).strong());
+        ui.add_space(4.0);
+        field(ui, "Image prompt", "Wraps what you type on the Generate page, for every provider. {prompt} marks where your text goes; without it, your text is added at the end.", &mut prompts.generate, &defaults.generate, 2);
+        if svg {
+            field(ui, "Illustrator instructions", "System prompt for the model, used when generating and editing images.", &mut prompts.illustrator, &defaults.illustrator, 3);
+            ui.label(dim("Always added after it, so the app can read the reply:"));
+            ui.label(egui::RichText::new(crate::ai::SVG_RULES).small().color(theme::text_dim()));
+        }
+        ui.add_space(12.0);
+
+        ui.label(egui::RichText::new("Edit with AI").size(15.0).strong());
+        ui.add_space(4.0);
+        field(ui, "Edit prompt", "Wraps the change you ask for, for every provider. {prompt} marks where your request goes.", &mut prompts.edit, &defaults.edit, 2);
+        if svg {
+            field(ui, "Assistant instructions", "System prompt for the dialog's text replies. It doesn't change the image.", &mut prompts.chat, &defaults.chat, 4);
+        } else {
+            ui.label(dim("Image models take no system prompt, so the illustrator and assistant instructions are hidden. They appear when you pick a model that draws SVG (Anthropic, an OpenAI chat model, or vLLM)."));
+        }
+    });
+}
+
 /// Provider / model / API key fields shared by the AI setup dialog and the AI settings tab.
-fn ai_fields(ui: &mut egui::Ui, provider: &mut BackendKind, model: &mut String, key: &mut String) {
+fn ai_fields(ui: &mut egui::Ui, provider: &mut BackendKind, model: &mut String, key: &mut String, base_url: &mut String) {
     egui::Grid::new(ui.id().with("ai_fields")).num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
         ui.label("Provider");
         let before = *provider;
@@ -4617,9 +4841,20 @@ fn ai_fields(ui: &mut egui::Ui, provider: &mut BackendKind, model: &mut String, 
             }
         });
         if *provider != before {
-            *model = provider.models()[0].into();
+            *model = provider.models().first().copied().unwrap_or_default().into();
         }
         ui.end_row();
+
+        // vLLM serves the model it was started with and needs no key.
+        if provider.self_hosted() {
+            ui.label("Server URL");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(base_url).hint_text("http://localhost:8000").desired_width(220.0));
+                ui.hyperlink_to("Docs", provider.key_url());
+            });
+            ui.end_row();
+            return;
+        }
 
         ui.label("Model");
         ui.horizontal(|ui| {

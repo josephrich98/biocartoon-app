@@ -209,14 +209,19 @@ impl BioCartoon {
         ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
         let modal = egui::Modal::new(id).show(ctx, |ui| {
             ui.set_width(480.0);
-            ui.horizontal(|ui| {
-                ui.heading(format!("{}  Attributions", ph::QUOTES));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Sides sizes the row to the taller heading; a right-to-left layout nested in a
+            // horizontal row didn't, so the next line drew over the heading.
+            egui::containers::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.heading(format!("{}  Attributions", ph::QUOTES));
+                },
+                |ui| {
                     if ui.button(ph::X).on_hover_text("Close").clicked() {
                         open = false;
                     }
-                });
-            });
+                },
+            );
             ui.set_max_height(ctx.content_rect().height() * 0.7);
             action = attributions_ui(ui, credits, &mut self.attributions_required_only);
         });

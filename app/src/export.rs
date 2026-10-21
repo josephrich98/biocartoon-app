@@ -439,14 +439,14 @@ fn prepared_png(img: &RgbaImage, crop: [f32; 4], overlay: [u8; 4], flip_h: bool,
 /// vector shapes.
 pub enum Picture {
     Pixels(RgbaImage),
-    Vector(Box<usvg::Tree>),
+    Vector(Box<Vector>),
 }
 
 impl Picture {
     /// Decode an image file; SVGs are parsed, not rasterised.
     fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         if crate::assets::is_svg(bytes) {
-            usvg::Tree::from_data(bytes, &svg_options()).map(|t| Picture::Vector(Box::new(t))).map_err(|e| format!("svg: {e}"))
+            Vector::parse(bytes).map(|v| Picture::Vector(Box::new(v)))
         } else {
             image::load_from_memory(bytes).map(|i| Picture::Pixels(i.to_rgba8())).map_err(|e| e.to_string())
         }
@@ -454,15 +454,17 @@ impl Picture {
 }
 
 /// An SVG image item drawn as vector shapes: the file's contents (IDs prefixed with `id`) in a
-/// nested `<svg>` placed so the crop window lands on the item's rect, clipped to it, mirrored
-/// for flips and tinted with a colour matrix (the same multiply as [`prepared_png`]).
-fn vector_image(s: &mut String, tree: &usvg::Tree, it: &Item, crop: [f32; 4], overlay: [u8; 4], id: &str) {
-    let r = it.rect();
+/// nested `<svg>` whose view box is the drawing, placed so the crop window lands on the item's
+/// rect, clipped to it, mirrored for flips and tinted with a colour matrix (the same multiply
+/// as [`prepared_png`]). An item from before SVGs were trimmed to their drawing is moved onto
+/// the drawing first, as the canvas does when it opens such a document.
+fn vector_image(s: &mut String, vector: &Vector, it: &Item, crop: [f32; 4], overlay: [u8; 4], id: &str) {
+    let content = vector.content();
+    let (r, crop) = if it.fitted { None } else { crate::doc::fit_to_drawing(it, vector.artboard(), content) }.unwrap_or((it.rect(), crop));
     let c = r.center();
-    let size = tree.size();
     let (cw, ch) = ((crop[2] - crop[0]).max(1e-3), (crop[3] - crop[1]).max(1e-3));
     let full = Rect::from_min_size(Pos2::new(r.min.x - crop[0] / cw * r.width(), r.min.y - crop[1] / ch * r.height()), Vec2::new(r.width() / cw, r.height() / ch));
-    let xml = tree.to_string(&usvg::WriteOptions { id_prefix: Some(format!("{id}-")), indent: usvg::Indent::None, ..Default::default() });
+    let xml = vector.tree.to_string(&usvg::WriteOptions { id_prefix: Some(format!("{id}-")), indent: usvg::Indent::None, ..Default::default() });
     // Keep what is inside the file's root <svg> element; it gets our own below.
     let body = xml.find("<svg").and_then(|i| xml[i..].find('>').map(|j| i + j + 1)).zip(xml.rfind("</svg>")).map_or("", |(a, b)| &xml[a..b]);
 
@@ -487,13 +489,15 @@ fn vector_image(s: &mut String, tree: &usvg::Tree, it: &Item, crop: [f32; 4], ov
     }
     let _ = writeln!(
         s,
-        r#"<svg x="{}" y="{}" width="{}" height="{}" viewBox="0 0 {} {}" preserveAspectRatio="none" overflow="visible">{body}</svg>"#,
+        r#"<svg x="{}" y="{}" width="{}" height="{}" viewBox="{} {} {} {}" preserveAspectRatio="none" overflow="visible">{body}</svg>"#,
         n(full.min.x),
         n(full.min.y),
         n(full.width()),
         n(full.height()),
-        n(size.width()),
-        n(size.height())
+        n(content.min.x),
+        n(content.min.y),
+        n(content.width()),
+        n(content.height())
     );
     if it.flip_h || it.flip_v {
         s.push_str("</g>\n");
@@ -529,9 +533,9 @@ pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<
         match &it.kind {
             ItemKind::Image { source, crop, overlay } => {
                 let png = match images.get(&source.cache_key()) {
-                    Some(Picture::Vector(tree)) => {
+                    Some(Picture::Vector(vector)) => {
                         clip_id += 1;
-                        vector_image(&mut s, tree, it, *crop, *overlay, &format!("svg{clip_id}"));
+                        vector_image(&mut s, vector, it, *crop, *overlay, &format!("svg{clip_id}"));
                         continue;
                     }
                     Some(Picture::Pixels(img)) => prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v),
@@ -735,21 +739,98 @@ fn parse(svg: &str) -> Result<usvg::Tree, String> {
     usvg::Tree::from_str(svg, &svg_options()).map_err(|e| format!("svg: {e}"))
 }
 
-/// An SVG file's size in user units.
+/// An SVG file's drawing's size in user units (see [`Vector`]).
 pub fn svg_size(bytes: &[u8]) -> Option<(f32, f32)> {
-    let size = usvg::Tree::from_data(bytes, &svg_options()).ok()?.size();
-    Some((size.width(), size.height()))
+    let size = Vector::parse(bytes).ok()?.size();
+    Some((size.x, size.y))
 }
 
 /// Rasterise an SVG file (an upload) so its longer side is `max_side` pixels.
 pub fn render_svg(bytes: &[u8], max_side: u32) -> Result<RgbaImage, String> {
-    let tree = usvg::Tree::from_data(bytes, &svg_options()).map_err(|e| format!("svg: {e}"))?;
+    Vector::parse(bytes)?.render(max_side)
+}
+
+/// Longer side, in pixels, of the rendering that finds an SVG's drawing.
+const TRIM_SIDE: u32 = 512;
+
+/// A parsed SVG, drawn trimmed to its drawing: the part of the artboard that has anything
+/// visible on it.
+///
+/// Files often have an artboard bigger than the drawing (BioArt exports every icon on a 500 x
+/// 500 board, while its PNG of the same icon is cropped to the drawing), so an image shown with
+/// the whole artboard would be padded and, placed with its PNG's proportions, squashed. The
+/// drawing is found by rendering, since a geometric bounding box counts shapes hidden by clip
+/// paths (BioArt fills a flask by clipping a big rectangle to the glass).
+pub struct Vector {
+    tree: usvg::Tree,
+    /// The drawing's box on the artboard, in the file's user units.
+    content: Rect,
+}
+
+impl Vector {
+    /// Parse an SVG file (plain or gzipped) with the app's fonts.
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let tree = usvg::Tree::from_data(bytes, &svg_options()).map_err(|e| format!("svg: {e}"))?;
+        let content = content_rect(&tree);
+        Ok(Self { tree, content })
+    }
+
+    /// The file's own size (its artboard), in user units.
+    pub fn artboard(&self) -> Vec2 {
+        let s = self.tree.size();
+        Vec2::new(s.width(), s.height())
+    }
+
+    /// The drawing's box on the artboard, in user units.
+    pub fn content(&self) -> Rect {
+        self.content
+    }
+
+    /// The drawing's size, in user units: what the image's pixels are proportioned to.
+    pub fn size(&self) -> Vec2 {
+        self.content.size()
+    }
+
+    /// Rasterise the drawing so its longer side is `max_side` pixels. The canvas calls this again
+    /// whenever an image is shown larger than its last rendering, so SVG assets stay sharp at
+    /// any zoom.
+    pub fn render(&self, max_side: u32) -> Result<RgbaImage, String> {
+        let c = self.content;
+        let s = max_side as f32 / c.width().max(c.height());
+        let (w, h) = (((c.width() * s).round() as u32).max(1), ((c.height() * s).round() as u32).max(1));
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h).ok_or_else(|| format!("{w} x {h} px is too large to render"))?;
+        resvg::render(&self.tree, resvg::tiny_skia::Transform::from_scale(s, s).pre_translate(-c.min.x, -c.min.y), &mut pixmap.as_mut());
+        pixmap_rgba(&pixmap)
+    }
+}
+
+/// The box of everything visible on an SVG's artboard, from a rendering of it `TRIM_SIDE` pixels
+/// on the longer side: the pixels with any opacity, converted back to user units (so the edges
+/// are at most a pixel of that rendering generous). The whole artboard when nothing is visible.
+fn content_rect(tree: &usvg::Tree) -> Rect {
     let size = tree.size();
-    let s = max_side as f32 / size.width().max(size.height());
-    let (w, h) = (((size.width() * s).round() as u32).max(1), ((size.height() * s).round() as u32).max(1));
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h).ok_or_else(|| format!("{w} x {h} px is too large to render"))?;
-    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(s, s), &mut pixmap.as_mut());
-    pixmap_rgba(&pixmap)
+    let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(size.width(), size.height()));
+    let s = TRIM_SIDE as f32 / size.width().max(size.height());
+    let (w, h) = (((size.width() * s).ceil() as u32).max(1), ((size.height() * s).ceil() as u32).max(1));
+    let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(w, h) else { return full };
+    resvg::render(tree, resvg::tiny_skia::Transform::from_scale(s, s), &mut pixmap.as_mut());
+    let px = pixmap.pixels();
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for y in 0..h {
+        let row = &px[(y * w) as usize..((y + 1) * w) as usize];
+        let Some(first) = row.iter().position(|p| p.alpha() > 0) else { continue };
+        let last = row.iter().rposition(|p| p.alpha() > 0).unwrap_or(first);
+        x0 = x0.min(first as u32);
+        x1 = x1.max(last as u32);
+        y0 = y0.min(y);
+        y1 = y1.max(y);
+    }
+    if x0 > x1 {
+        return full;
+    }
+    let (l, t) = ((x0 as f32 / s).max(0.0), (y0 as f32 / s).max(0.0));
+    let (r, b) = (((x1 + 1) as f32 / s).min(size.width()), ((y1 + 1) as f32 / s).min(size.height()));
+    Rect::from_min_max(Pos2::new(l, t), Pos2::new(r, b))
 }
 
 fn pixmap_rgba(pixmap: &resvg::tiny_skia::Pixmap) -> Result<RgbaImage, String> {
@@ -894,6 +975,36 @@ mod tests {
         assert_eq!(img.dimensions(), (400, 200));
         assert_eq!(img.get_pixel(10, 10).0, [255, 0, 0, 255]);
         assert!(!crate::assets::is_svg(crate::ICON_PNG));
+    }
+
+    /// An SVG is trimmed to its drawing: a 100 x 100 artboard with a 50 x 25 rectangle on it
+    /// has that rectangle's size and renders as just the rectangle, as an upload and in export.
+    /// An item placed for the whole artboard (an older document) is moved onto the drawing in
+    /// export, one that frames the drawing already is not.
+    #[test]
+    fn svg_trimmed_to_drawing() {
+        let file = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect x="25" y="50" width="50" height="25" fill="#f00"/></svg>"##;
+        let v = Vector::parse(file).unwrap();
+        assert_eq!(v.artboard(), Vec2::splat(100.0));
+        let c = v.content();
+        assert!((c.min - Pos2::new(25.0, 50.0)).length() < 0.3 && (c.max - Pos2::new(75.0, 75.0)).length() < 0.3, "{c:?}");
+        let (w, h) = crate::assets::image_size(file).unwrap();
+        assert!((w - 50.0).abs() < 0.3 && (h - 25.0).abs() < 0.3, "{w} x {h}");
+        let img = crate::assets::load_image(file, 100).unwrap();
+        assert_eq!(img.dimensions(), (100, 50));
+        assert_eq!(img.get_pixel(2, 2).0, [255, 0, 0, 255], "the drawing fills its rendering");
+        assert_eq!(img.get_pixel(97, 47).0, [255, 0, 0, 255]);
+
+        let source = ImageSource::file("padded.svg".into());
+        let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
+        let kind = ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4] };
+        let old = Item::new(1, "old", kind.clone(), Pos2::ZERO, Vec2::splat(200.0));
+        let mut new = Item::new(2, "new", kind, Pos2::new(300.0, 0.0), Vec2::new(200.0, 100.0));
+        new.fitted = true;
+        let ctx = egui::Context::default();
+        let svg = build_svg(&ctx, &[&old, &new], Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 300.0)), None, &pics);
+        assert!(svg.contains(r#"<svg x="50" y="100" width="100" height="50" viewBox="25 50 50 25""#), "the old item's drawing stays where it was:\n{svg}");
+        assert!(svg.contains(r#"<svg x="300" y="0" width="200" height="100" viewBox="25 50 50 25""#), "the new item is the drawing:\n{svg}");
     }
 
     /// Uploaded SVGs export as vector shapes, with crop, flip and tint applied as on the canvas.

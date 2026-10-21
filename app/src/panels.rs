@@ -2,7 +2,7 @@
 //! BioCartoon's own templates, user-generated assets, uploads), and the rail on the right with
 //! its panel (Text / Lines / Shapes / Table / Edit / Slides / Page).
 
-use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, IconsMode, Include, RailTab, SettingsTab, UploadTarget, GRID_PRESETS, PRESETS};
+use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, GeneratedImage, IconsMode, Include, RailTab, SettingsTab, UploadTarget, GRID_PRESETS, PRESETS};
 use crate::templates::TemplateRow;
 use crate::assets::ImgState;
 use crate::canvas::{draw_slide, tool_button, Xform};
@@ -19,7 +19,9 @@ const PANEL_MIN_W: f32 = 260.0;
 const PANEL_MAX_W: f32 = 720.0;
 const TILE: f32 = 96.0;
 
+/// The Slides panel starts narrower, and can be dragged narrower, than the others.
 const SLIDES_W: f32 = 186.0;
+const SLIDES_MIN_W: f32 = 150.0;
 
 impl BioCartoon {
     /// The rail at the right edge: one button per [`RailTab`].
@@ -95,9 +97,10 @@ impl BioCartoon {
     pub fn right_panel(&mut self, ui: &mut egui::Ui) {
         let Some(tab) = self.rail else { return };
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 0, right: 4, top: 36, bottom: 8 });
-        // Resizable by dragging its left edge; the narrow Slides panel keeps its own width.
+        // Resizable by dragging its left edge. The narrow Slides panel has its own id, so egui
+        // remembers its width separately from the other tabs'.
         let panel = if tab == RailTab::Slides {
-            egui::Panel::right("rightpanel_slides").exact_size(SLIDES_W)
+            egui::Panel::right("rightpanel_slides").resizable(true).default_size(SLIDES_W).size_range(SLIDES_MIN_W..=PANEL_MAX_W)
         } else {
             egui::Panel::right("rightpanel").resizable(true).default_size(PANEL_W + 20.0).size_range(PANEL_MIN_W..=PANEL_MAX_W)
         };
@@ -168,8 +171,9 @@ impl BioCartoon {
         match self.icons.mode {
             IconsMode::Search => {
                 let f = &self.icons.filter;
-                // Templates belong to BioCartoon: another database's filter leaves them out.
-                if !f.sources.is_empty() && !f.sources.iter().any(|s| s == theme::BIOCARTOON_SOURCE) {
+                // Templates belong to BioCartoon: another database's filter leaves them out. They
+                // are slides, not image files, so a file type leaves them out too.
+                if (!f.sources.is_empty() && !f.sources.iter().any(|s| s == theme::BIOCARTOON_SOURCE)) || !f.formats.is_empty() {
                     return Vec::new();
                 }
                 let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
@@ -201,7 +205,7 @@ impl BioCartoon {
         i.mode = IconsMode::Home;
     }
 
-    /// The filters under the search box: database, author, category, subcategory and license.
+    /// The filters under the search box: database, author, category, subcategory, license and file type.
     /// The search re-runs once one changes (see `last_sent_filter`).
     fn filters_panel(&mut self, ui: &mut egui::Ui) {
         if self.icons.facets_for.as_ref() != Some(&self.icons.filter) {
@@ -236,6 +240,10 @@ impl BioCartoon {
         licenses.dedup();
         let licenses: Vec<(String, String)> =
             licenses.into_iter().map(|l| (l.clone(), label(&l, in_facet(facets.as_ref().map_or(&[][..], |fc| &fc.licenses), &l)))).collect();
+        let formats: Vec<(String, String)> = [crate::catalog::FORMAT_SVG, crate::catalog::FORMAT_PNG]
+            .iter()
+            .map(|x| (x.to_string(), label(x, in_facet(facets.as_ref().map_or(&[][..], |fc| &fc.formats), x))))
+            .collect();
         let count = |cat: &str, sub: &str| facets.as_ref().map(|fc| fc.taxa.iter().find(|t| t.cat == cat && t.sub == sub).map_or(0, |t| t.count));
         let cats: Vec<(String, String)> = crate::taxonomy::TAXONOMY
             .iter()
@@ -310,6 +318,9 @@ impl BioCartoon {
                 ui.label("License");
                 multi_select(ui, "filter_license", w, &mut f.licenses, &licenses);
                 ui.end_row();
+                ui.label("File type").on_hover_text("SVG: the source publishes a vector version. PNG: an image only");
+                multi_select(ui, "filter_format", w, &mut f.formats, &formats);
+                ui.end_row();
             });
             if f.active() > 0 {
                 ui.add_space(2.0);
@@ -342,6 +353,9 @@ impl BioCartoon {
         if !f.licenses.is_empty() {
             parts.push(f.licenses.join(", "));
         }
+        if !f.formats.is_empty() {
+            parts.push(f.formats.join(", "));
+        }
         parts.join("  ·  ")
     }
 
@@ -353,20 +367,25 @@ impl BioCartoon {
 
     fn search_box(&mut self, ui: &mut egui::Ui) {
         let r = egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+            // As wide as the filters and results beneath it.
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).color(theme::text_dim()));
-                let r = ui.add(egui::TextEdit::singleline(&mut self.icons.query).frame(egui::Frame::NONE).desired_width(ui.available_width() - 44.0));
-                // The funnel opens the filters, and shows how many are set.
-                let n = self.icons.filter.active();
-                let (text, color) = match n {
-                    0 => (ph::FUNNEL.to_string(), if self.icons.show_filters { theme::text() } else { theme::text_dim() }),
-                    n => (format!("{} {n}", ph::FUNNEL), theme::accent()),
-                };
-                let tip = if self.icons.show_filters { "Hide the filters" } else { "Filter by database, author, category or license" };
-                if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
-                    self.icons.show_filters = !self.icons.show_filters;
-                }
-                r
+                // Right to left, so the funnel sits at the right edge and the query takes the rest.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // The funnel opens the filters, and shows how many are set.
+                    let n = self.icons.filter.active();
+                    let (text, color) = match n {
+                        0 => (ph::FUNNEL.to_string(), if self.icons.show_filters { theme::text() } else { theme::text_dim() }),
+                        n => (format!("{} {n}", ph::FUNNEL), theme::accent()),
+                    };
+                    let tip = if self.icons.show_filters { "Hide the filters" } else { "Filter by database, author, category or license" };
+                    if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
+                        self.icons.show_filters = !self.icons.show_filters;
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.icons.query).frame(egui::Frame::NONE).desired_width(ui.available_width()))
+                })
+                .inner
             })
             .inner
         });
@@ -485,7 +504,7 @@ impl BioCartoon {
             }
             IconsMode::Library => {
                 if self.icons.results.is_empty() && !self.icons.loading && self.matching_templates().is_empty() {
-                    ui.label(egui::RichText::new("Nothing here yet. Images you add to your library (with \"Add to library...\" after generating one with AI, or from Uploads) and slides you save as templates appear here.").color(theme::text_dim()));
+                    ui.label(egui::RichText::new("Nothing here yet. Images you add to your library (generated with AI, or from Uploads) and slides you save as templates appear here.").color(theme::text_dim()));
                 }
                 #[cfg(target_arch = "wasm32")]
                 ui.label(egui::RichText::new("In the browser, images added to your library are kept until the page is reloaded.").small().color(theme::text_dim()));
@@ -551,30 +570,35 @@ impl BioCartoon {
                 ui.label(egui::RichText::new(format!("{} {}", thousands(templates.len() as i64), if templates.len() == 1 { "template" } else { "templates" })).small().color(theme::text_dim()));
             }
         });
-        if !templates.is_empty() {
-            ui.label(egui::RichText::new("Templates").strong());
-            self.templates_grid(ui, &templates);
-            ui.add_space(6.0);
-            if self.icons.include.icons() {
-                ui.label(egui::RichText::new("Icons").strong());
-            }
-        }
-        if !self.icons.include.icons() {
-            if templates.is_empty() {
-                ui.label(egui::RichText::new("No templates here").color(theme::text_dim()));
-            }
+        let icons = self.icons.include.icons();
+        if !icons && templates.is_empty() {
+            ui.label(egui::RichText::new("No templates here").color(theme::text_dim()));
             return;
         }
-        let rows = self.icons.results.clone();
+        let rows = if icons { self.icons.results.clone() } else { Vec::new() };
         if rows.is_empty() && templates.is_empty() && !self.icons.loading && self.icons.mode == IconsMode::Search && !self.icons.query.trim().is_empty() {
             ui.label(egui::RichText::new("No results").color(theme::text_dim()));
         }
+        let sort = if self.icons.mode == IconsMode::Search { self.settings.search_sort } else { self.settings.icon_sort };
+        let more = icons && self.icons.more;
+        let total = self.icons.total.filter(|_| icons).map_or(rows.len(), |n| n.max(0) as usize);
+        let tiles = mix_templates(&rows, &templates, sort, more, total);
         let mut picked: Option<AssetRow> = None;
         let (per_row, size) = self.icon_grid(ui);
         // Reveal thumbnails in order: hold back each one until the visible tiles before it are in.
         let mut hold = false;
         egui::Grid::new("results").spacing([6.0, 6.0]).show(ui, |ui| {
-            for (i, row) in rows.iter().enumerate() {
+            for (i, tile) in tiles.into_iter().enumerate() {
+                let row = match tile {
+                    Tile::Template(t) => {
+                        self.template_tile(ui, size, t);
+                        if (i + 1) % per_row == 0 {
+                            ui.end_row();
+                        }
+                        continue;
+                    }
+                    Tile::Icon(row) => row,
+                };
                 let colors = self.icons.colors.get(&row.id).copied().unwrap_or(1);
                 let marks = TileMarks {
                     database: self.settings.tile_database,
@@ -675,7 +699,7 @@ impl BioCartoon {
     }
 
     fn generate_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Describe the icon or illustration you need. The result can be placed on the sheet and uploaded to your library.").color(theme::text_dim()));
+        ui.label(egui::RichText::new("Describe the icon or illustration you need. The result can be placed on the sheet, kept in your library, or contributed.").color(theme::text_dim()));
         ui.add_space(4.0);
         let r = ui.add(egui::TextEdit::multiline(&mut self.generate.prompt).hint_text("e.g. a flat-style T cell attacking a tumour cell, transparent background").desired_rows(3).desired_width(f32::INFINITY));
         let enter = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
@@ -697,55 +721,95 @@ impl BioCartoon {
             let s = (rect.width() / iw).min(rect.height() / ih) * 0.92;
             let r = Rect::from_center_size(rect.center(), Vec2::new(iw * s, ih * s));
             ui.painter().image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-            ui.horizontal(|ui| {
-                if ui.button(format!("{}  Add to sheet", ph::PLUS)).clicked() {
-                    self.actions.push(Action::AddGeneratedToCanvas);
-                }
-                if ui.button(format!("{}  Add to library...", ph::CLOUD_ARROW_UP)).clicked() {
-                    self.actions.push(Action::OpenUploadDialog(UploadTarget::Generated));
-                }
-            });
+            // Saved to the history as it arrived; without a file there is nothing to add.
+            if let Some(path) = self.generate.result_path.clone() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(format!("{}  Add to sheet", ph::PLUS)).clicked() {
+                        self.actions.push(Action::InsertFile(path.clone().into()));
+                    }
+                    if ui.button(format!("{}  Add to your library", ph::BOOKS)).on_hover_text("Keep it in Your library, on this computer").clicked() {
+                        self.actions.push(Action::GeneratedToLibrary { path: path.clone(), favorite: false });
+                    }
+                    if ui.button(format!("{}  Contribute", ph::CLOUD_ARROW_UP)).on_hover_text("Share it with everyone through Contribute artwork").clicked() {
+                        self.actions.push(Action::ContributeGenerated(path));
+                    }
+                });
+            }
         }
+        self.generated_history(ui);
     }
 
-    /// Template thumbnails; clicking one adds its slide.
-    fn templates_grid(&mut self, ui: &mut egui::Ui, list: &[TemplateRow]) {
-        let (per_row, size) = self.icon_grid(ui);
-        egui::Grid::new("saved_templates").spacing([6.0, 6.0]).show(ui, |ui| {
-            for (i, row) in list.iter().enumerate() {
-                let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
-                let (abbr, col, _) = theme::source_badge(theme::BIOCARTOON_SOURCE);
-                let r = tile(ui, size, &row.meta.title, state, self.settings.tile_database.then_some((abbr, col, "Template")));
-                let info = |ui: &mut egui::Ui| {
-                    ui.label(egui::RichText::new(&row.meta.title).strong());
-                    if !row.meta.description.is_empty() {
-                        ui.label(&row.meta.description);
-                    }
-                    if !row.meta.category.is_empty() {
-                        ui.label(format!("Category: {}", row.meta.category));
-                    }
-                    ui.label(egui::RichText::new(format!("Template  ·  {}  ·  {}", row.meta.author, row.meta.license)).small().color(theme::text_dim()));
-                };
-                // A long press opens the context menu when there is one, so the info goes there.
-                let r = if row.json_local.is_some() { r.on_hover_ui(info) } else { info_ui(r, info) };
+    /// Earlier generated images as small tiles: click to place, right-click for the library.
+    fn generated_history(&mut self, ui: &mut egui::Ui) {
+        let shown = self.generate.result.as_ref().and(self.generate.result_path.as_deref());
+        let history: Vec<GeneratedImage> = self.settings.generated.iter().filter(|g| Some(g.path.as_str()) != shown).cloned().collect();
+        if history.is_empty() {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("Generated earlier").strong());
+        ui.add_space(2.0);
+        let size = 56.0;
+        let per_row = ((ui.available_width() + 6.0) / (size + 6.0)).floor().max(1.0) as usize;
+        egui::Grid::new("generated_history").spacing([6.0, 6.0]).show(ui, |ui| {
+            for (i, g) in history.iter().enumerate() {
+                let state = self.images.file(&g.path);
+                let r = tile(ui, size, "", state, None);
                 if r.clicked() {
-                    self.actions.push(Action::UseSavedTemplate(row.clone()));
+                    self.actions.push(Action::InsertFile(g.path.clone().into()));
                 }
-                if row.json_local.is_some() {
-                    r.context_menu(|ui| {
-                        info(ui);
-                        ui.separator();
-                        if ui.button("Remove from this computer").clicked() {
-                            self.actions.push(Action::RemoveTemplate(row.meta.id.clone()));
-                            ui.close();
-                        }
-                    });
-                }
+                let r = r.on_hover_text(format!("{}\n\nClick to place; right-click for more", g.prompt));
+                r.context_menu(|ui| {
+                    if ui.button(format!("{}  Add to your library", ph::BOOKS)).clicked() {
+                        self.actions.push(Action::GeneratedToLibrary { path: g.path.clone(), favorite: false });
+                        ui.close();
+                    }
+                    if ui.button(format!("{}  Favorite", ph::STAR)).clicked() {
+                        self.actions.push(Action::GeneratedToLibrary { path: g.path.clone(), favorite: true });
+                        ui.close();
+                    }
+                    if ui.button(format!("{}  Contribute", ph::CLOUD_ARROW_UP)).clicked() {
+                        self.actions.push(Action::ContributeGenerated(g.path.clone()));
+                        ui.close();
+                    }
+                });
                 if (i + 1) % per_row == 0 {
                     ui.end_row();
                 }
             }
         });
+    }
+
+    /// One template's thumbnail in the results grid; clicking it adds its slide.
+    fn template_tile(&mut self, ui: &mut egui::Ui, size: f32, row: &TemplateRow) {
+        let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
+        let (abbr, col, _) = theme::source_badge(theme::BIOCARTOON_SOURCE);
+        let r = tile(ui, size, &row.meta.title, state, self.settings.tile_database.then_some((abbr, col, "Template")));
+        let info = |ui: &mut egui::Ui| {
+            ui.label(egui::RichText::new(&row.meta.title).strong());
+            if !row.meta.description.is_empty() {
+                ui.label(&row.meta.description);
+            }
+            if !row.meta.category.is_empty() {
+                ui.label(format!("Category: {}", row.meta.category));
+            }
+            ui.label(egui::RichText::new(format!("Template  ·  {}  ·  {}", row.meta.author, row.meta.license)).small().color(theme::text_dim()));
+        };
+        // A long press opens the context menu when there is one, so the info goes there.
+        let r = if row.json_local.is_some() { r.on_hover_ui(info) } else { info_ui(r, info) };
+        if r.clicked() {
+            self.actions.push(Action::UseSavedTemplate(row.clone()));
+        }
+        if row.json_local.is_some() {
+            r.context_menu(|ui| {
+                info(ui);
+                ui.separator();
+                if ui.button("Remove from this computer").clicked() {
+                    self.actions.push(Action::RemoveTemplate(row.meta.id.clone()));
+                    ui.close();
+                }
+            });
+        }
     }
 
     /// Thumbnail of a built-in slide format, as shown in the new-slide dropdown.
@@ -1789,6 +1853,54 @@ fn info_ui(r: egui::Response, info: impl Fn(&mut egui::Ui)) -> egui::Response {
         .width(260.0)
         .show(|ui| info(ui));
     r.on_hover_ui(info)
+}
+
+/// One tile of the Icons panel's results: icons and templates share one grid.
+enum Tile<'a> {
+    Icon(&'a AssetRow),
+    Template(&'a TemplateRow),
+}
+
+/// The loaded icons with the matching templates mixed in. A to Z and Z to A place each template
+/// by its title; the other orders have nothing to rank a template by, so they spread the
+/// templates through the icons, at most a few tiles apart. A template whose place is past the
+/// icons loaded so far waits for the page that reaches it.
+fn mix_templates<'a>(icons: &'a [AssetRow], templates: &'a [TemplateRow], sort: IconSort, more: bool, total: usize) -> Vec<Tile<'a>> {
+    let key = |t: &str| t.to_lowercase();
+    let mut temps: Vec<&TemplateRow> = templates.iter().collect();
+    let mut at: Vec<usize> = match sort {
+        IconSort::Alphabetical | IconSort::ReverseAlphabetical => {
+            let rev = sort == IconSort::ReverseAlphabetical;
+            temps.sort_by_cached_key(|t| key(&t.meta.title));
+            if rev {
+                temps.reverse();
+            }
+            temps.iter().map(|t| {
+                let k = key(&t.meta.title);
+                icons.iter().position(|a| if rev { key(&a.title) < k } else { key(&a.title) > k }).unwrap_or(usize::MAX)
+            }).collect()
+        }
+        _ => {
+            let step = (total / (temps.len() + 1)).clamp(1, 6);
+            (1..=temps.len()).map(|j| j * step).collect()
+        }
+    };
+    // Past the last loaded icon: shown at the end once there are no more pages.
+    for p in &mut at {
+        if *p >= icons.len() {
+            *p = if more { usize::MAX } else { icons.len() };
+        }
+    }
+    let mut out = Vec::with_capacity(icons.len() + temps.len());
+    let mut next = temps.iter().zip(at).peekable();
+    for (i, a) in icons.iter().enumerate() {
+        while let Some((t, _)) = next.next_if(|(_, p)| *p == i) {
+            out.push(Tile::Template(t));
+        }
+        out.push(Tile::Icon(a));
+    }
+    out.extend(next.filter(|(_, p)| *p == icons.len()).map(|(t, _)| Tile::Template(t)));
+    out
 }
 
 /// The gold of a favorite's star.

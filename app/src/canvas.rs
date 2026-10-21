@@ -460,6 +460,14 @@ pub(crate) fn shape_polygons(kind: ShapeKind, r: Rect) -> (Vec<Vec<Pos2>>, Vec<P
     (fills, outline)
 }
 
+/// Device pixels an image's longer side covers when `uv` of it fills `rs` (screen points).
+fn svg_pixels(painter: &egui::Painter, rs: Rect, uv: Rect) -> f32 {
+    let ppp = painter.ctx().pixels_per_point();
+    let w = rs.width() * ppp / uv.width().abs().max(1e-3);
+    let h = rs.height() * ppp / uv.height().abs().max(1e-3);
+    w.max(h)
+}
+
 /// Draw one item. `images` is needed for textures; `faded` dims the item (used for drag previews).
 pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut ImageCache, local_dir_hint: Option<&str>) {
     let z = xf.zoom;
@@ -472,8 +480,14 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
                 crate::doc::ImageSource::Asset { key, svg, .. } => images.asset_image(key, svg.as_deref(), local_dir_hint),
                 crate::doc::ImageSource::File { path, .. } => images.file(path),
             };
+            // Ends the borrow of `images`, which the vector re-render below needs mutably.
+            let state = match state {
+                ImgState::Ready { tex, .. } => Ok(tex.clone()),
+                ImgState::Loading => Err(None),
+                ImgState::Failed(e) => Err(Some(e.clone())),
+            };
             match state {
-                ImgState::Ready { tex, .. } => {
+                Ok(base) => {
                     let (mut u0, mut u1) = (crop[0], crop[2]);
                     let (mut v0, mut v1) = (crop[1], crop[3]);
                     if it.flip_h {
@@ -483,6 +497,14 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
                         std::mem::swap(&mut v0, &mut v1);
                     }
                     let uv = Rect::from_min_max(Pos2::new(u0, v0), Pos2::new(u1, v1));
+                    // An SVG is re-rendered for the device pixels the whole image would cover (the
+                    // crop window shows `uv` of it), so it stays sharp at any zoom. Only for what
+                    // is on screen: zooming in on one item must not re-render every other one.
+                    let tex = if painter.clip_rect().intersects(rs) {
+                        images.lod_texture(painter.ctx(), &key, svg_pixels(painter, rs, uv)).unwrap_or(base)
+                    } else {
+                        base
+                    };
                     let strength = overlay[3] as f32 / 255.0;
                     let tint = Color32::from_rgb(
                         (255.0 * (1.0 - strength) + overlay[0] as f32 * strength) as u8,
@@ -497,11 +519,11 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
                     }
                     painter.add(Shape::mesh(mesh));
                 }
-                ImgState::Loading => {
+                Err(None) => {
                     painter.rect(rs, 4.0 * z, Color32::from_rgba_unmultiplied(200, 200, 210, 60), Stroke::new(1.0, Color32::from_gray(170)), StrokeKind::Inside);
                     painter.text(rs.center(), egui::Align2::CENTER_CENTER, "Loading...", FontId::proportional((12.0 * z).clamp(8.0, 20.0)), Color32::from_gray(120));
                 }
-                ImgState::Failed(e) => {
+                Err(Some(e)) => {
                     painter.rect(rs, 4.0 * z, Color32::from_rgba_unmultiplied(230, 200, 200, 90), Stroke::new(1.0, Color32::from_rgb(200, 120, 120)), StrokeKind::Inside);
                     let msg = if rs.width() > 80.0 { format!("{}\n(not loaded)", it.name) } else { "!".into() };
                     painter.text(rs.center(), egui::Align2::CENTER_CENTER, msg, FontId::proportional((11.0 * z).clamp(8.0, 16.0)), Color32::from_rgb(150, 60, 60));
@@ -1735,9 +1757,17 @@ impl BioCartoon {
             crate::doc::ImageSource::Asset { key, svg, .. } => self.images.asset_image(key, svg.as_deref(), None),
             crate::doc::ImageSource::File { path, .. } => self.images.file(path),
         };
+        let base = match state {
+            ImgState::Ready { tex, .. } => Some(tex.clone()),
+            _ => None,
+        };
         let (f, full) = (g.frame, g.full);
         let center = xf.to_screen(g.center);
-        if let ImgState::Ready { tex, .. } = state {
+        if let Some(base) = base {
+            // The same rendering the item itself is drawn with (the whole image fills `full`).
+            let ppp = painter.ctx().pixels_per_point();
+            let need = (full.width() * xf.zoom * ppp).max(full.height() * xf.zoom * ppp);
+            let tex = self.images.lod_texture(painter.ctx(), &source.cache_key(), need).unwrap_or(base);
             let mut mesh = Mesh::with_texture(tex.id());
             let strips = [
                 Rect::from_min_max(full.min, Pos2::new(full.max.x, f.min.y)),

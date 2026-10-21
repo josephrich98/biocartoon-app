@@ -4,7 +4,13 @@
 //! Pending loads are a priority queue rather than a FIFO: each frame, images are ranked in the
 //! order the UI asked for them, so a grid fills in reading order and images that are no longer
 //! drawn (e.g. after switching tabs) are dropped instead of delaying the visible ones.
+//!
+//! SVGs stay vector: the parsed tree is kept next to the base texture, and the canvas asks for
+//! a rendering at the resolution it is about to draw ([`ImageCache::lod_texture`]). Those
+//! renderings are cached per power-of-two size and evicted by a byte budget, so an SVG asset is
+//! sharp at any zoom while a PNG-only asset is drawn as the pixels it has.
 
+use crate::export::Vector;
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use image::RgbaImage;
 use std::collections::{HashMap, VecDeque};
@@ -18,6 +24,12 @@ use std::time::Duration;
 
 /// Longest side kept in GPU memory. Larger images are downscaled on the worker thread.
 const MAX_SIDE: u32 = 768;
+/// Smallest and largest longer side of an SVG rendered for the canvas beyond the base texture.
+/// Sizes go up by powers of two in between, so a drawing is never minified more than 2x.
+const MIN_LOD_SIDE: u32 = 1024;
+const MAX_LOD_SIDE: u32 = 4096;
+/// GPU memory kept for those renderings before the least recently drawn are dropped.
+const LOD_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// File types accepted as uploads (picked or dropped on the canvas).
 pub const IMAGE_EXTS: [&str; 7] = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"];
@@ -39,8 +51,24 @@ pub enum ImgState {
     Failed(String),
 }
 
+/// What a worker does for a cache key.
+enum Work {
+    /// Fetch and decode an image file.
+    Fetch(Request),
+    /// Rasterise an SVG that is already loaded, `side` pixels on its longer side.
+    Render(Arc<Vector>, u32),
+}
+
+/// A decoded image, and its vector form when the file was an SVG.
+pub struct Loaded {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub svg: Option<Arc<Vector>>,
+}
+
 struct Job {
-    req: Request,
+    work: Work,
     /// Frame the UI last asked for it, and its position among that frame's requests.
     frame: u64,
     order: usize,
@@ -56,15 +84,15 @@ struct Queue {
 
 impl Queue {
     /// Take the job wanted most recently, earliest in that frame.
-    fn best(jobs: &mut HashMap<String, Job>) -> Option<(String, Request)> {
+    fn best(jobs: &mut HashMap<String, Job>) -> Option<(String, Work)> {
         let key = jobs.iter().max_by_key(|(_, j)| (j.frame, std::cmp::Reverse(j.order))).map(|(k, _)| k.clone())?;
         let job = jobs.remove(&key)?;
-        Some((key, job.req))
+        Some((key, job.work))
     }
 
     /// Block until there is a job.
     #[cfg(not(target_arch = "wasm32"))]
-    fn take(&self) -> (String, Request) {
+    fn take(&self) -> (String, Work) {
         let mut jobs = self.jobs.lock().unwrap();
         loop {
             if let Some(j) = Self::best(&mut jobs) {
@@ -82,12 +110,16 @@ const WEB_FETCHES: usize = 6;
 /// Queued loads not asked for in this many frames are dropped (re-queued if asked for again).
 const STALE_FRAMES: u64 = 2;
 
-type Decoded = (String, Result<(u32, u32, Vec<u8>), String>);
+type Decoded = (String, Result<Loaded, String>);
 
 pub struct ImageCache {
     map: HashMap<String, ImgState>,
     /// Decoded CPU copies, kept for the AI edit operations and export.
     cpu: HashMap<String, Arc<RgbaImage>>,
+    /// Parsed SVGs, by the cache key of their base texture, for re-rendering at any size.
+    svg: HashMap<String, Arc<Vector>>,
+    /// Bytes of GPU memory held by the `lod:` renderings in `map`.
+    lod_bytes: usize,
     lru: VecDeque<String>,
     queue: Arc<Queue>,
     /// Keys still loading that the UI asked for this frame, in request order.
@@ -161,9 +193,31 @@ pub fn fetch_web(req: Request, done: Box<dyn FnOnce(Result<Vec<u8>, String>) + S
     }
 }
 
-/// Whether `bytes` are an SVG (plain or gzipped) rather than a raster image.
+/// Web build: [`fetch_decode`] without blocking; `done` gets the decoded image.
+#[cfg(target_arch = "wasm32")]
+fn fetch_decode_web(req: Request, done: Box<dyn FnOnce(Result<Loaded, String>) + Send>) {
+    match req {
+        Request::Either(a, b) => fetch_decode_web(*a, Box::new(move |res| match res {
+            Ok(l) => done(Ok(l)),
+            Err(e) => fetch_decode_web(*b, Box::new(move |res| done(res.map_err(|e2| format!("{e}; {e2}"))))),
+        })),
+        req => fetch_web(req, Box::new(move |bytes| done(bytes.and_then(|b| decode(&b))))),
+    }
+}
+
+/// Whether `bytes` are an SVG (plain or gzipped) rather than a raster image. The root may carry
+/// a namespace prefix (`<ns0:svg`, as Python's ElementTree writes it), not only `<svg`.
 pub fn is_svg(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0x1f, 0x8b]) || bytes.windows(4).take(4096).any(|w| w == b"<svg")
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return true;
+    }
+    let head = &bytes[..bytes.len().min(4096)];
+    head.iter().enumerate().filter(|(_, b)| **b == b'<').any(|(i, _)| {
+        // The tag name, with any `prefix:` stripped.
+        let name = head[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'));
+        let name: Vec<u8> = name.copied().collect();
+        name.rsplit(|b| *b == b':').next() == Some(b"svg")
+    })
 }
 
 /// Decode an image file. SVGs are rasterised to fit `svg_side` pixels, since everything
@@ -185,18 +239,83 @@ pub fn image_size(bytes: &[u8]) -> Option<(f32, f32)> {
     Some((w as f32, h as f32))
 }
 
-pub fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
-    let img = load_image(bytes, MAX_SIDE)?;
+/// Decode an image file for the canvas: pixels at most `MAX_SIDE` on the longer side, plus the
+/// parsed file when it is an SVG (so it can be rendered larger later).
+pub fn decode(bytes: &[u8]) -> Result<Loaded, String> {
+    let (img, svg) = if is_svg(bytes) {
+        let vector = Vector::parse(bytes)?;
+        (vector.render(MAX_SIDE)?, Some(Arc::new(vector)))
+    } else {
+        (image::load_from_memory(bytes).map(|i| i.to_rgba8()).map_err(|e| e.to_string())?, None)
+    };
     let (w, h) = img.dimensions();
     let m = w.max(h);
-    if m > MAX_SIDE {
+    let img = if m > MAX_SIDE {
         let s = MAX_SIDE as f32 / m as f32;
         let nw = ((w as f32 * s) as u32).max(1);
         let nh = ((h as f32 * s) as u32).max(1);
-        Ok(image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle))
+        image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle)
     } else {
-        Ok(img)
+        img
+    };
+    Ok(loaded(img, svg))
+}
+
+fn loaded(img: RgbaImage, svg: Option<Arc<Vector>>) -> Loaded {
+    let (width, height) = img.dimensions();
+    Loaded { width, height, rgba: img.into_raw(), svg }
+}
+
+/// Do a job: fetch and decode, or render an SVG at a size. `from_url` is set when the bytes
+/// came from the network as the request's first choice (see [`fetch_first`]).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn run(work: &Work) -> Result<(Loaded, Option<Vec<u8>>), String> {
+    match work {
+        Work::Fetch(req) => fetch_decode(req),
+        Work::Render(vector, side) => Ok((loaded(vector.render(*side)?, None), None)),
     }
+}
+
+/// Fetch and decode `req`. An either-request falls back to its second choice when the first
+/// fails to decode, not only when it fails to fetch: a catalog SVG the parser rejects still
+/// shows as its PNG.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn fetch_decode(req: &Request) -> Result<(Loaded, Option<Vec<u8>>), String> {
+    match req {
+        Request::Either(a, b) => fetch_decode(a).or_else(|e| fetch_decode(b).map(|(l, _)| (l, None)).map_err(|e2| format!("{e}; {e2}"))),
+        _ => {
+            let (bytes, from_url) = fetch_first(req)?;
+            let l = decode(&bytes)?;
+            Ok((l, from_url.then_some(bytes)))
+        }
+    }
+}
+
+/// Cache key of `key`'s SVG rendered `side` pixels on the longer side.
+fn lod_key(key: &str, side: u32) -> String {
+    format!("lod:{side}:{key}")
+}
+
+fn is_lod_key(key: &str) -> bool {
+    key.starts_with("lod:")
+}
+
+/// The rendering size for drawing an SVG `need` pixels on its longer side: the next power of
+/// two from `MIN_LOD_SIDE`, capped by `MAX_LOD_SIDE` and the GPU's limit. `None` when the base
+/// texture is enough.
+fn lod_side(need: f32, max_texture_side: usize) -> Option<u32> {
+    if need.is_nan() || need <= MAX_SIDE as f32 {
+        return None;
+    }
+    let cap = MAX_LOD_SIDE.min(max_texture_side as u32);
+    if cap < MIN_LOD_SIDE {
+        return None;
+    }
+    let mut side = MIN_LOD_SIDE;
+    while (side as f32) < need && side < cap {
+        side = (side * 2).min(cap);
+    }
+    Some(side)
 }
 
 impl ImageCache {
@@ -212,20 +331,17 @@ impl ImageCache {
             thread::Builder::new()
                 .name(format!("img-loader-{i}"))
                 .spawn(move || loop {
-                    let (key, req) = queue.take();
-                    log::debug!("loading {req:?}");
-                    let res = fetch_first(&req)
-                        .and_then(|(b, from_url)| {
-                            let img = decode(&b)?;
-                            if let (true, Some(dir), Some(k)) = (from_url, cache_dir.read().unwrap().clone(), key.strip_prefix("asset:")) {
-                                crate::offline::store(&dir, k, &b);
-                            }
-                            Ok(img)
-                        })
-                        .map(|img| {
-                            let (w, h) = img.dimensions();
-                            (w, h, img.into_raw())
-                        });
+                    let (key, work) = queue.take();
+                    match &work {
+                        Work::Fetch(req) => log::debug!("loading {req:?}"),
+                        Work::Render(_, side) => log::debug!("rendering {key} at {side} px"),
+                    }
+                    let res = run(&work).map(|(l, fetched)| {
+                        if let (Some(b), Some(dir), Some(k)) = (fetched, cache_dir.read().unwrap().clone(), key.strip_prefix("asset:")) {
+                            crate::offline::store(&dir, k, &b);
+                        }
+                        l
+                    });
                     if dtx.send((key, res)).is_err() {
                         break;
                     }
@@ -235,6 +351,8 @@ impl ImageCache {
         Self {
             map: HashMap::new(),
             cpu: HashMap::new(),
+            svg: HashMap::new(),
+            lod_bytes: 0,
             lru: VecDeque::new(),
             queue,
             wanted: Vec::new(),
@@ -327,7 +445,7 @@ impl ImageCache {
         let ck = format!("asset:{}", svg.unwrap_or(key));
         if !self.map.contains_key(&ck) {
             match self.request_for_image(key, svg, local_rel) {
-                Ok(req) => self.queue(ck.clone(), req),
+                Ok(req) => self.queue(ck.clone(), Work::Fetch(req)),
                 Err(e) => {
                     self.map.insert(ck.clone(), ImgState::Failed(e));
                 }
@@ -342,7 +460,7 @@ impl ImageCache {
     pub fn file(&mut self, path: &str) -> &ImgState {
         let ck = format!("file:{path}");
         if !self.map.contains_key(&ck) {
-            self.queue(ck.clone(), Request::Path(PathBuf::from(path)));
+            self.queue(ck.clone(), Work::Fetch(Request::Path(PathBuf::from(path))));
         } else {
             self.want(&ck);
         }
@@ -359,6 +477,11 @@ impl ImageCache {
         self.cpu.get(cache_key).cloned()
     }
 
+    /// A loaded SVG's vector form (its artboard and drawing), if the key is one.
+    pub fn vector(&self, cache_key: &str) -> Option<Arc<Vector>> {
+        self.svg.get(cache_key).cloned()
+    }
+
     /// Replace the cached texture for a key with a new image (after an AI edit) and return it.
     pub fn insert_image(&mut self, ctx: &egui::Context, cache_key: &str, img: RgbaImage) {
         let (w, h) = img.dimensions();
@@ -366,18 +489,77 @@ impl ImageCache {
         let tex = ctx.load_texture(cache_key, ci, TextureOptions::LINEAR);
         self.cpu.insert(cache_key.to_string(), Arc::new(img));
         self.map.insert(cache_key.to_string(), ImgState::Ready { tex, size: [w as usize, h as usize] });
+        self.forget_svg(cache_key);
         self.touch(cache_key);
     }
 
     pub fn forget(&mut self, cache_key: &str) {
         self.map.remove(cache_key);
         self.cpu.remove(cache_key);
+        self.forget_svg(cache_key);
     }
 
-    fn queue(&mut self, key: String, req: Request) {
+    /// Drop a key's vector form and every rendering made from it.
+    fn forget_svg(&mut self, cache_key: &str) {
+        self.svg.remove(cache_key);
+        let suffix = format!(":{cache_key}");
+        let lods: Vec<String> = self.map.keys().filter(|k| is_lod_key(k) && k.ends_with(&suffix)).cloned().collect();
+        for k in lods {
+            self.remove_lod(&k);
+        }
+    }
+
+    /// Drop a rendering from the texture map (and the byte count); the LRU entry stays.
+    fn drop_lod(&mut self, lod: &str) {
+        if let Some(ImgState::Ready { size, .. }) = self.map.remove(lod) {
+            self.lod_bytes = self.lod_bytes.saturating_sub(size[0] * size[1] * 4);
+        }
+    }
+
+    fn remove_lod(&mut self, lod: &str) {
+        self.drop_lod(lod);
+        if let Some(i) = self.lru.iter().position(|k| k == lod) {
+            self.lru.remove(i);
+        }
+    }
+
+    /// The texture to draw an SVG image with when it covers `need_px` device pixels on its longer
+    /// side: a rendering at least that large, started on a worker if there is none yet. Meanwhile
+    /// (and for raster images, or when the base texture is already big enough) `None`: draw the
+    /// base texture. Call every frame the image is drawn; renderings not asked for are dropped.
+    pub fn lod_texture(&mut self, ctx: &egui::Context, cache_key: &str, need_px: f32) -> Option<TextureHandle> {
+        let vector = self.svg.get(cache_key)?.clone();
+        let want = lod_side(need_px, ctx.input(|i| i.max_texture_side))?;
+        let wk = lod_key(cache_key, want);
+        match self.map.get(&wk) {
+            Some(ImgState::Ready { tex, .. }) => {
+                let tex = tex.clone();
+                self.touch(&wk);
+                return Some(tex);
+            }
+            Some(ImgState::Loading) => self.want(&wk),
+            Some(ImgState::Failed(_)) => {}
+            None => self.queue(wk, Work::Render(vector, want)),
+        }
+        // Until it is ready, the sharpest rendering there is: a larger one first (zooming out),
+        // else the largest smaller one (zooming in).
+        let larger = std::iter::successors(Some(want * 2), |s| Some(s * 2)).take_while(|s| *s <= MAX_LOD_SIDE);
+        let smaller = std::iter::successors(Some(want / 2), |s| Some(s / 2)).take_while(|s| *s >= MIN_LOD_SIDE);
+        for side in larger.chain(smaller) {
+            let k = lod_key(cache_key, side);
+            if let Some(ImgState::Ready { tex, .. }) = self.map.get(&k) {
+                let tex = tex.clone();
+                self.touch(&k);
+                return Some(tex);
+            }
+        }
+        None
+    }
+
+    fn queue(&mut self, key: String, work: Work) {
         self.map.insert(key.clone(), ImgState::Loading);
         self.loads_in_flight += 1;
-        let job = Job { req, frame: self.frame, order: self.wanted.len() };
+        let job = Job { work, frame: self.frame, order: self.wanted.len() };
         self.wanted.push(key.clone());
         self.queue.jobs.lock().unwrap().insert(key, job);
         self.queue.ready.notify_one();
@@ -387,23 +569,33 @@ impl ImageCache {
     /// loads first and stale requests are dropped from the queue as on the desktop.
     #[cfg(target_arch = "wasm32")]
     fn start_web_loads(&mut self) {
+        // Renders run on this thread (there is no other), so at most one per frame.
+        let mut rendered = false;
         while self.fetching < WEB_FETCHES {
-            let Some((key, req)) = Queue::best(&mut self.queue.jobs.lock().unwrap()) else { break };
-            self.fetching += 1;
-            self.load_web(key, req);
+            let Some((key, work)) = Queue::best(&mut self.queue.jobs.lock().unwrap()) else { break };
+            match work {
+                Work::Fetch(req) => {
+                    self.fetching += 1;
+                    self.load_web(key, req);
+                }
+                Work::Render(vector, side) => {
+                    if rendered {
+                        let job = Job { work: Work::Render(vector, side), frame: self.frame, order: 0 };
+                        self.queue.jobs.lock().unwrap().insert(key, job);
+                        break;
+                    }
+                    rendered = true;
+                    let _ = self.dtx.send((key, vector.render(side).map(|img| loaded(img, None))));
+                }
+            }
         }
     }
 
     #[cfg(target_arch = "wasm32")]
     fn load_web(&self, key: String, req: Request) {
-        fn finish(bytes: Result<Vec<u8>, String>) -> Result<(u32, u32, Vec<u8>), String> {
-            let img = decode(&bytes?)?;
-            let (w, h) = img.dimensions();
-            Ok((w, h, img.into_raw()))
-        }
         let dtx = self.dtx.clone();
-        fetch_web(req, Box::new(move |bytes| {
-            let _ = dtx.send((key, finish(bytes)));
+        fetch_decode_web(req, Box::new(move |res| {
+            let _ = dtx.send((key, res));
         }));
     }
 
@@ -452,17 +644,31 @@ impl ImageCache {
         while let Ok((key, res)) = self.rx.try_recv() {
             #[cfg(target_arch = "wasm32")]
             {
-                self.fetching = self.fetching.saturating_sub(1);
+                if !is_lod_key(&key) {
+                    self.fetching = self.fetching.saturating_sub(1);
+                }
             }
-            log::debug!("loaded {key}: {}", res.as_ref().map(|r| format!("{}x{}", r.0, r.1)).unwrap_or_else(|e| e.clone()));
+            log::debug!("loaded {key}: {}", res.as_ref().map(|l| format!("{}x{}", l.width, l.height)).unwrap_or_else(|e| e.clone()));
             self.loads_in_flight = self.loads_in_flight.saturating_sub(1);
             any = true;
+            // Dropped as stale (or forgotten) while it was in flight: nobody wants it any more.
+            if !matches!(self.map.get(&key), Some(ImgState::Loading)) {
+                continue;
+            }
             match res {
-                Ok((w, h, raw)) => {
-                    let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &raw);
+                Ok(Loaded { width: w, height: h, rgba, svg }) => {
+                    let ci = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                     let tex = ctx.load_texture(&key, ci, TextureOptions::LINEAR);
-                    if let Some(img) = RgbaImage::from_raw(w, h, raw) {
-                        self.cpu.insert(key.clone(), Arc::new(img));
+                    if is_lod_key(&key) {
+                        self.lod_bytes += (w * h * 4) as usize;
+                    } else {
+                        if let Some(img) = RgbaImage::from_raw(w, h, rgba) {
+                            self.cpu.insert(key.clone(), Arc::new(img));
+                        }
+                        match svg {
+                            Some(vector) => self.svg.insert(key.clone(), vector),
+                            None => self.svg.remove(&key),
+                        };
                     }
                     self.map.insert(key, ImgState::Ready { tex, size: [w as usize, h as usize] });
                 }
@@ -476,11 +682,115 @@ impl ImageCache {
         while self.lru.len() > MAX_TEXTURES {
             if let Some(old) = self.lru.pop_front() {
                 if matches!(self.map.get(&old), Some(ImgState::Ready { .. })) {
-                    self.map.remove(&old);
-                    self.cpu.remove(&old);
+                    if is_lod_key(&old) {
+                        self.drop_lod(&old);
+                    } else {
+                        self.map.remove(&old);
+                        self.cpu.remove(&old);
+                        self.svg.remove(&old);
+                    }
                 }
             }
         }
+        // And the least recently drawn SVG renderings over the budget.
+        while self.lod_bytes > LOD_BUDGET_BYTES {
+            let Some(old) = self.lru.iter().find(|k| is_lod_key(k) && matches!(self.map.get(*k), Some(ImgState::Ready { .. }))).cloned() else { break };
+            self.remove_lod(&old);
+        }
         any
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="red"/></svg>"#;
+
+    /// Below the base texture's size nothing extra is rendered; above it, the next power of two
+    /// from 1024, capped by the GPU and our own limit.
+    #[test]
+    fn lod_sizes() {
+        assert_eq!(lod_side(100.0, 8192), None);
+        assert_eq!(lod_side(768.0, 8192), None);
+        assert_eq!(lod_side(769.0, 8192), Some(1024));
+        assert_eq!(lod_side(1024.0, 8192), Some(1024));
+        assert_eq!(lod_side(1025.0, 8192), Some(2048));
+        assert_eq!(lod_side(3000.0, 8192), Some(4096));
+        assert_eq!(lod_side(9000.0, 8192), Some(4096));
+        assert_eq!(lod_side(3000.0, 2048), Some(2048));
+        assert_eq!(lod_side(3000.0, 512), None);
+        assert_eq!(lod_side(f32::NAN, 8192), None);
+    }
+
+    /// An SVG decodes to the base pixels and keeps its vector form, which renders at any size
+    /// with the drawing's aspect ratio; a PNG keeps none.
+    #[test]
+    fn svg_keeps_vector_form() {
+        let l = decode(SVG).unwrap();
+        assert_eq!((l.width, l.height), (MAX_SIDE, MAX_SIDE / 2));
+        let vector = l.svg.expect("svg vector form");
+        let big = vector.render(2048).unwrap();
+        assert_eq!(big.dimensions(), (2048, 1024));
+        assert_eq!(big.get_pixel(1000, 500).0, [255, 0, 0, 255]);
+        assert!(matches!(run(&Work::Render(vector, 1024)), Ok((Loaded { width: 1024, height: 512, svg: None, .. }, None))));
+
+        let mut png = Vec::new();
+        RgbaImage::from_pixel(4, 2, image::Rgba([0, 0, 255, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let l = decode(&png).unwrap();
+        assert_eq!((l.width, l.height), (4, 2));
+        assert!(l.svg.is_none());
+    }
+
+    /// An SVG whose root carries a namespace prefix (as Python's ElementTree writes NIAID
+    /// BioArt files, e.g. Low Friction Flask) is still an SVG; text that merely mentions one
+    /// is not.
+    #[test]
+    fn prefixed_svg_root() {
+        let prefixed = br#"<?xml version='1.0' encoding='utf-8'?>
+<ns0:svg xmlns:ns0="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><metadata><title>Low Friction Flask</title></metadata><ns0:rect width="20" height="10" fill="red"/></ns0:svg>"#;
+        assert!(is_svg(prefixed));
+        assert!(is_svg(SVG));
+        assert!(is_svg(b"<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg\"/>"));
+        assert!(!is_svg(b"<svgfoo/>"));
+        assert!(!is_svg(b"<html>svg</html>"));
+        let l = decode(prefixed).unwrap();
+        assert_eq!((l.width, l.height), (MAX_SIDE, MAX_SIDE / 2));
+        assert!(l.svg.is_some());
+    }
+
+    /// A catalog image whose SVG fetches but will not decode falls back to its PNG, so the
+    /// canvas shows the picture rather than a "not loaded" box.
+    #[test]
+    fn undecodable_svg_falls_back_to_png() {
+        let dir = std::env::temp_dir().join(format!("biocartoon-fallback-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("a.svg");
+        std::fs::write(&bad, b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect").unwrap();
+        let mut png = Vec::new();
+        RgbaImage::from_pixel(4, 2, image::Rgba([0, 0, 255, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let good = dir.join("a.png");
+        std::fs::write(&good, &png).unwrap();
+
+        let req = Request::Either(Box::new(Request::Path(bad.clone())), Box::new(Request::Path(good.clone())));
+        let (l, kept) = run(&Work::Fetch(req)).unwrap();
+        assert_eq!((l.width, l.height), (4, 2));
+        assert!(l.svg.is_none());
+        assert!(kept.is_none(), "a fallback is not cached under the SVG's key");
+
+        let missing = dir.join("none.png");
+        let req = Request::Either(Box::new(Request::Path(bad)), Box::new(Request::Path(missing)));
+        let e = run(&Work::Fetch(req)).err().expect("both choices fail");
+        assert!(e.contains("none.png"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lod_keys() {
+        let k = lod_key("asset:bioart/a.svg", 2048);
+        assert_eq!(k, "lod:2048:asset:bioart/a.svg");
+        assert!(is_lod_key(&k));
+        assert!(!is_lod_key("asset:bioart/a.svg"));
+        assert!(!is_lod_key("file:/x/lod:1.png"));
     }
 }
