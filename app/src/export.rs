@@ -86,11 +86,13 @@ pub struct ExportOptions {
     pub all_slides: bool,
     /// PDF of several slides: one file with a page per slide, instead of a file per slide.
     pub pdf_pages: bool,
+    /// JPG only: 1 (smallest file) to 100 (best quality).
+    pub jpg_quality: u8,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: true }
+        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: true, jpg_quality: 90 }
     }
 }
 
@@ -193,6 +195,59 @@ pub fn start(ctx: egui::Context, job: ExportJob) -> Receiver<Result<String, Stri
 }
 
 pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
+    let out = render(ctx, &job, None, &mut |path, bytes, _| {
+        // A download in the browser.
+        crate::platform::write_output(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+    })?;
+    let mut msg = match out.files.as_slice() {
+        [] => format!("Exported {} slides to {}", out.pages, job.path.display()),
+        [one] => format!("Exported {}", one.display()),
+        many => format!("Exported {} {} to {}", many.len(), if job.opts.individual { "images" } else { "slides" }, many[0].parent().map(|p| p.display().to_string()).unwrap_or_default()),
+    };
+    if out.missing > 0 {
+        let _ = write!(msg, " ({} image(s) could not be loaded and were left out)", out.missing);
+    }
+    Ok(msg)
+}
+
+/// The size of what [`run`] would write, without writing it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SizeEstimate {
+    pub bytes: u64,
+    pub files: usize,
+    /// Some image was rendered at a lower resolution and its size scaled up.
+    pub approx: bool,
+}
+
+/// Raster images larger than this are measured at a lower resolution, and the size scaled.
+const ESTIMATE_MAX_PIXELS: u64 = 12_000_000;
+
+/// Encode everything `job` would export, in memory, and add up the sizes.
+pub fn estimate(ctx: &egui::Context, job: &ExportJob) -> Result<SizeEstimate, String> {
+    let mut est = SizeEstimate { bytes: 0, files: 0, approx: false };
+    render(ctx, job, Some(ESTIMATE_MAX_PIXELS), &mut |_, bytes, scale| {
+        est.bytes += (bytes.len() as f64 * scale).round() as u64;
+        est.files += 1;
+        est.approx |= scale != 1.0;
+        Ok(())
+    })?;
+    Ok(est)
+}
+
+/// What [`render`] produced.
+struct Rendered {
+    /// The files, unless they were combined into one PDF.
+    files: Vec<PathBuf>,
+    /// The page count of the combined PDF, or 0.
+    pages: usize,
+    /// Images that could not be loaded.
+    missing: usize,
+}
+
+/// Encode every file `job` exports and hand each to `out`, with its path and how much bigger the
+/// real file is (raster images over `max_pixels` are encoded at a lower resolution, and this is
+/// their pixel ratio; otherwise 1).
+fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &mut dyn FnMut(&Path, &[u8], f64) -> Result<(), String>) -> Result<Rendered, String> {
     let opts = &job.opts;
     let mut images: HashMap<String, Picture> = HashMap::new();
     let mut missing = 0;
@@ -236,7 +291,7 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
                 let svg = build_svg(ctx, &[it], region, bg, &images);
                 let name = crate::app::BioCartoon::slugify(&it.name);
                 let path = dir.join(format!("{stem}-{:02}-{name}.{}", i + 1, opts.format.ext()));
-                write_file(&svg, region, opts, &path, &crate::credits::for_items(&[it], false))?;
+                emit(&svg, region, opts, max_pixels, &path, &crate::credits::for_items(&[it], false), out)?;
                 written.push(path);
             }
         } else {
@@ -256,27 +311,34 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
                 continue;
             }
             let path = if multi { dir.join(format!("{stem}.{}", opts.format.ext())) } else { job.path.clone() };
-            write_file(&svg, region, opts, &path, &crate::credits::for_items(&items, false))?;
+            emit(&svg, region, opts, max_pixels, &path, &crate::credits::for_items(&items, false), out)?;
             written.push(path);
         }
     }
     if !pages.is_empty() {
         let bytes = pdf_pages(&pages).map_err(|e| format!("{}: {e}", job.path.display()))?;
-        crate::platform::write_output(&job.path, &bytes).map_err(|e| format!("{}: {e}", job.path.display()))?;
+        out(&job.path, &bytes, 1.0)?;
     }
     if written.is_empty() && pages.is_empty() {
         return Err(if multi { "There are no images on these slides" } else { "There are no images on this slide" }.into());
     }
+    Ok(Rendered { files: written, pages: pages.len(), missing })
+}
 
-    let mut msg = match written.as_slice() {
-        [] => format!("Exported {} slides to {}", pages.len(), job.path.display()),
-        [one] => format!("Exported {}", one.display()),
-        many => format!("Exported {} {} to {}", many.len(), if opts.individual { "images" } else { "slides" }, many[0].parent().map(|p| p.display().to_string()).unwrap_or_default()),
-    };
-    if missing > 0 {
-        let _ = write!(msg, " ({missing} image(s) could not be loaded and were left out)");
+/// Encode one file and hand it to `out`, at a lower resolution if it has more than `max_pixels`.
+fn emit(svg: &str, region: Rect, opts: &ExportOptions, max_pixels: Option<u64>, path: &Path, credits: &str, out: &mut dyn FnMut(&Path, &[u8], f64) -> Result<(), String>) -> Result<(), String> {
+    let mut dpi = opts.dpi.clamp(MIN_DPI, MAX_DPI);
+    let mut scale = 1.0;
+    if let (true, Some(max)) = (opts.format.is_raster(), max_pixels) {
+        let px = |dpi| pixel_size(region, dpi).iter().map(|&v| v as u64).product::<u64>();
+        let full = px(dpi);
+        if full > max {
+            dpi = ((dpi as f64 * (max as f64 / full as f64).sqrt()) as u32).max(1);
+            scale = full as f64 / px(dpi) as f64;
+        }
     }
-    Ok(msg)
+    let bytes = encode(svg, region, opts, dpi, credits).map_err(|e| format!("{}: {e}", path.display()))?;
+    out(path, &bytes, scale)
 }
 
 /// `items` cropped to their bounds on a transparent background, at twice screen resolution (the
@@ -971,11 +1033,11 @@ fn pdf_pages(svgs: &[String]) -> Result<Vec<u8>, String> {
     Ok(pdf.finish())
 }
 
-/// `credits` (one per line, possibly empty) go into SVG and PNG files as metadata.
-fn write_file(svg: &str, region: Rect, opts: &ExportOptions, path: &Path, credits: &str) -> Result<(), String> {
-    let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    let dpi = opts.dpi.clamp(MIN_DPI, MAX_DPI);
-    let bytes = match opts.format {
+/// The file's bytes. `credits` (one per line, possibly empty) go into SVG and PNG files as
+/// metadata.
+fn encode(svg: &str, region: Rect, opts: &ExportOptions, dpi: u32, credits: &str) -> Result<Vec<u8>, String> {
+    let err = |e: &dyn std::fmt::Display| e.to_string();
+    Ok(match opts.format {
         ExportFormat::Svg if !credits.is_empty() => svg_with_credits(svg, credits).into_bytes(),
         ExportFormat::Svg => svg.as_bytes().to_vec(),
         ExportFormat::Biocartoon => return Err("A .biocartoon file is a project, not a rendered slide".into()),
@@ -993,7 +1055,7 @@ fn write_file(svg: &str, region: Rect, opts: &ExportOptions, path: &Path, credit
         ExportFormat::Jpg => {
             let img = flatten(&rasterise(&parse(svg)?, region, dpi)?);
             let mut buf = Vec::new();
-            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 95);
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, opts.jpg_quality.clamp(1, 100));
             enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(dpi.min(u16::MAX as u32) as u16));
             enc.encode_image(&img).map_err(|e| err(&e))?;
             buf
@@ -1017,9 +1079,7 @@ fn write_file(svg: &str, region: Rect, opts: &ExportOptions, path: &Path, credit
             }
             buf.into_inner()
         }
-    };
-    // A download in the browser.
-    crate::platform::write_output(path, &bytes).map_err(|e| err(&e))
+    })
 }
 
 #[cfg(test)]
@@ -1155,7 +1215,7 @@ mod tests {
         requests.insert(src.cache_key(), Request::Path(icon.clone()));
         let job = |format, dpi, transparent, individual, name: &str| ExportJob {
             path: dir.join(name),
-            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false, pdf_pages: true },
+            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false, pdf_pages: true, jpg_quality: 90 },
             slides: vec![(1, slide.clone())],
             page,
             background: [250, 245, 235, 255],
@@ -1166,6 +1226,17 @@ mod tests {
         for (f, name) in [(ExportFormat::Png, "slide.png"), (ExportFormat::Jpg, "slide.jpg"), (ExportFormat::Tif, "slide.tif"), (ExportFormat::Pdf, "slide.pdf"), (ExportFormat::Svg, "slide.svg")] {
             run(&ctx, job(f, 150, false, false, name)).unwrap();
         }
+        // The estimate is the written size, until the image is too big to render whole.
+        for (f, name) in [(ExportFormat::Png, "slide.png"), (ExportFormat::Jpg, "slide.jpg"), (ExportFormat::Pdf, "slide.pdf"), (ExportFormat::Svg, "slide.svg")] {
+            let est = estimate(&ctx, &job(f, 150, false, false, name)).unwrap();
+            assert_eq!(est, SizeEstimate { bytes: std::fs::metadata(dir.join(name)).unwrap().len(), files: 1, approx: false }, "{name}");
+        }
+        let big = estimate(&ctx, &job(ExportFormat::Png, 1800, false, false, "big.png")).unwrap();
+        assert!(big.approx && big.bytes > std::fs::metadata(dir.join("slide.png")).unwrap().len());
+        // Lower JPG quality, smaller file.
+        let mut low = job(ExportFormat::Jpg, 150, false, false, "low.jpg");
+        low.opts.jpg_quality = 30;
+        assert!(estimate(&ctx, &low).unwrap().bytes < std::fs::metadata(dir.join("slide.jpg")).unwrap().len());
         run(&ctx, job(ExportFormat::Png, 300, true, false, "transparent.png")).unwrap();
         let msg = run(&ctx, job(ExportFormat::Png, 300, true, true, "each.png")).unwrap();
         assert!(msg.contains("2 images"), "{msg}");

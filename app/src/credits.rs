@@ -269,19 +269,20 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
     let has_required = !list(credits, true).is_empty();
     let has_any = !list(credits, false).is_empty();
     ui.horizontal(|ui| {
-        if ui.add_enabled(has_required, egui::Button::new(format!("{}  Copy required credits", ph::COPY))).clicked() {
-            action = Some(CreditsAction::Copy { required: true });
-        }
         if ui.add_enabled(has_any, egui::Button::new(format!("{}  Copy all credits", ph::COPY))).clicked() {
             action = Some(CreditsAction::Copy { required: false });
         }
+        if ui.add_enabled(has_required, egui::Button::new(format!("{}  Copy required credits", ph::COPY))).clicked() {
+            action = Some(CreditsAction::Copy { required: true });
+        }
     });
     ui.horizontal(|ui| {
+        let save_all = egui::RichText::new(format!("{}  Save all credits", ph::FLOPPY_DISK)).color(theme::accent());
+        if ui.add_enabled(has_any, egui::Button::new(save_all)).clicked() {
+            action = Some(CreditsAction::Save { required: false });
+        }
         if ui.add_enabled(has_required, egui::Button::new(format!("{}  Save required credits", ph::FLOPPY_DISK))).clicked() {
             action = Some(CreditsAction::Save { required: true });
-        }
-        if ui.add_enabled(has_any, egui::Button::new(format!("{}  Save all credits", ph::FLOPPY_DISK))).clicked() {
-            action = Some(CreditsAction::Save { required: false });
         }
     });
     ui.separator();

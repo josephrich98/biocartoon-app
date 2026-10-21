@@ -767,6 +767,9 @@ pub struct BioCartoon {
     pub actions: Vec<Action>,
     pub show_export: bool,
     pub export_job: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// The export dialog's last file size, with the options it was worked out for.
+    export_size: Option<(ExportOptions, Result<crate::export::SizeEstimate, String>)>,
+    export_size_rx: Option<std::sync::mpsc::Receiver<(ExportOptions, Result<crate::export::SizeEstimate, String>)>>,
     pub variants: Vec<AssetRow>,
     pub variants_for: Option<String>,
     pub variants_req: u64,
@@ -939,6 +942,8 @@ impl BioCartoon {
             actions: Vec::new(),
             show_export: false,
             export_job: None,
+            export_size: None,
+            export_size_rx: None,
             variants: Vec::new(),
             variants_for: None,
             variants_req: 0,
@@ -3073,7 +3078,7 @@ impl BioCartoon {
             return self.toast_err(format!("email: {e}"));
         }
         let png = dir.join(format!("{slug}.png"));
-        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: false };
+        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: false, jpg_quality: 90 };
         self.pending_email = Some((doc.title.clone(), vec![png.clone(), file]));
         let job = self.export_job_for(&doc, &[0], png, opts);
         self.export_job = Some(crate::export::start(ctx.clone(), job));
@@ -3259,6 +3264,25 @@ impl BioCartoon {
             (None, true) => "Export slides".into(),
             (None, false) => "Export slide".into(),
         };
+        // While the options change, the last size stays up, marked as updating.
+        let size_note = match &self.export_size {
+            Some((o, res)) => {
+                let updating = if *o == self.settings.export { "" } else { " ..." };
+                match res {
+                    Ok(est) => {
+                        let files = if est.files > 1 { format!(" in {} files", est.files) } else { String::new() };
+                        format!("{}{}{files}{updating}", if est.approx { "about " } else { "" }, Self::file_size(est.bytes))
+                    }
+                    Err(_) => format!("unknown{updating}"),
+                }
+            }
+            None => "working it out...".into(),
+        };
+        let size_row = |ui: &mut egui::Ui| {
+            ui.label("File size");
+            ui.label(egui::RichText::new(&size_note).color(theme::text_dim()));
+            ui.end_row();
+        };
         let opts = &mut self.settings.export;
         let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
             ui.set_width(440.0);
@@ -3276,8 +3300,17 @@ impl BioCartoon {
                 });
                 ui.end_row();
 
-                // The project file has no rendering options.
+                // The project file has no rendering options, just a note where the resolution note goes.
                 if project_file {
+                    size_row(ui);
+                    let slides = if multi { format!("all {n_slides} slides") } else { "the slide".into() };
+                    let note = format!(".biocartoon format allows for sharing editable slides: {slides} and their images in one file, which anyone can open with Open file.");
+                    ui.label("");
+                    // Wrap within the dialog's width instead of stretching it.
+                    ui.allocate_ui(egui::vec2(360.0, 0.0), |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(note).color(theme::text_dim())).wrap());
+                    });
+                    ui.end_row();
                     return;
                 }
 
@@ -3324,12 +3357,21 @@ impl BioCartoon {
                 };
                 ui.label(egui::RichText::new(note).color(theme::text_dim()));
                 ui.end_row();
+
+                if opts.format == ExportFormat::Jpg {
+                    ui.label("Quality");
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Smaller").color(theme::text_dim()));
+                        ui.add(egui::Slider::new(&mut opts.jpg_quality, 10..=100).suffix("%").trailing_fill(true))
+                            .on_hover_text("JPEG compression: lower quality makes a smaller file, with more visible artifacts.");
+                        ui.label(egui::RichText::new("Sharper").color(theme::text_dim()));
+                    });
+                    ui.end_row();
+                }
+
+                size_row(ui);
             });
             ui.add_space(6.0);
-            if project_file {
-                let slides = if multi { format!("all {n_slides} slides") } else { "the slide".into() };
-                ui.label(egui::RichText::new(format!("Stays editable: {slides} and their images in one file, which anyone can open with Open file.")).color(theme::text_dim()));
-            }
             if opts.format == ExportFormat::Png {
                 ui.checkbox(&mut opts.transparent, "Transparent background");
             }
@@ -3369,12 +3411,64 @@ impl BioCartoon {
             self.settings.export.crop = false;
         }
         self.show_export = open && !go && !cancel;
+        if self.show_export {
+            self.update_export_size(ctx);
+        } else {
+            self.export_size = None;
+            self.export_size_rx = None;
+        }
         if !self.show_export && !go {
             self.export_doc = None;
         }
         if go {
             self.pick_export_path();
         }
+    }
+
+    /// Keep the export dialog's file size up to date: once the last estimate is in, start another
+    /// if the options have changed since.
+    fn update_export_size(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.export_size_rx {
+            match rx.try_recv() {
+                Ok(done) => {
+                    self.export_size = Some(done);
+                    self.export_size_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.export_size_rx = None,
+            }
+        }
+        let opts = self.settings.export.clone();
+        if self.export_size.as_ref().is_some_and(|(o, _)| *o == opts) {
+            return;
+        }
+        let (doc, slide) = self.export_source();
+        let doc = doc.clone();
+        let slides: Vec<usize> = if opts.all_slides { (0..doc.slides.len()).collect() } else { vec![slide] };
+        // Never written: only its name matters.
+        let job = (opts.format != ExportFormat::Biocartoon).then(|| self.export_job_for(&doc, &slides, PathBuf::from(format!("export.{}", opts.format.ext())), opts.clone()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx2 = ctx.clone();
+        self.export_size_rx = Some(rx);
+        crate::platform::spawn("export size", move || {
+            let res = match job {
+                Some(job) => crate::export::estimate(&ctx2, &job),
+                None => crate::projects::to_file(&doc).map(|b| crate::export::SizeEstimate { bytes: b.len() as u64, files: 1, approx: false }),
+            };
+            let _ = tx.send((opts, res));
+            ctx2.request_repaint();
+        });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// `bytes` as KB / MB / GB, with a decimal below 10.
+    fn file_size(bytes: u64) -> String {
+        let (v, unit) = match bytes {
+            b if b >= 1_000_000_000 => (b as f64 / 1e9, "GB"),
+            b if b >= 1_000_000 => (b as f64 / 1e6, "MB"),
+            b => ((b as f64 / 1e3).max(1.0), "KB"),
+        };
+        if v < 10.0 { format!("{v:.1} {unit}") } else { format!("{v:.0} {unit}") }
     }
 
     // ---------- templates ----------
@@ -4695,7 +4789,7 @@ impl BioCartoon {
                         self.icons.mode = IconsMode::Generate;
                         self.actions.push(Action::Generate("a flat-style macrophage engulfing a bacterium".into()));
                     }
-                    // export=<path>: format from the extension, other options from exportdpi= /
+                    // export=<path>: format from the extension, other options from exportdpi= / exportquality= /
                     // exporttransparent / exportindividual / exportcrop steps given before it.
                     s if s.starts_with("export=") => {
                         self.show_settings = false;
@@ -4706,6 +4800,7 @@ impl BioCartoon {
                         self.actions.push(Action::Export(p));
                     }
                     s if s.starts_with("exportdpi=") => self.settings.export.dpi = s["exportdpi=".len()..].parse().unwrap_or(300),
+                    s if s.starts_with("exportquality=") => self.settings.export.jpg_quality = s["exportquality=".len()..].parse().unwrap_or(90),
                     // fav=<asset id>: mark it as a favorite.
                     s if s.starts_with("fav=") => {
                         let id = s["fav=".len()..].to_string();
