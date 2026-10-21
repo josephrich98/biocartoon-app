@@ -27,7 +27,7 @@ pub enum Req {
     MyStars,
     Categories { source: String },
     /// The search filters' choices that still find icons under `filter` (see [`Worker::facets`]).
-    Facets { filter: Filter },
+    Facets { query: String, filter: Filter },
     Sources,
     /// Style presets of the asset with this id.
     Variants { id: String },
@@ -145,7 +145,7 @@ fn handle(w: &Worker, req_id: u64, req: Req) -> Resp {
             Ok(cats) => Resp::Categories { req_id, source, cats },
             Err(e) => err(e),
         },
-        Req::Facets { filter } => match w.facets(&filter) {
+        Req::Facets { query, filter } => match w.facets(&query, &filter) {
             Ok(facets) => Resp::Facets { req_id, facets },
             Err(e) => err(e),
         },

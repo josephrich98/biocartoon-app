@@ -342,8 +342,8 @@ pub struct IconsState {
     pub total: Option<i64>,
     /// The filters' choices that find icons, for their dropdowns (kept while newer ones load).
     pub facets: Option<Facets>,
-    /// The filter `facets` are for (or are loading for); `None` loads them again.
-    pub facets_for: Option<SearchFilter>,
+    /// The query and filter `facets` are for (or are loading for); `None` loads them again.
+    pub facets_for: Option<(String, SearchFilter)>,
     pub facets_req: u64,
     pub browse_offset: usize,
     pub categories: HashMap<String, Vec<CategoryInfo>>,
@@ -2042,10 +2042,11 @@ impl BioCartoon {
         self.icons.results_req = self.catalog.send(req);
     }
 
-    /// Ask which of the filters' choices find icons under the current filter.
+    /// Ask which of the filters' choices find icons under the current query and filter.
     pub fn request_facets(&mut self) {
-        self.icons.facets_for = Some(self.icons.filter.clone());
-        self.icons.facets_req = self.catalog.send(Req::Facets { filter: self.icons.filter.catalog() });
+        let query = self.icons.query.trim().to_string();
+        self.icons.facets_req = self.catalog.send(Req::Facets { query: query.clone(), filter: self.icons.filter.catalog() });
+        self.icons.facets_for = Some((query, self.icons.filter.clone()));
     }
 
     /// The Icons panel's Contribute artwork page, with the library's icons to pick from.

@@ -208,11 +208,11 @@ impl BioCartoon {
     /// The filters under the search box: database, author, category, subcategory, license and file type.
     /// The search re-runs once one changes (see `last_sent_filter`).
     fn filters_panel(&mut self, ui: &mut egui::Ui) {
-        if self.icons.facets_for.as_ref() != Some(&self.icons.filter) {
+        if self.icons.facets_for.as_ref().is_none_or(|(q, f)| q != self.icons.query.trim() || *f != self.icons.filter) {
             self.request_facets();
         }
-        // Each dropdown lists the choices that find icons under the other filters, with how many;
-        // the picked ones stay listed so they can be taken out. Until the counts arrive, all of them.
+        // Each dropdown lists the choices that find icons under the query and the other filters, with
+        // how many; the picked ones stay listed so they can be taken out. Until the counts arrive, all of them.
         let facets = self.icons.facets.clone();
         let label = |name: &str, n: Option<i64>| match n {
             Some(n) => format!("{name} ({})", thousands(n)),
