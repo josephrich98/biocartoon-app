@@ -725,9 +725,27 @@ fn fonts() -> &'static Fonts {
         for (_, _, bytes) in TextFont::EMBEDDED {
             db.load_font_source(fontdb::Source::Binary(Arc::new(bytes.to_vec())));
         }
+        alias_core_fonts(&mut db);
         db.set_sans_serif_family(&family);
         Fonts { db: Arc::new(db), family }
     })
+}
+
+/// Register the bundled metric-compatible fonts under the core font names that SVGs commonly ask
+/// for (e.g. Reactome icons use `font-family="Arial"`), wherever the system lacks them. The web
+/// build has no system fonts, so without this such text matches no face and is dropped.
+fn alias_core_fonts(db: &mut fontdb::Database) {
+    let has = |db: &fontdb::Database, name: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
+    for (bundled, aliases) in [("Arimo", ["Arial", "Helvetica"]), ("Tinos", ["Times New Roman", "Times"]), ("Cousine", ["Courier New", "Courier"])] {
+        let Some(face) = db.faces().find(|f| f.families.iter().any(|(n, _)| n == bundled)).cloned() else { continue };
+        for alias in aliases {
+            if !has(db, alias) {
+                let mut info = face.clone();
+                info.families = vec![(alias.to_string(), fontdb::Language::English_UnitedStates)];
+                db.push_face_info(info);
+            }
+        }
+    }
 }
 
 fn svg_options() -> usvg::Options<'static> {
@@ -964,6 +982,23 @@ fn write_file(svg: &str, region: Rect, opts: &ExportOptions, path: &Path, credit
 mod tests {
     use super::*;
     use crate::doc::{ImageSource, ShapeKind};
+
+    /// With only the bundled fonts (as on the web), text naming Arial still renders, via Arimo.
+    #[test]
+    fn core_font_names_resolve_without_system_fonts() {
+        let mut db = fontdb::Database::new();
+        for (_, _, bytes) in TextFont::EMBEDDED {
+            db.load_font_source(fontdb::Source::Binary(Arc::new(bytes.to_vec())));
+        }
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><text font-family="Arial" font-size="12" font-weight="bold" x="8" y="16">THF</text></svg>"#;
+        let has_text = |db: &fontdb::Database| {
+            let tree = usvg::Tree::from_str(svg, &usvg::Options { fontdb: Arc::new(db.clone()), ..Default::default() }).unwrap();
+            tree.root().has_children()
+        };
+        assert!(!has_text(&db));
+        alias_core_fonts(&mut db);
+        assert!(has_text(&db));
+    }
 
     /// An uploaded SVG loads as pixels at the requested size, keeping its aspect ratio.
     #[test]
