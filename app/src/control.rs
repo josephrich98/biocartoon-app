@@ -243,11 +243,14 @@ pub fn item_json(it: &Item) -> Value {
     match &it.kind {
         ItemKind::Image { source, crop, overlay } => {
             match source {
-                ImageSource::Asset { id, key, title, source, credit, license } => {
+                ImageSource::Asset { id, key, svg, title, source, credit, license } => {
                     o.insert("asset_id".into(), json!(id));
                     o.insert("asset_title".into(), json!(title));
                     o.insert("asset_source".into(), json!(source));
                     o.insert("png_key".into(), json!(key));
+                    if let Some(svg) = svg {
+                        o.insert("svg_key".into(), json!(svg));
+                    }
                     o.insert("credit".into(), json!(credit));
                     o.insert("license".into(), json!(license));
                 }
@@ -515,6 +518,7 @@ impl BioCartoon {
                     png_local: s(a, "png_local").map(str::to_string),
                     png_width: u(a, "width").unwrap_or(1) as u32,
                     png_height: u(a, "height").unwrap_or(1) as u32,
+                    svg_key: s(a, "svg_key").map(str::to_string),
                     stars: 0,
                     starred: false,
                 };

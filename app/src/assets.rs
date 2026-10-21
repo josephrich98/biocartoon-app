@@ -18,6 +18,9 @@ use std::time::Duration;
 
 /// Longest side kept in GPU memory. Larger images are downscaled on the worker thread.
 const MAX_SIDE: u32 = 768;
+
+/// File types accepted as uploads (picked or dropped on the canvas).
+pub const IMAGE_EXTS: [&str; 7] = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"];
 const MAX_TEXTURES: usize = 400;
 
 #[derive(Clone, Debug)]
@@ -26,6 +29,8 @@ pub enum Request {
     Url(String),
     /// Read from disk.
     Path(PathBuf),
+    /// The first, or the second if it fails (an asset's SVG, then its PNG).
+    Either(Box<Request>, Box<Request>),
 }
 
 pub enum ImgState {
@@ -104,7 +109,22 @@ pub struct ImageCache {
 }
 
 pub fn fetch(req: &Request) -> Result<Vec<u8>, String> {
+    fetch_first(req).map(|(bytes, _)| bytes)
+}
+
+/// [`fetch`], and whether the bytes came from the network as the request's first choice (so
+/// they are the asset its cache key names, worth keeping for offline use).
+fn fetch_first(req: &Request) -> Result<(Vec<u8>, bool), String> {
     match req {
+        Request::Either(a, b) => fetch_first(a).or_else(|e| fetch(b).map(|bytes| (bytes, false)).map_err(|e2| format!("{e}; {e2}"))),
+        Request::Url(_) => fetch_one(req).map(|bytes| (bytes, true)),
+        Request::Path(_) => fetch_one(req).map(|bytes| (bytes, false)),
+    }
+}
+
+fn fetch_one(req: &Request) -> Result<Vec<u8>, String> {
+    match req {
+        Request::Either(..) => fetch(req),
         Request::Path(p) => crate::storage::read(p).map_err(|e| format!("{}: {e}", p.display())),
         #[cfg(target_arch = "wasm32")]
         Request::Url(url) => Err(format!("GET {url}: blocking fetches are not available in the web build")),
@@ -124,9 +144,49 @@ pub fn fetch(req: &Request) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Web build: [`fetch`] without blocking; `done` gets the bytes.
+#[cfg(target_arch = "wasm32")]
+pub fn fetch_web(req: Request, done: Box<dyn FnOnce(Result<Vec<u8>, String>) + Send>) {
+    match req {
+        Request::Path(_) => done(fetch(&req)),
+        Request::Url(url) => ehttp::fetch(ehttp::Request::get(&url), move |res| {
+            done(res.map_err(|e| format!("GET {url}: {e}")).and_then(|r| {
+                if r.ok { Ok(r.bytes) } else { Err(format!("GET {url}: {} {}", r.status, r.status_text)) }
+            }))
+        }),
+        Request::Either(a, b) => fetch_web(*a, Box::new(move |res| match res {
+            Ok(bytes) => done(Ok(bytes)),
+            Err(e) => fetch_web(*b, Box::new(move |res| done(res.map_err(|e2| format!("{e}; {e2}"))))),
+        })),
+    }
+}
+
+/// Whether `bytes` are an SVG (plain or gzipped) rather than a raster image.
+pub fn is_svg(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x1f, 0x8b]) || bytes.windows(4).take(4096).any(|w| w == b"<svg")
+}
+
+/// Decode an image file. SVGs are rasterised to fit `svg_side` pixels, since everything
+/// downstream (canvas textures, exports, AI edits) works on pixels.
+pub fn load_image(bytes: &[u8], svg_side: u32) -> Result<RgbaImage, String> {
+    if is_svg(bytes) {
+        crate::export::render_svg(bytes, svg_side)
+    } else {
+        image::load_from_memory(bytes).map(|i| i.to_rgba8()).map_err(|e| e.to_string())
+    }
+}
+
+/// An image file's size in pixels (an SVG's in user units), without decoding it.
+pub fn image_size(bytes: &[u8]) -> Option<(f32, f32)> {
+    if is_svg(bytes) {
+        return crate::export::svg_size(bytes);
+    }
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
+    Some((w as f32, h as f32))
+}
+
 pub fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
-    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
-    let img = img.to_rgba8();
+    let img = load_image(bytes, MAX_SIDE)?;
     let (w, h) = img.dimensions();
     let m = w.max(h);
     if m > MAX_SIDE {
@@ -154,10 +214,10 @@ impl ImageCache {
                 .spawn(move || loop {
                     let (key, req) = queue.take();
                     log::debug!("loading {req:?}");
-                    let res = fetch(&req)
-                        .and_then(|b| {
+                    let res = fetch_first(&req)
+                        .and_then(|(b, from_url)| {
                             let img = decode(&b)?;
-                            if let (Request::Url(_), Some(dir), Some(k)) = (&req, cache_dir.read().unwrap().clone(), key.strip_prefix("asset:")) {
+                            if let (true, Some(dir), Some(k)) = (from_url, cache_dir.read().unwrap().clone(), key.strip_prefix("asset:")) {
                                 crate::offline::store(&dir, k, &b);
                             }
                             Ok(img)
@@ -235,20 +295,38 @@ impl ImageCache {
         Err("No asset URL configured.".into())
     }
 
+    /// Where to load a catalog image from: its SVG when it has one, else (or if that fails, as
+    /// when offline with only the PNGs downloaded) its PNG.
+    fn request_for_image(&self, key: &str, svg: Option<&str>, local_rel: Option<&str>) -> Result<Request, String> {
+        let png = self.request_for_asset(key, local_rel);
+        match (svg.map(|k| self.request_for_asset(k, None)), png) {
+            (Some(Ok(svg)), Ok(png)) => Ok(Request::Either(Box::new(svg), Box::new(png))),
+            (Some(Ok(svg)), Err(_)) => Ok(svg),
+            (_, png) => png,
+        }
+    }
+
     /// Where to load the full-resolution original of a source (used by export): the offline
     /// copy when there is one, else the asset URL.
     pub fn request_for(&self, src: &crate::doc::ImageSource) -> Result<Request, String> {
         match src {
-            crate::doc::ImageSource::Asset { key, .. } => self.request_for_asset(key, None),
+            crate::doc::ImageSource::Asset { key, svg, .. } => self.request_for_image(key, svg.as_deref(), None),
             crate::doc::ImageSource::File { path, .. } => Ok(Request::Path(PathBuf::from(path))),
         }
     }
 
     /// Ask for an asset PNG by R2 key. Returns the current state.
     pub fn asset(&mut self, key: &str, local_rel: Option<&str>) -> &ImgState {
-        let ck = format!("asset:{key}");
+        self.asset_image(key, None, local_rel)
+    }
+
+    /// Ask for a catalog image placed on the canvas: its SVG (`svg`, an R2 key) when it has one,
+    /// with the PNG (`key`) as the fallback. Cached under the key of the one it prefers, as
+    /// [`crate::doc::ImageSource::cache_key`] names it.
+    pub fn asset_image(&mut self, key: &str, svg: Option<&str>, local_rel: Option<&str>) -> &ImgState {
+        let ck = format!("asset:{}", svg.unwrap_or(key));
         if !self.map.contains_key(&ck) {
-            match self.request_for_asset(key, local_rel) {
+            match self.request_for_image(key, svg, local_rel) {
                 Ok(req) => self.queue(ck.clone(), req),
                 Err(e) => {
                     self.map.insert(ck.clone(), ImgState::Failed(e));
@@ -324,17 +402,9 @@ impl ImageCache {
             Ok((w, h, img.into_raw()))
         }
         let dtx = self.dtx.clone();
-        match req {
-            Request::Path(_) => {
-                let _ = dtx.send((key, finish(fetch(&req))));
-            }
-            Request::Url(url) => ehttp::fetch(ehttp::Request::get(&url), move |res| {
-                let bytes = res.map_err(|e| format!("GET {url}: {e}")).and_then(|r| {
-                    if r.ok { Ok(r.bytes) } else { Err(format!("GET {url}: {} {}", r.status, r.status_text)) }
-                });
-                let _ = dtx.send((key, finish(bytes)));
-            }),
-        }
+        fetch_web(req, Box::new(move |bytes| {
+            let _ = dtx.send((key, finish(bytes)));
+        }));
     }
 
     /// Note that a still-loading image was asked for again this frame.

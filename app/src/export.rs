@@ -75,6 +75,8 @@ pub struct ExportOptions {
     pub crop: bool,
     /// Also write the library artwork's credits to `<name>-credits.txt` beside the export.
     pub save_credits: bool,
+    /// As `save_credits`, but only the credits the licenses require (`save_credits` wins).
+    pub save_required_credits: bool,
     /// Every slide of the document, one file (or set of image files) each, instead of just one.
     /// Starts off each session.
     #[serde(skip)]
@@ -83,7 +85,7 @@ pub struct ExportOptions {
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, save_credits: false, all_slides: false }
+        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, save_credits: false, save_required_credits: false, all_slides: false }
     }
 }
 
@@ -128,6 +130,8 @@ pub struct ExportJob {
     pub requests: HashMap<String, Request>,
     /// Cache key -> the decoded (possibly downscaled) copy, used if the original can't be loaded.
     pub fallbacks: HashMap<String, Arc<RgbaImage>>,
+    /// Web build: cache key -> the original's bytes, which `start` downloads first.
+    pub downloads: HashMap<String, Vec<u8>>,
 }
 
 /// Run an export on a worker thread. The receiver yields a status message when it is done.
@@ -148,29 +152,26 @@ pub fn start(ctx: egui::Context, job: ExportJob) -> Receiver<Result<String, Stri
 pub fn start(ctx: egui::Context, job: ExportJob) -> Receiver<Result<String, String>> {
     use std::sync::Mutex;
     let (tx, rx) = channel();
-    let urls: Vec<(String, String)> = job
+    let fetches: Vec<(String, Request)> = job
         .requests
         .iter()
-        .filter_map(|(k, r)| match r {
-            Request::Url(u) => Some((k.clone(), u.clone())),
-            Request::Path(_) => None,
-        })
+        .filter(|(_, r)| !matches!(r, Request::Path(_)))
+        .map(|(k, r)| (k.clone(), r.clone()))
         .collect();
-    if urls.is_empty() {
+    if fetches.is_empty() {
         let _ = tx.send(run(&ctx, job));
         return rx;
     }
-    let pending = Arc::new(Mutex::new((Some((ctx, job, tx)), urls.len())));
-    for (key, url) in urls {
+    let pending = Arc::new(Mutex::new((Some((ctx, job, tx)), fetches.len())));
+    for (key, req) in fetches {
         let pending = pending.clone();
-        ehttp::fetch(ehttp::Request::get(&url), move |res| {
-            let full = res.and_then(|r| if r.ok { Ok(r.bytes) } else { Err(format!("{} {}", r.status, r.status_text)) }).and_then(|b| image::load_from_memory(&b).map_err(|e| e.to_string()));
+        crate::assets::fetch_web(req, Box::new(move |res| {
             let mut g = pending.lock().unwrap();
-            match (full, g.0.as_mut()) {
-                (Ok(img), Some((_, job, _))) => {
-                    job.fallbacks.insert(key, Arc::new(img.to_rgba8()));
+            match (res, g.0.as_mut()) {
+                (Ok(bytes), Some((_, job, _))) => {
+                    job.downloads.insert(key, bytes);
                 }
-                (Err(e), _) => log::warn!("export: {url}: {e}; using the cached copy"),
+                (Err(e), _) => log::warn!("export: {e}; using the cached copy"),
                 _ => {}
             }
             g.1 -= 1;
@@ -181,21 +182,20 @@ pub fn start(ctx: egui::Context, job: ExportJob) -> Receiver<Result<String, Stri
                     ctx.request_repaint();
                 }
             }
-        });
+        }));
     }
     rx
 }
 
 pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
     let opts = &job.opts;
-    let mut images: HashMap<String, RgbaImage> = HashMap::new();
+    let mut images: HashMap<String, Picture> = HashMap::new();
     let mut missing = 0;
     for (key, req) in &job.requests {
-        let full = match req {
-            // Web build: `start` already downloaded the original into `fallbacks`.
-            #[cfg(target_arch = "wasm32")]
-            Request::Url(_) if job.fallbacks.contains_key(key) => Ok((*job.fallbacks[key]).clone()),
-            _ => fetch(req).and_then(|b| image::load_from_memory(&b).map_err(|e| e.to_string())).map(|i| i.to_rgba8()),
+        let full = match job.downloads.get(key) {
+            // Web build: `start` already downloaded the original.
+            Some(b) => Picture::from_bytes(b),
+            None => fetch(req).and_then(|b| Picture::from_bytes(&b)),
         };
         match full {
             Ok(img) => {
@@ -204,7 +204,7 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
             Err(e) => match job.fallbacks.get(key) {
                 Some(img) => {
                     log::warn!("export: using cached copy of {key}: {e}");
-                    images.insert(key.clone(), (**img).clone());
+                    images.insert(key.clone(), Picture::Pixels((**img).clone()));
                 }
                 None => {
                     log::warn!("export: {key}: {e}");
@@ -228,7 +228,7 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
                 let svg = build_svg(ctx, &[it], region, bg, &images);
                 let name = crate::app::BioCartoon::slugify(&it.name);
                 let path = dir.join(format!("{stem}-{:02}-{name}.{}", i + 1, opts.format.ext()));
-                write_file(&svg, region, opts, &path, &crate::credits::for_items(&[it]))?;
+                write_file(&svg, region, opts, &path, &crate::credits::for_items(&[it], false))?;
                 written.push(path);
             }
         } else {
@@ -244,7 +244,7 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
             let items: Vec<&Item> = slide.items.iter().collect();
             let svg = build_svg(ctx, &items, region, bg, &images);
             let path = if multi { dir.join(format!("{stem}.{}", opts.format.ext())) } else { job.path.clone() };
-            write_file(&svg, region, opts, &path, &crate::credits::for_items(&items))?;
+            write_file(&svg, region, opts, &path, &crate::credits::for_items(&items, false))?;
             written.push(path);
         }
     }
@@ -252,9 +252,9 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
         return Err(if multi { "There are no images on these slides" } else { "There are no images on this slide" }.into());
     }
 
-    if opts.save_credits {
+    if opts.save_credits || opts.save_required_credits {
         let items: Vec<&Item> = job.slides.iter().flat_map(|(_, s)| &s.items).collect();
-        let credits = crate::credits::for_items(&items);
+        let credits = crate::credits::for_items(&items, !opts.save_credits);
         if !credits.is_empty() {
             let path = job.path.with_file_name(format!("{stem}-credits.txt"));
             crate::platform::write_output(&path, format!("{credits}\n").as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -271,6 +271,17 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
     Ok(msg)
 }
 
+/// `items` cropped to their bounds on a transparent background, at twice screen resolution (the
+/// longest side capped at `max_side` px), for copying to the clipboard. Images come from `cached`;
+/// ones not loaded yet are left out.
+pub fn snapshot(ctx: &egui::Context, items: &[&Item], cached: &HashMap<String, Arc<RgbaImage>>, max_side: u32) -> Result<RgbaImage, String> {
+    let region = items.iter().map(|it| item_bounds(it)).reduce(|a, b| a.union(b)).ok_or("Nothing to copy")?;
+    let images: HashMap<String, Picture> = cached.iter().map(|(k, img)| (k.clone(), Picture::Pixels((**img).clone()))).collect();
+    let svg = build_svg(ctx, items, region, None, &images);
+    let dpi = (DPI * 2.0).min(max_side as f32 * DPI / region.width().max(region.height()).max(1.0)).round().max(1.0) as u32;
+    rasterise(&parse(&svg)?, region, dpi)
+}
+
 /// A small preview of a slide (longest side `max_side` px) for project tiles and version history.
 /// Images come from `cached` when present, otherwise from `requests`; missing ones are left out.
 pub fn thumbnail(
@@ -282,11 +293,11 @@ pub fn thumbnail(
     cached: &HashMap<String, Arc<RgbaImage>>,
     max_side: u32,
 ) -> Result<RgbaImage, String> {
-    let mut images: HashMap<String, RgbaImage> = HashMap::new();
+    let mut images: HashMap<String, Picture> = HashMap::new();
     for (key, req) in requests {
         let img = match cached.get(key) {
-            Some(img) => Ok((**img).clone()),
-            None => fetch(req).and_then(|b| image::load_from_memory(&b).map_err(|e| e.to_string())).map(|i| i.to_rgba8()),
+            Some(img) => Ok(Picture::Pixels((**img).clone())),
+            None => fetch(req).and_then(|b| Picture::from_bytes(&b)),
         };
         match img {
             Ok(img) => {
@@ -424,7 +435,73 @@ fn prepared_png(img: &RgbaImage, crop: [f32; 4], overlay: [u8; 4], flip_h: bool,
     Some(buf)
 }
 
-pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[u8; 4]>, images: &HashMap<String, RgbaImage>) -> String {
+/// An image item's picture as export draws it: decoded pixels, or an uploaded SVG kept as
+/// vector shapes.
+pub enum Picture {
+    Pixels(RgbaImage),
+    Vector(Box<usvg::Tree>),
+}
+
+impl Picture {
+    /// Decode an image file; SVGs are parsed, not rasterised.
+    fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if crate::assets::is_svg(bytes) {
+            usvg::Tree::from_data(bytes, &svg_options()).map(|t| Picture::Vector(Box::new(t))).map_err(|e| format!("svg: {e}"))
+        } else {
+            image::load_from_memory(bytes).map(|i| Picture::Pixels(i.to_rgba8())).map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// An SVG image item drawn as vector shapes: the file's contents (IDs prefixed with `id`) in a
+/// nested `<svg>` placed so the crop window lands on the item's rect, clipped to it, mirrored
+/// for flips and tinted with a colour matrix (the same multiply as [`prepared_png`]).
+fn vector_image(s: &mut String, tree: &usvg::Tree, it: &Item, crop: [f32; 4], overlay: [u8; 4], id: &str) {
+    let r = it.rect();
+    let c = r.center();
+    let size = tree.size();
+    let (cw, ch) = ((crop[2] - crop[0]).max(1e-3), (crop[3] - crop[1]).max(1e-3));
+    let full = Rect::from_min_size(Pos2::new(r.min.x - crop[0] / cw * r.width(), r.min.y - crop[1] / ch * r.height()), Vec2::new(r.width() / cw, r.height() / ch));
+    let xml = tree.to_string(&usvg::WriteOptions { id_prefix: Some(format!("{id}-")), indent: usvg::Indent::None, ..Default::default() });
+    // Keep what is inside the file's root <svg> element; it gets our own below.
+    let body = xml.find("<svg").and_then(|i| xml[i..].find('>').map(|j| i + j + 1)).zip(xml.rfind("</svg>")).map_or("", |(a, b)| &xml[a..b]);
+
+    let op = it.opacity.clamp(0.0, 1.0);
+    let op_attr = if op < 1.0 { format!(r#" opacity="{}""#, n(op)) } else { String::new() };
+    let _ = writeln!(s, r#"<g{op_attr}{}>"#, rotate_attr(it, c));
+    let _ = writeln!(s, r#"<clipPath id="{id}"><rect x="{}" y="{}" width="{}" height="{}"/></clipPath>"#, n(r.min.x), n(r.min.y), n(r.width()), n(r.height()));
+    let mut filter = String::new();
+    if overlay[3] > 0 {
+        let a = overlay[3] as f32 / 255.0;
+        let [tr, tg, tb] = [0, 1, 2].map(|i| n((1.0 - a) + overlay[i] as f32 / 255.0 * a));
+        let _ = writeln!(
+            s,
+            r#"<filter id="{id}-tint" x="0" y="0" width="1" height="1" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="{tr} 0 0 0 0 0 {tg} 0 0 0 0 0 {tb} 0 0 0 0 0 1 0"/></filter>"#
+        );
+        filter = format!(r#" filter="url(#{id}-tint)""#);
+    }
+    let _ = writeln!(s, r#"<g clip-path="url(#{id})"{filter}>"#);
+    let (sx, sy) = (if it.flip_h { -1.0 } else { 1.0 }, if it.flip_v { -1.0 } else { 1.0 });
+    if it.flip_h || it.flip_v {
+        let _ = writeln!(s, r#"<g transform="translate({} {}) scale({sx} {sy}) translate({} {})">"#, n(c.x), n(c.y), n(-c.x), n(-c.y));
+    }
+    let _ = writeln!(
+        s,
+        r#"<svg x="{}" y="{}" width="{}" height="{}" viewBox="0 0 {} {}" preserveAspectRatio="none" overflow="visible">{body}</svg>"#,
+        n(full.min.x),
+        n(full.min.y),
+        n(full.width()),
+        n(full.height()),
+        n(size.width()),
+        n(size.height())
+    );
+    if it.flip_h || it.flip_v {
+        s.push_str("</g>\n");
+    }
+    s.push_str("</g>\n</g>\n");
+}
+
+pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[u8; 4]>, images: &HashMap<String, Picture>) -> String {
     let mut s = String::new();
     let (w, h) = (region.width(), region.height());
     let _ = writeln!(
@@ -451,7 +528,16 @@ pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<
         let c = r.center();
         match &it.kind {
             ItemKind::Image { source, crop, overlay } => {
-                let Some(png) = images.get(&source.cache_key()).and_then(|img| prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v)) else { continue };
+                let png = match images.get(&source.cache_key()) {
+                    Some(Picture::Vector(tree)) => {
+                        clip_id += 1;
+                        vector_image(&mut s, tree, it, *crop, *overlay, &format!("svg{clip_id}"));
+                        continue;
+                    }
+                    Some(Picture::Pixels(img)) => prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v),
+                    None => None,
+                };
+                let Some(png) = png else { continue };
                 let op_attr = if op < 1.0 { format!(r#" opacity="{}""#, n(op)) } else { String::new() };
                 let _ = writeln!(
                     s,
@@ -640,10 +726,39 @@ fn fonts() -> &'static Fonts {
     })
 }
 
-fn parse(svg: &str) -> Result<usvg::Tree, String> {
+fn svg_options() -> usvg::Options<'static> {
     let f = fonts();
-    let opts = usvg::Options { fontdb: f.db.clone(), font_family: f.family.clone(), ..Default::default() };
-    usvg::Tree::from_str(svg, &opts).map_err(|e| format!("svg: {e}"))
+    usvg::Options { fontdb: f.db.clone(), font_family: f.family.clone(), ..Default::default() }
+}
+
+fn parse(svg: &str) -> Result<usvg::Tree, String> {
+    usvg::Tree::from_str(svg, &svg_options()).map_err(|e| format!("svg: {e}"))
+}
+
+/// An SVG file's size in user units.
+pub fn svg_size(bytes: &[u8]) -> Option<(f32, f32)> {
+    let size = usvg::Tree::from_data(bytes, &svg_options()).ok()?.size();
+    Some((size.width(), size.height()))
+}
+
+/// Rasterise an SVG file (an upload) so its longer side is `max_side` pixels.
+pub fn render_svg(bytes: &[u8], max_side: u32) -> Result<RgbaImage, String> {
+    let tree = usvg::Tree::from_data(bytes, &svg_options()).map_err(|e| format!("svg: {e}"))?;
+    let size = tree.size();
+    let s = max_side as f32 / size.width().max(size.height());
+    let (w, h) = (((size.width() * s).round() as u32).max(1), ((size.height() * s).round() as u32).max(1));
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h).ok_or_else(|| format!("{w} x {h} px is too large to render"))?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(s, s), &mut pixmap.as_mut());
+    pixmap_rgba(&pixmap)
+}
+
+fn pixmap_rgba(pixmap: &resvg::tiny_skia::Pixmap) -> Result<RgbaImage, String> {
+    let mut raw = Vec::with_capacity((pixmap.width() * pixmap.height() * 4) as usize);
+    for p in pixmap.pixels() {
+        let c = p.demultiply();
+        raw.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    RgbaImage::from_raw(pixmap.width(), pixmap.height(), raw).ok_or_else(|| "render failed".to_string())
 }
 
 fn rasterise(tree: &usvg::Tree, region: Rect, dpi: u32) -> Result<RgbaImage, String> {
@@ -652,12 +767,7 @@ fn rasterise(tree: &usvg::Tree, region: Rect, dpi: u32) -> Result<RgbaImage, Str
     let size = tree.size();
     let t = resvg::tiny_skia::Transform::from_scale(pw as f32 / size.width(), ph as f32 / size.height());
     resvg::render(tree, t, &mut pixmap.as_mut());
-    let mut raw = Vec::with_capacity((pw * ph * 4) as usize);
-    for p in pixmap.pixels() {
-        let c = p.demultiply();
-        raw.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
-    }
-    RgbaImage::from_raw(pw, ph, raw).ok_or_else(|| "render failed".to_string())
+    pixmap_rgba(&pixmap)
 }
 
 /// Insert a pHYs chunk (pixels per metre) right after IHDR so viewers and journals see the DPI.
@@ -774,6 +884,52 @@ mod tests {
     use super::*;
     use crate::doc::{ImageSource, ShapeKind};
 
+    /// An uploaded SVG loads as pixels at the requested size, keeping its aspect ratio.
+    #[test]
+    fn svg_uploads() {
+        let svg = br##"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#f00"/></svg>"##;
+        assert!(crate::assets::is_svg(svg));
+        assert_eq!(crate::assets::image_size(svg), Some((200.0, 100.0)));
+        let img = crate::assets::load_image(svg, 400).unwrap();
+        assert_eq!(img.dimensions(), (400, 200));
+        assert_eq!(img.get_pixel(10, 10).0, [255, 0, 0, 255]);
+        assert!(!crate::assets::is_svg(crate::ICON_PNG));
+    }
+
+    /// Uploaded SVGs export as vector shapes, with crop, flip and tint applied as on the canvas.
+    #[test]
+    fn svg_stays_vector() {
+        // Left half white, right half blue.
+        let file = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><defs><linearGradient id="g"><stop stop-color="#00f"/><stop offset="1" stop-color="#00f" stop-opacity="0.999"/></linearGradient></defs><rect width="100" height="100" fill="#fff"/><rect x="100" width="100" height="100" fill="url(#g)"/></svg>"##;
+        let source = ImageSource::file("upload.svg".into());
+        let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
+        let image = |id, crop, overlay, pos: Pos2, size: Vec2| Item::new(id, "Upload", ItemKind::Image { source: source.clone(), crop, overlay }, pos, size);
+        let cropped = image(1, [0.5, 0.0, 1.0, 1.0], [0; 4], Pos2::new(0.0, 0.0), Vec2::splat(100.0));
+        let mut flipped = image(2, [0.0, 0.0, 1.0, 1.0], [0; 4], Pos2::new(200.0, 0.0), Vec2::new(200.0, 100.0));
+        flipped.flip_h = true;
+        let tinted = image(3, [0.0, 0.0, 0.5, 1.0], [0, 255, 0, 255], Pos2::new(0.0, 200.0), Vec2::splat(100.0));
+        let region = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0));
+        let ctx = egui::Context::default();
+
+        let svg = build_svg(&ctx, &[&cropped, &flipped, &tinted], region, Some([0, 0, 0, 255]), &pics);
+        assert!(!svg.contains("data:image/png"), "SVG uploads must not be rasterised");
+        // Each copy's IDs are prefixed, so the gradient isn't defined twice.
+        assert_eq!(svg.matches(r#"id="svg1-g""#).count(), 1);
+
+        let img = rasterise(&parse(&svg).unwrap(), region, DPI as u32).unwrap();
+        let px = |x: f32, y: f32| img.get_pixel((x * img.width() as f32 / 400.0) as u32, (y * img.height() as f32 / 300.0) as u32).0;
+        assert_eq!(px(50.0, 50.0), [0, 0, 255, 255], "crop shows the right half");
+        assert_eq!(px(250.0, 50.0), [0, 0, 255, 255], "flip puts the right half on the left");
+        assert_eq!(px(350.0, 50.0), [255, 255, 255, 255]);
+        assert_eq!(px(50.0, 250.0), [0, 255, 0, 255], "tint multiplies white to green");
+        assert_eq!(px(150.0, 50.0), [0, 0, 0, 255], "crop clips the rest");
+
+        // Untinted, the PDF has no raster images at all.
+        let svg = build_svg(&ctx, &[&cropped, &flipped], region, None, &pics);
+        let pdf = svg2pdf::to_pdf(&parse(&svg).unwrap(), svg2pdf::ConversionOptions::default(), svg2pdf::PageOptions { dpi: DPI }).unwrap();
+        assert!(!pdf.windows(13).any(|w| w == b"/Subtype /Ima" || w == b"/Subtype/Imag"), "PDF should be vector only");
+    }
+
     /// Exports a slide with every item kind in every format. Set BIOCARTOON_EXPORT_TEST_DIR to
     /// keep the files for inspection.
     #[test]
@@ -791,7 +947,7 @@ mod tests {
         let mut slide = Slide::default();
         let src = ImageSource::file(icon.display().to_string());
         // An AI edit of a catalog asset: exports still credit the original.
-        let catalog = ImageSource::Asset { id: "servier/cell".into(), key: "x".into(), title: "Cell".into(), source: "servier".into(), credit: "\"Cell\", Servier Medical Art, CC-BY-4.0 & co".into(), license: "CC-BY-4.0".into() };
+        let catalog = ImageSource::Asset { id: "servier/cell".into(), key: "x".into(), svg: None, title: "Cell".into(), source: "servier".into(), credit: "\"Cell\", Servier Medical Art, CC-BY-4.0 & co".into(), license: "CC-BY-4.0".into() };
         let edited = catalog.derived(icon.display().to_string());
         let mut img = Item::new(1, "Cell icon", ItemKind::Image { source: edited, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4] }, Pos2::new(40.0, 40.0), Vec2::splat(200.0));
         img.rotation = 0.3;
@@ -809,12 +965,13 @@ mod tests {
         requests.insert(src.cache_key(), Request::Path(icon.clone()));
         let job = |format, dpi, transparent, individual, name: &str| ExportJob {
             path: dir.join(name),
-            opts: ExportOptions { format, dpi, transparent, individual, crop: false, save_credits: false, all_slides: false },
+            opts: ExportOptions { format, dpi, transparent, individual, crop: false, save_credits: false, save_required_credits: false, all_slides: false },
             slides: vec![(1, slide.clone())],
             page,
             background: [250, 245, 235, 255],
             requests: requests.clone(),
             fallbacks: HashMap::new(),
+            downloads: HashMap::new(),
         };
         for (f, name) in [(ExportFormat::Png, "slide.png"), (ExportFormat::Jpg, "slide.jpg"), (ExportFormat::Tif, "slide.tif"), (ExportFormat::Pdf, "slide.pdf"), (ExportFormat::Svg, "slide.svg")] {
             run(&ctx, job(f, 150, false, false, name)).unwrap();

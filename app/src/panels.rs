@@ -2,7 +2,7 @@
 //! BioCartoon's own templates, user-generated assets, uploads), and the rail on the right with
 //! its panel (Text / Lines / Shapes / Table / Edit / Slides / Page).
 
-use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, IconsMode, Include, Pick, RailTab, SettingsTab, UploadTarget, GRID_PRESETS, PRESETS};
+use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, IconsMode, Include, RailTab, SettingsTab, UploadTarget, GRID_PRESETS, PRESETS};
 use crate::templates::TemplateRow;
 use crate::assets::ImgState;
 use crate::canvas::{draw_slide, tool_button, Xform};
@@ -14,6 +14,9 @@ use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use egui_phosphor::regular as ph;
 
 const PANEL_W: f32 = 340.0;
+/// How narrow and wide the side panels can be dragged.
+const PANEL_MIN_W: f32 = 260.0;
+const PANEL_MAX_W: f32 = 720.0;
 const TILE: f32 = 96.0;
 
 const SLIDES_W: f32 = 186.0;
@@ -46,34 +49,20 @@ impl BioCartoon {
     /// The Icons panel, on the left.
     pub fn left_panel(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 8, right: 0, top: 36, bottom: 8 });
-        egui::Panel::left("leftpanel").exact_size(PANEL_W + 8.0).frame(frame).show_separator_line(false).show(ui, |ui| {
+        // Resizable by dragging its right edge; egui remembers the width.
+        egui::Panel::left("leftpanel").resizable(true).default_size(PANEL_W + 8.0).size_range(PANEL_MIN_W..=PANEL_MAX_W).frame(frame).show_separator_line(false).show(ui, |ui| {
             egui::Frame::new().fill(theme::panel()).corner_radius(10).inner_margin(egui::Margin::same(12)).stroke(Stroke::new(1.0, theme::border())).show(ui, |ui| {
                 ui.set_min_height(ui.available_height());
-                ui.set_width(PANEL_W - 24.0);
+                ui.set_width(ui.available_width());
                 let (title, back) = match self.icons.mode {
                     IconsMode::Home => ("Icons".to_string(), false),
                     IconsMode::Search => ("Search".into(), true),
                     IconsMode::Generate => ("Generate with AI".into(), true),
                     IconsMode::Uploads => ("Uploads".into(), true),
                     IconsMode::Contribute => ("Contribute artwork".into(), true),
-                    IconsMode::Categories => (
-                        match (&self.icons.taxon_cat, &self.icons.taxon_sub) {
-                            (None, _) => "Browse categories".into(),
-                            (Some(Pick::All), _) => "All categories".into(),
-                            (Some(_), Some(Pick::One(s))) => s.clone(),
-                            (Some(Pick::One(c)), _) => c.clone(),
-                        },
-                        true,
-                    ),
-                    IconsMode::Databases => (
-                        match (&self.icons.db, &self.icons.db_cat) {
-                            (None, _) => "Browse databases".into(),
-                            (Some(_), Some(Pick::One(c))) => if c.is_empty() { "(uncategorized)".into() } else { c.clone() },
-                            (Some(db), _) => self.source_name(db),
-                        },
-                        true,
-                    ),
-                    IconsMode::UserGenerated => ("User-generated".into(), true),
+                    IconsMode::Suggest => ("Submit a suggestion".into(), true),
+                    IconsMode::Favorites => ("Favorites".into(), true),
+                    IconsMode::Library => ("Your library".into(), true),
                 };
                 ui.horizontal(|ui| {
                     if back && ui.add(egui::Button::new(ph::ARROW_LEFT).frame(false)).clicked() {
@@ -97,7 +86,7 @@ impl BioCartoon {
                         });
                     });
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.icons_panel(ui));
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(ui.available_width()).show(ui, |ui| self.icons_panel(ui));
             });
         });
     }
@@ -105,15 +94,20 @@ impl BioCartoon {
     /// The panel next to the rail, showing the open [`RailTab`].
     pub fn right_panel(&mut self, ui: &mut egui::Ui) {
         let Some(tab) = self.rail else { return };
-        let width = if tab == RailTab::Slides { SLIDES_W } else { PANEL_W + 20.0 };
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 0, right: 4, top: 36, bottom: 8 });
-        egui::Panel::right("rightpanel").exact_size(width).frame(frame).show_separator_line(false).show(ui, |ui| {
+        // Resizable by dragging its left edge; the narrow Slides panel keeps its own width.
+        let panel = if tab == RailTab::Slides {
+            egui::Panel::right("rightpanel_slides").exact_size(SLIDES_W)
+        } else {
+            egui::Panel::right("rightpanel").resizable(true).default_size(PANEL_W + 20.0).size_range(PANEL_MIN_W..=PANEL_MAX_W)
+        };
+        panel.frame(frame).show_separator_line(false).show(ui, |ui| {
             let margin = if tab == RailTab::Slides { 10 } else { 12 };
             egui::Frame::new().fill(theme::panel()).corner_radius(10).inner_margin(egui::Margin::same(margin)).stroke(Stroke::new(1.0, theme::border())).show(ui, |ui| {
                 ui.set_min_height(ui.available_height());
-                // Less the frame's 1px stroke on each side: anything wider than the panel would push it
-                // out to the left, under the canvas.
-                ui.set_width(width - 4.0 - 2.0 * margin as f32 - 2.0);
+                // No wider than the panel (the frame's margins include its stroke): anything wider would
+                // push it out to the left, under the canvas.
+                ui.set_width(ui.available_width());
                 let title = match tab {
                     RailTab::Edit if self.selection.len() > 1 => format!("{} items", self.selection.len()),
                     t => t.label().to_string(),
@@ -170,103 +164,209 @@ impl BioCartoon {
         if !self.icons.include.templates() {
             return Vec::new();
         }
-        // Templates belong to BioCartoon: another database's filter leaves them out.
-        let filter = &self.icons.source_filter;
-        let filtered_out = !filter.is_empty() && !filter.iter().any(|s| s == theme::BIOCARTOON_SOURCE);
-        if filtered_out && matches!(self.icons.mode, IconsMode::Search | IconsMode::Categories) {
-            return Vec::new();
-        }
-        let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
         let rows = self.template_rows.iter();
         match self.icons.mode {
             IconsMode::Search => {
-                let q = self.icons.query.trim().to_lowercase();
-                if q.is_empty() {
+                let f = &self.icons.filter;
+                // Templates belong to BioCartoon: another database's filter leaves them out.
+                if !f.sources.is_empty() && !f.sources.iter().any(|s| s == theme::BIOCARTOON_SOURCE) {
                     return Vec::new();
                 }
-                rows.filter(|r| [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q))).cloned().collect()
+                let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+                let q = self.icons.query.trim().to_lowercase();
+                let authors = f.authors();
+                // A template's category is free text: it matches a picked category or subcategory by name.
+                let places: Vec<&str> = f.cats.iter().map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
+                rows.filter(|r| q.is_empty() || [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q)))
+                    .filter(|r| authors.is_empty() || authors.iter().any(|a| r.meta.author.to_lowercase().contains(a)))
+                    .filter(|r| f.licenses.is_empty() || f.licenses.iter().any(|l| eq(l, &r.meta.license)))
+                    .filter(|r| places.is_empty() || places.iter().any(|p| eq(p, &r.meta.category)))
+                    // Their categories are BioCartoon's own database categories.
+                    .filter(|r| f.db_cats.is_empty() || f.db_cats.iter().any(|(s, c)| s == theme::BIOCARTOON_SOURCE && eq(c, &r.meta.category)))
+                    .cloned()
+                    .collect()
             }
-            IconsMode::Categories => match (&self.icons.taxon_cat, &self.icons.taxon_sub) {
-                (Some(Pick::All), _) => rows.cloned().collect(),
-                (Some(Pick::One(cat)), Some(Pick::All)) => rows.filter(|r| eq(&r.meta.category, cat)).cloned().collect(),
-                (Some(Pick::One(cat)), Some(Pick::One(sub))) => rows.filter(|r| eq(&r.meta.category, sub) || eq(&r.meta.category, cat)).cloned().collect(),
-                _ => Vec::new(),
-            },
-            IconsMode::Databases if self.icons.db.as_deref() == Some(theme::BIOCARTOON_SOURCE) => match &self.icons.db_cat {
-                Some(Pick::One(cat)) => rows.filter(|r| eq(&r.meta.category, cat)).cloned().collect(),
-                _ => rows.cloned().collect(),
-            },
-            IconsMode::UserGenerated => rows.filter(|r| r.json_local.is_none()).cloned().collect(),
+            // The user's own: templates saved on this computer.
+            IconsMode::Library => rows.filter(|r| r.json_local.is_some()).cloned().collect(),
             _ => Vec::new(),
         }
     }
 
-    /// Up one level: results to the menu they came from, then to the menu above, then home.
+    /// Back to the Icons panel's start.
     fn icons_back(&mut self) {
         let i = &mut self.icons;
         i.results.clear();
         i.total = None;
         i.browse_offset = 0;
-        match i.mode {
-            IconsMode::Categories if i.taxon_sub.is_some() => i.taxon_sub = None,
-            IconsMode::Categories if i.taxon_cat.is_some() => i.taxon_cat = None,
-            IconsMode::Databases if i.db_cat.is_some() => i.db_cat = None,
-            IconsMode::Databases if i.db.is_some() => i.db = None,
-            _ => i.mode = IconsMode::Home,
+        i.mode = IconsMode::Home;
+    }
+
+    /// The filters under the search box: database, author, category, subcategory and license.
+    /// The search re-runs once one changes (see `last_sent_filter`).
+    fn filters_panel(&mut self, ui: &mut egui::Ui) {
+        if self.icons.facets_for.as_ref() != Some(&self.icons.filter) {
+            self.request_facets();
         }
-    }
-
-    /// Show a browse menu's results, from the start.
-    fn open_results(&mut self) {
-        self.icons.results.clear();
-        self.icons.total = None;
-        self.icons.browse_offset = 0;
-        self.request_browse();
-    }
-
-    /// Open a database's own category menu.
-    fn open_database(&mut self, source: &str) {
-        self.icons.mode = IconsMode::Databases;
-        self.icons.db = Some(source.to_string());
-        self.icons.db_cat = None;
-        self.icons.results.clear();
-        self.icons.total = None;
-        if !self.icons.categories.contains_key(source) {
-            self.catalog.send(crate::catalog::Req::Categories { source: source.to_string() });
-        }
-    }
-
-    /// "All", then one button per database (BioCartoon's own and Community, i.e. user uploads,
-    /// included), as in Search. The databases toggle independently, so several can be on at once;
-    /// none on means all. Returns true when the choice changed.
-    fn source_filter_row(&self, ui: &mut egui::Ui, filter: &mut Vec<String>) -> bool {
-        let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            if ui.selectable_label(filter.is_empty(), "All").clicked() && !filter.is_empty() {
-                filter.clear();
-                changed = true;
+        // Each dropdown lists the choices that find icons under the other filters, with how many;
+        // the picked ones stay listed so they can be taken out. Until the counts arrive, all of them.
+        let facets = self.icons.facets.clone();
+        let label = |name: &str, n: Option<i64>| match n {
+            Some(n) => format!("{name} ({})", thousands(n)),
+            None => name.to_string(),
+        };
+        let f = &self.icons.filter;
+        let in_facet = |list: &[(String, i64)], v: &str| facets.as_ref().map(|_| list.iter().find(|(k, _)| k == v).map_or(0, |(_, n)| *n));
+        let dbs: Vec<(String, String)> = self
+            .databases()
+            .into_iter()
+            .filter_map(|(s, _, name)| {
+                let name = if s == "user" { "Community and user-generated".to_string() } else { name };
+                let n = in_facet(facets.as_ref().map_or(&[][..], |fc| &fc.sources), &s);
+                // BioCartoon's templates are in it even when none of its icons are.
+                let keep = n != Some(0) || f.sources.contains(&s) || (s == theme::BIOCARTOON_SOURCE && !self.template_rows.is_empty());
+                keep.then(|| (s, label(&name, n)))
+            })
+            .collect();
+        let mut licenses: Vec<String> = match &facets {
+            Some(fc) => fc.licenses.iter().map(|(l, _)| l.clone()).collect(),
+            None => self.icons.sources.iter().flat_map(|s| s.licenses.split(',')).map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        };
+        licenses.extend(f.licenses.iter().cloned());
+        licenses.sort();
+        licenses.dedup();
+        let licenses: Vec<(String, String)> =
+            licenses.into_iter().map(|l| (l.clone(), label(&l, in_facet(facets.as_ref().map_or(&[][..], |fc| &fc.licenses), &l)))).collect();
+        let count = |cat: &str, sub: &str| facets.as_ref().map(|fc| fc.taxa.iter().find(|t| t.cat == cat && t.sub == sub).map_or(0, |t| t.count));
+        let cats: Vec<(String, String)> = crate::taxonomy::TAXONOMY
+            .iter()
+            .filter(|(c, _)| count(c, "") != Some(0) || f.cats.iter().any(|p| p == c))
+            .map(|(c, _)| (c.to_string(), label(c, count(c, ""))))
+            .collect();
+        // The subcategories of the picked categories (of all of them when none is picked).
+        let mut subs: Vec<((String, String), String)> = Vec::new();
+        for (cat, list) in crate::taxonomy::TAXONOMY.iter().filter(|(c, _)| f.cats.is_empty() || f.cats.iter().any(|p| p == c)) {
+            for sub in *list {
+                let key = (cat.to_string(), sub.to_string());
+                let n = count(cat, sub);
+                if n != Some(0) || f.subs.contains(&key) {
+                    let name = if f.cats.len() == 1 { sub.to_string() } else { format!("{cat}: {sub}") };
+                    subs.push((key, label(&name, n)));
+                }
             }
-            for (source, abbr, name) in self.databases() {
-                let name = if source == "user" { "Community and user-generated: your uploads and approved contributions".to_string() } else { name };
-                let on = filter.iter().any(|s| *s == source);
-                if ui.selectable_label(on, abbr).on_hover_text(name).clicked() {
-                    if on {
-                        filter.retain(|s| *s != source);
-                    } else {
-                        filter.push(source.to_string());
-                    }
-                    changed = true;
+        }
+        // Each database's own categories, "BA: Viruses", in the order of the databases. BioCartoon's
+        // include its templates' categories.
+        let mut own: Vec<(String, String, Option<i64>)> = facets.as_ref().map_or(Vec::new(), |fc| fc.db_cats.iter().map(|(s, c, n)| (s.clone(), c.clone(), Some(*n))).collect());
+        if f.sources.is_empty() || f.sources.iter().any(|s| s == theme::BIOCARTOON_SOURCE) {
+            for c in self.template_rows.iter().map(|r| r.meta.category.trim()).filter(|c| !c.is_empty()) {
+                match own.iter_mut().find(|(s, k, _)| s == theme::BIOCARTOON_SOURCE && k.eq_ignore_ascii_case(c)) {
+                    Some((_, _, n)) => *n = Some(n.unwrap_or(0) + 1),
+                    None => own.push((theme::BIOCARTOON_SOURCE.into(), c.to_string(), Some(1))),
+                }
+            }
+        }
+        for (s, c) in &f.db_cats {
+            if !own.iter().any(|(os, oc, _)| os == s && oc == c) {
+                own.push((s.clone(), c.clone(), facets.as_ref().map(|_| 0)));
+            }
+        }
+        let order: Vec<String> = self.databases().into_iter().map(|(s, ..)| s).collect();
+        own.sort_by_key(|(s, c, _)| (order.iter().position(|o| o == s).unwrap_or(usize::MAX), c.to_lowercase()));
+        let db_cats: Vec<((String, String), String)> = own
+            .into_iter()
+            .map(|(s, c, n)| {
+                let l = label(&format!("{}: {c}", theme::source_badge(&s).0), n);
+                ((s, c), l)
+            })
+            .collect();
+        let f = &mut self.icons.filter;
+        egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).inner_margin(8).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let w = ui.available_width() - 84.0;
+            egui::Grid::new("search_filters").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Database");
+                if multi_select(ui, "filter_db", w, &mut f.sources, &dbs) && !f.sources.is_empty() {
+                    // Another database's own categories would find nothing.
+                    let sources = f.sources.clone();
+                    f.db_cats.retain(|(s, _)| sources.contains(s));
+                }
+                ui.end_row();
+                ui.label("Author");
+                ui.add(egui::TextEdit::singleline(&mut f.authors).hint_text("Any (commas for several)").desired_width(w));
+                ui.end_row();
+                ui.label("Category");
+                let before = f.cats.clone();
+                if multi_select(ui, "filter_cat", w, &mut f.cats, &cats) {
+                    // Taking a category out takes its subcategories with it.
+                    f.subs.retain(|(c, _)| !before.contains(c) || f.cats.contains(c));
+                }
+                ui.end_row();
+                ui.label("Subcategory");
+                multi_select(ui, "filter_sub", w, &mut f.subs, &subs);
+                ui.end_row();
+                ui.label("DB category").on_hover_text("A database's own categories, by its code (BA: NIAID NIH BioArt, ...)");
+                multi_select(ui, "filter_dbcat", w, &mut f.db_cats, &db_cats);
+                ui.end_row();
+                ui.label("License");
+                multi_select(ui, "filter_license", w, &mut f.licenses, &licenses);
+                ui.end_row();
+            });
+            if f.active() > 0 {
+                ui.add_space(2.0);
+                if ui.small_button(format!("{}  Clear filters", ph::FUNNEL_X)).clicked() {
+                    *f = Default::default();
                 }
             }
         });
-        changed
+        ui.add_space(4.0);
+    }
+
+    /// The set filters in a line: "Bioicons, OpenMoji · by Ann · Cells · CC0-1.0".
+    fn filter_summary(&self) -> String {
+        let f = &self.icons.filter;
+        let mut parts: Vec<String> = Vec::new();
+        if !f.sources.is_empty() {
+            parts.push(f.sources.iter().map(|s| self.source_name(s)).collect::<Vec<_>>().join(", "));
+        }
+        let authors = f.authors();
+        if !authors.is_empty() {
+            parts.push(format!("by {}", f.authors.split(',').map(str::trim).filter(|a| !a.is_empty()).collect::<Vec<_>>().join(", ")));
+        }
+        let places: Vec<&str> = f.cats.iter().filter(|c| !f.subs.iter().any(|(sc, _)| sc == *c)).map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
+        if !places.is_empty() {
+            parts.push(places.join(", "));
+        }
+        if !f.db_cats.is_empty() {
+            parts.push(f.db_cats.iter().map(|(s, c)| format!("{}: {c}", theme::source_badge(s).0)).collect::<Vec<_>>().join(", "));
+        }
+        if !f.licenses.is_empty() {
+            parts.push(f.licenses.join(", "));
+        }
+        parts.join("  ·  ")
+    }
+
+    /// Columns and tile size of the Icons panel's grids: `Settings::icon_columns` tiles filling the width.
+    fn icon_grid(&self, ui: &egui::Ui) -> (usize, f32) {
+        let cols = self.settings.icon_columns.clamp(1, 5);
+        (cols, ((ui.available_width() - 6.0 * (cols - 1) as f32) / cols as f32).floor().max(32.0))
     }
 
     fn search_box(&mut self, ui: &mut egui::Ui) {
         let r = egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).color(theme::text_dim()));
-                ui.add(egui::TextEdit::singleline(&mut self.icons.query).hint_text("Search icons").frame(egui::Frame::NONE).desired_width(ui.available_width() - 24.0))
+                let r = ui.add(egui::TextEdit::singleline(&mut self.icons.query).frame(egui::Frame::NONE).desired_width(ui.available_width() - 44.0));
+                // The funnel opens the filters, and shows how many are set.
+                let n = self.icons.filter.active();
+                let (text, color) = match n {
+                    0 => (ph::FUNNEL.to_string(), if self.icons.show_filters { theme::text() } else { theme::text_dim() }),
+                    n => (format!("{} {n}", ph::FUNNEL), theme::accent()),
+                };
+                let tip = if self.icons.show_filters { "Hide the filters" } else { "Filter by database, author, category or license" };
+                if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
+                    self.icons.show_filters = !self.icons.show_filters;
+                }
+                r
             })
             .inner
         });
@@ -307,32 +407,30 @@ impl BioCartoon {
         }
         match self.icons.mode {
             IconsMode::Home => {
-                for (icon, label, mode) in [
+                self.home_row_buttons(ui, &[
                     (ph::MAGNIFYING_GLASS, "Search", IconsMode::Search),
                     (ph::SPARKLE, "Generate with AI", IconsMode::Generate),
-                    (ph::SQUARES_FOUR, "Browse categories", IconsMode::Categories),
-                    (ph::DATABASE, "Browse databases", IconsMode::Databases),
-                    (ph::USERS, "Browse user-generated", IconsMode::UserGenerated),
+                ]);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                self.home_row_buttons(ui, &[
+                    (ph::STAR, "Favorites", IconsMode::Favorites),
+                    (ph::BOOKS, "Your library", IconsMode::Library),
                     (ph::UPLOAD_SIMPLE, "Uploads", IconsMode::Uploads),
-                ] {
-                    if row_button(ui, icon, label).clicked() {
-                        self.icons.mode = mode.clone();
-                        self.icons.results.clear();
-                        self.icons.total = None;
-                        self.icons.browse_offset = 0;
-                        self.icons.db = None;
-                        self.icons.db_cat = None;
-                        self.icons.taxon_cat = None;
-                        self.icons.taxon_sub = None;
-                        match mode {
-                            IconsMode::Search => self.request_search(),
-                            IconsMode::UserGenerated => self.request_browse(),
-                            IconsMode::Categories if self.icons.taxa.is_none() => self.request_taxa(),
-                            _ => {}
-                        }
-                    }
+                ]);
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                if row_button(ui, ph::CLOUD_ARROW_UP, "Contribute artwork").on_hover_text("Share your icons and templates with everyone").clicked() {
+                    self.open_contribute();
                 }
-                ui.add_space(10.0);
+                if row_button(ui, ph::CHAT_CIRCLE_TEXT, "Submit a suggestion").on_hover_text("Ask the BioCartoon team for an icon or template").clicked() {
+                    self.actions.push(Action::OpenSuggest(String::new()));
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
                 let sources = self.icons.sources.clone();
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Databases").strong());
@@ -354,187 +452,67 @@ impl BioCartoon {
                         };
                         let b = egui::Button::new(egui::RichText::new(format!("({abbr}) {name}")).size(11.0)).stroke(Stroke::new(1.0, col));
                         if ui.add(b).on_hover_text(hover).clicked() {
-                            self.open_database(&source);
+                            self.search_database(&source);
                         }
                     }
                 });
-                ui.add_space(12.0);
-                if row_button(ui, ph::CLOUD_ARROW_UP, "Contribute artwork").on_hover_text("Share your icons and templates with everyone").clicked() {
-                    self.icons.mode = IconsMode::Contribute;
-                }
             }
             IconsMode::Search => {
                 self.search_box(ui);
                 ui.add_space(4.0);
-                let mut filter = self.icons.source_filter.clone();
-                if self.source_filter_row(ui, &mut filter) {
-                    self.icons.source_filter = filter;
-                    self.request_search();
+                if self.icons.show_filters {
+                    self.filters_panel(ui);
+                } else if self.icons.filter.active() > 0 {
+                    // What the closed filters keep, as a reminder; clicking opens them.
+                    let summary = self.filter_summary();
+                    let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
+                    if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.icons.show_filters = true;
+                    }
                 }
                 self.results_grid(ui);
             }
             IconsMode::Generate => self.generate_panel(ui),
             IconsMode::Uploads => self.uploads_panel(ui),
             IconsMode::Contribute => self.contribute_panel(ui),
-            IconsMode::Categories => {
-                let mut filter = self.icons.taxon_filter.clone();
-                if self.source_filter_row(ui, &mut filter) {
-                    self.icons.taxon_filter = filter;
-                    self.request_taxa();
-                    if self.icons.taxon_cat.is_some() {
-                        self.open_results();
-                    }
-                }
-                ui.add_space(6.0);
-                let at_results = matches!((&self.icons.taxon_cat, &self.icons.taxon_sub), (Some(Pick::All), _) | (Some(_), Some(_)));
-                if at_results {
-                    self.results_grid(ui);
-                } else if let Some(taxa) = self.icons.taxa.clone() {
-                    let count = |cat: &str, sub: &str| taxa.iter().find(|t| t.cat == cat && t.sub == sub).map_or(0, |t| t.count);
-                    match self.icons.taxon_cat.clone() {
-                        None => {
-                            if row_button_count(ui, ph::SQUARES_FOUR, "All", count("", "")).clicked() {
-                                self.icons.taxon_cat = Some(Pick::All);
-                                self.open_results();
-                            }
-                            for (cat, _) in crate::taxonomy::TAXONOMY {
-                                let n = count(cat, "");
-                                if n > 0 && row_button_count(ui, ph::FOLDER, cat, n).clicked() {
-                                    self.icons.taxon_cat = Some(Pick::One(cat.to_string()));
-                                }
-                            }
-                        }
-                        Some(cat) => {
-                            let cat = cat.name().unwrap_or_default().to_string();
-                            if row_button_count(ui, ph::SQUARES_FOUR, "All", count(&cat, "")).clicked() {
-                                self.icons.taxon_sub = Some(Pick::All);
-                                self.open_results();
-                            }
-                            let subs = crate::taxonomy::TAXONOMY.iter().find(|(c, _)| *c == cat).map_or(&[][..], |(_, s)| *s);
-                            for sub in subs {
-                                let n = count(&cat, sub);
-                                if n > 0 && row_button_count(ui, ph::FOLDER_OPEN, sub, n).clicked() {
-                                    self.icons.taxon_sub = Some(Pick::One(sub.to_string()));
-                                    self.open_results();
-                                }
-                            }
-                        }
-                    }
+            IconsMode::Suggest => self.suggest_panel(ui),
+            IconsMode::Favorites => {
+                if self.settings.favorites.is_empty() {
+                    ui.label(egui::RichText::new("No favorites yet. Right-click an icon and pick Favorite.").color(theme::text_dim()));
                 } else {
-                    ui.label(egui::RichText::new("Loading categories...").color(theme::text_dim()));
+                    self.results_grid(ui);
                 }
             }
-            IconsMode::Databases => match self.icons.db.clone() {
-                None => {
-                    let sources = self.icons.sources.clone();
-                    for (source, abbr, name) in self.databases() {
-                        let col = theme::source_badge(&source).1;
-                        let detail = match sources.iter().find(|s| s.source == source) {
-                            found if source == theme::BIOCARTOON_SOURCE => {
-                                let n = self.template_rows.len();
-                                let icons = found.map_or(String::new(), |s| format!("{} icon{}, ", thousands(s.icons), if s.icons == 1 { "" } else { "s" }));
-                                format!("{icons}{} template{}  ·  BioCartoon's own icons, and your own and shared slide templates", thousands(n as i64), if n == 1 { "" } else { "s" })
-                            }
-                            Some(s) => format!("{} icons  ·  {}", thousands(s.icons), s.licenses),
-                            None => String::new(),
-                        };
-                        let r = egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).inner_margin(8).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                badge(ui, abbr, col);
-                                ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new(format!("({abbr}) {name}")).strong());
-                                    ui.label(egui::RichText::new(detail).small().color(theme::text_dim()));
-                                });
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(ph::CARET_RIGHT); });
-                            });
-                        });
-                        if ui.interact(r.response.rect, ui.id().with(&source), Sense::click()).clicked() {
-                            self.open_database(&source);
-                        }
-                    }
+            IconsMode::Library => {
+                if self.icons.results.is_empty() && !self.icons.loading && self.matching_templates().is_empty() {
+                    ui.label(egui::RichText::new("Nothing here yet. Images you add to your library (with \"Add to library...\" after generating one with AI, or from Uploads) and slides you save as templates appear here.").color(theme::text_dim()));
                 }
-                Some(db) if db == theme::BIOCARTOON_SOURCE && self.icons.db_cat.is_none() => {
-                    self.save_template_button(ui);
-                    ui.add_space(6.0);
-                    let rows = self.template_rows.clone();
-                    // BioCartoon's own icons, listed with its templates.
-                    let icons = self.icons.sources.iter().find(|s| s.source == db).map_or(0, |s| s.icons);
-                    if row_button_count(ui, ph::SQUARES_FOUR, "All", rows.len() as i64 + icons).clicked() {
-                        self.icons.db_cat = Some(Pick::All);
-                        self.open_results();
-                    }
-                    // One row per category the templates and icons use, alphabetical.
-                    let mut cats: Vec<(String, i64)> = Vec::new();
-                    let icon_cats = self.icons.categories.get(&db).cloned().unwrap_or_default();
-                    for (c, k) in rows.iter().map(|r| (r.meta.category.trim(), 1)).chain(icon_cats.iter().map(|c| (c.name.trim(), c.count))) {
-                        match cats.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(c)) {
-                            Some((_, n)) => *n += k,
-                            None => cats.push((c.to_string(), k)),
-                        }
-                    }
-                    cats.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-                    for (c, n) in cats {
-                        let label = if c.is_empty() { "(uncategorized)".to_string() } else { c.clone() };
-                        if row_button_count(ui, ph::FOLDER_OPEN, &label, n).clicked() {
-                            self.icons.db_cat = Some(Pick::One(c));
-                            self.open_results();
-                        }
-                    }
-                    if rows.is_empty() && icons == 0 {
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("No templates yet. Save the current slide as one.").color(theme::text_dim()));
-                    }
-                }
-                Some(db) if self.icons.db_cat.is_none() => {
-                    let all = self.icons.sources.iter().find(|s| s.source == db).map_or(0, |s| s.icons);
-                    if row_button_count(ui, ph::SQUARES_FOUR, "All", all).clicked() {
-                        self.icons.db_cat = Some(Pick::All);
-                        self.open_results();
-                    }
-                    match self.icons.categories.get(&db).cloned() {
-                        None => {
-                            ui.label(egui::RichText::new("Loading categories...").color(theme::text_dim()));
-                        }
-                        Some(cats) => {
-                            for c in cats {
-                                let label = if c.name.is_empty() { "(uncategorized)" } else { c.name.as_str() };
-                                if row_button_count(ui, ph::FOLDER_OPEN, label, c.count).clicked() {
-                                    self.icons.db_cat = Some(Pick::One(c.name.clone()));
-                                    self.open_results();
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(_) => self.results_grid(ui),
-            },
-            IconsMode::UserGenerated => {
-                ui.horizontal(|ui| {
-                    if ui.button(format!("{}  Generate a new asset", ph::SPARKLE)).clicked() {
-                        self.icons.mode = IconsMode::Generate;
-                    }
-                    if ui.button(format!("{}  Upload a file", ph::UPLOAD_SIMPLE)).clicked() {
-                        self.actions.push(Action::PickLibraryFile);
-                    }
-                });
-                if self.icons.results.is_empty() && !self.icons.loading {
-                    ui.label(egui::RichText::new("No user assets yet. Generate one with AI or upload an image file.").color(theme::text_dim()));
-                }
+                #[cfg(target_arch = "wasm32")]
+                ui.label(egui::RichText::new("In the browser, images added to your library are kept until the page is reloaded.").small().color(theme::text_dim()));
                 self.results_grid(ui);
+            }
+        }
+    }
+
+    /// Full-width buttons that open one of the Icons panel's modes, from its start.
+    fn home_row_buttons(&mut self, ui: &mut egui::Ui, rows: &[(&str, &str, IconsMode)]) {
+        for (icon, label, mode) in rows {
+            if row_button(ui, icon, label).clicked() {
+                self.icons.mode = mode.clone();
+                self.icons.results.clear();
+                self.icons.total = None;
+                self.icons.browse_offset = 0;
+                match mode {
+                    IconsMode::Search => self.request_search(),
+                    IconsMode::Library | IconsMode::Favorites => self.request_browse(),
+                    _ => {}
+                }
             }
         }
     }
 
     fn results_grid(&mut self, ui: &mut egui::Ui) {
         let templates = self.matching_templates();
-        let own_db = self.icons.mode == IconsMode::Databases && self.icons.db.as_deref() == Some(theme::BIOCARTOON_SOURCE);
-        if own_db {
-            // BioCartoon's database holds templates only: no catalog request, sort or Include.
-            ui.label(egui::RichText::new(format!("{} {}", thousands(templates.len() as i64), if templates.len() == 1 { "template" } else { "templates" })).small().color(theme::text_dim()));
-            self.templates_grid(ui, &templates);
-            return;
-        }
         if let Some(e) = &self.icons.error {
             ui.label(egui::RichText::new(e).color(Color32::from_rgb(230, 120, 120)));
         }
@@ -592,19 +570,24 @@ impl BioCartoon {
             ui.label(egui::RichText::new("No results").color(theme::text_dim()));
         }
         let mut picked: Option<AssetRow> = None;
-        let per_row = ((ui.available_width() + 6.0) / (TILE + 6.0)).floor().max(1.0) as usize;
+        let (per_row, size) = self.icon_grid(ui);
         // Reveal thumbnails in order: hold back each one until the visible tiles before it are in.
         let mut hold = false;
         egui::Grid::new("results").spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
                 let colors = self.icons.colors.get(&row.id).copied().unwrap_or(1);
-                let (r, star, remove) = asset_tile(ui, row, row.png_local.as_deref(), &mut self.images, hold, colors);
-                if remove {
-                    self.actions.push(Action::RemoveUserAsset(row.clone()));
-                } else if star {
-                    self.actions.push(Action::ToggleStar(row.clone()));
-                } else if r.clicked() {
-                    picked = Some(row.clone());
+                let marks = TileMarks {
+                    database: self.settings.tile_database,
+                    colors: if self.settings.tile_colors { colors } else { 1 },
+                    stars: self.settings.tile_stars,
+                    fav: self.settings.favorites.contains(&row.id),
+                };
+                let (r, act) = asset_tile(ui, size, row, row.png_local.as_deref(), &mut self.images, hold, colors, marks);
+                match act {
+                    Some(TileAct::Remove) => self.actions.push(Action::RemoveUserAsset(row.clone())),
+                    Some(TileAct::Favorite) => self.actions.push(Action::ToggleFavorite(row.id.clone())),
+                    None if r.clicked() => picked = Some(row.clone()),
+                    None => {}
                 }
                 if ui.is_rect_visible(r.rect) && matches!(self.images.get(&format!("asset:{}", row.png_key)), Some(ImgState::Loading)) {
                     hold = true;
@@ -619,19 +602,75 @@ impl BioCartoon {
         }
         // Load the next page once the end of the list is within a few rows of the bottom.
         let (end, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-        if self.icons.more && end.top() < ui.clip_rect().bottom() + 3.0 * TILE {
+        if self.icons.more && end.top() < ui.clip_rect().bottom() + 3.0 * size {
             self.request_more();
         }
         if self.icons.loading && !self.icons.results.is_empty() {
             ui.label(egui::RichText::new("Loading...").small().color(theme::text_dim()));
         }
-        let q = self.icons.query.trim();
-        if self.icons.mode == IconsMode::Search && !q.is_empty() {
-            // A plain outbound link: the search runs on BioRender's site, under their terms and login.
-            ui.add_space(6.0);
-            if ui.button(format!("{}  Search BioRender", ph::ARROW_SQUARE_OUT)).on_hover_text("Opens BioRender's library in a new tab (a BioRender account may be required)").clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.biorender.com/library?q={}", form_encode(q))));
+        if self.icons.mode == IconsMode::Search && !self.icons.more && !self.icons.loading {
+            self.not_found_footer(ui);
+        }
+        // A plain outbound link to run the same search on another icon library's site.
+        // let q = self.icons.query.trim();
+        // if self.icons.mode == IconsMode::Search && !q.is_empty() {
+        //     ui.add_space(6.0);
+        //     if ui.button(format!("{}  Search other", ph::ARROW_SQUARE_OUT)).on_hover_text("Opens another icon library in a new tab").clicked() {
+        //         ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://example.com/search?q={}", form_encode(q))));
+        //     }
+        // }
+    }
+
+    /// Under the last search result: where to go when the search came up short.
+    fn not_found_footer(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
+        let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
+        let link = |t: &str| egui::Label::new(egui::RichText::new(t).small().italics().underline().color(theme::text_dim())).sense(Sense::click());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.label(dim("Didn't find what you were looking for? "));
+            if ui.add(link("Generate a figure with AI")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.icons.mode = IconsMode::Generate;
             }
+            ui.label(dim(" or "));
+            if ui.add(link("Submit a suggestion")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.actions.push(Action::OpenSuggest(self.icons.query.trim().to_string()));
+            }
+            ui.label(dim("."));
+        });
+    }
+
+    /// Submit a suggestion: ask the BioCartoon team for an icon or template.
+    fn suggest_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Submit a suggestion for an icon or template to the BioCartoon team.").color(theme::text_dim()));
+        ui.add_space(8.0);
+        let w = ui.available_width();
+        ui.label(egui::RichText::new("Item type").strong());
+        egui::ComboBox::from_id_salt("suggest_kind").width(w).selected_text(if self.suggest.template { "Template" } else { "Icon" }).show_ui(ui, |ui| {
+            ui.selectable_value(&mut self.suggest.template, false, "Icon");
+            ui.selectable_value(&mut self.suggest.template, true, "Template");
+        });
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Title").strong());
+        ui.add(egui::TextEdit::singleline(&mut self.suggest.title).hint_text("Required").char_limit(80).desired_width(w));
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Description").strong());
+        ui.add(egui::TextEdit::multiline(&mut self.suggest.description).hint_text("Optional").char_limit(1000).desired_rows(4).desired_width(w));
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Name").strong());
+        ui.add(egui::TextEdit::singleline(&mut self.suggest.name).hint_text("Optional").char_limit(60).desired_width(w));
+        ui.add_space(12.0);
+        let can = !self.suggest.title.trim().is_empty() && !self.suggest.busy;
+        let label = format!("{}  Submit suggestion", ph::PAPER_PLANE_TILT);
+        let b = ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent()).min_size(Vec2::new(w, 38.0)));
+        if b.on_disabled_hover_text("Give it a title first").clicked() {
+            self.actions.push(Action::SubmitSuggestion);
+        }
+        if self.suggest.busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("Sending...").small().color(theme::text_dim()));
+            });
         }
     }
 
@@ -669,30 +708,14 @@ impl BioCartoon {
         }
     }
 
-    /// "Save slide as template", enabled once the slide has something on it.
-    fn save_template_button(&mut self, ui: &mut egui::Ui) {
-        let can_save = !self.slide().items.is_empty();
-        let save = ui.add_enabled(can_save, egui::Button::new(egui::RichText::new(format!("{}  Save slide as template", ph::CLOUD_ARROW_UP)).color(Color32::WHITE)).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 32.0)));
-        if save.on_disabled_hover_text("Add something to the slide first").clicked() {
-            self.actions.push(Action::OpenUploadDialog(self.template_target(self.cur_slide)));
-        }
-        ui.label(egui::RichText::new("Templates add a new slide after the current one.").small().color(theme::text_dim()));
-        if self.library_busy > 0 {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(egui::RichText::new("Working...").small().color(theme::text_dim()));
-            });
-        }
-    }
-
     /// Template thumbnails; clicking one adds its slide.
     fn templates_grid(&mut self, ui: &mut egui::Ui, list: &[TemplateRow]) {
-        let per_row = ((ui.available_width() + 6.0) / (TILE + 6.0)).floor().max(1.0) as usize;
+        let (per_row, size) = self.icon_grid(ui);
         egui::Grid::new("saved_templates").spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, row) in list.iter().enumerate() {
                 let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
                 let (abbr, col, _) = theme::source_badge(theme::BIOCARTOON_SOURCE);
-                let r = tile(ui, &row.meta.title, state, Some((abbr, col, "Template")));
+                let r = tile(ui, size, &row.meta.title, state, self.settings.tile_database.then_some((abbr, col, "Template")));
                 let info = |ui: &mut egui::Ui| {
                     ui.label(egui::RichText::new(&row.meta.title).strong());
                     if !row.meta.description.is_empty() {
@@ -776,20 +799,42 @@ impl BioCartoon {
             self.actions.push(Action::PickUploads);
         }
         ui.add_space(6.0);
+        ui.label(egui::RichText::new("Uploads").strong());
         let uploads = self.settings.uploads.clone();
         if uploads.is_empty() {
             ui.label(egui::RichText::new("No uploads yet.").color(theme::text_dim()));
         }
-        let per_row = ((ui.available_width() + 6.0) / (TILE + 6.0)).floor().max(1.0) as usize;
+        let (per_row, size) = self.icon_grid(ui);
         egui::Grid::new("contribute_icons").spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, p) in uploads.iter().enumerate() {
                 let name = std::path::Path::new(p).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 let state = self.images.file(p);
-                let r = tile(ui, &name, state, None);
+                let r = tile(ui, size, &name, state, None);
                 let on = self.contribute.icons.contains(p);
                 check_corner(ui, r.rect, on, true);
                 if r.on_hover_text(&name).clicked() && !self.contribute.icons.remove(p) {
                     self.contribute.icons.insert(p.clone());
+                }
+                if (i + 1) % per_row == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Your library").strong());
+        let library: Vec<AssetRow> = self.icons.results.iter().filter(|r| r.png_local.is_some()).cloned().collect();
+        if library.is_empty() {
+            let text = if self.icons.loading { "Loading..." } else { "No icons in your library yet." };
+            ui.label(egui::RichText::new(text).color(theme::text_dim()));
+        }
+        egui::Grid::new("contribute_library").spacing([6.0, 6.0]).show(ui, |ui| {
+            for (i, row) in library.iter().enumerate() {
+                let state = self.images.file(row.png_local.as_deref().unwrap_or_default());
+                let r = tile(ui, size, &row.title, state, None);
+                let on = self.contribute.library.contains(&row.id);
+                check_corner(ui, r.rect, on, true);
+                if r.on_hover_text(&row.title).clicked() && !self.contribute.library.remove(&row.id) {
+                    self.contribute.library.insert(row.id.clone());
                 }
                 if (i + 1) % per_row == 0 {
                     ui.end_row();
@@ -869,9 +914,31 @@ impl BioCartoon {
         }
         let used = row_start.y + row_h - ui.cursor().min.y;
         ui.allocate_space(Vec2::new(ui.available_width(), used.max(0.0)));
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Your library").strong());
+        let saved: Vec<TemplateRow> = self.template_rows.iter().filter(|r| r.json_local.is_some()).cloned().collect();
+        if saved.is_empty() {
+            ui.label(egui::RichText::new("No templates in your library yet.").color(theme::text_dim()));
+        }
+        let (per_row, size) = self.icon_grid(ui);
+        egui::Grid::new("contribute_templates").spacing([6.0, 6.0]).show(ui, |ui| {
+            for (i, row) in saved.iter().enumerate() {
+                let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
+                let r = tile(ui, size, &row.meta.title, state, None);
+                let on = self.contribute.library_templates.contains(&row.meta.id);
+                check_corner(ui, r.rect, on, true);
+                if r.on_hover_text(&row.meta.title).clicked() && !self.contribute.library_templates.remove(&row.meta.id) {
+                    self.contribute.library_templates.insert(row.meta.id.clone());
+                }
+                if (i + 1) % per_row == 0 {
+                    ui.end_row();
+                }
+            }
+        });
 
         ui.add_space(16.0);
-        let n = self.contribute.icons.len() + self.contribute.slides.len() + self.contribute.picked_templates.len();
+        let c = &self.contribute;
+        let n = c.icons.len() + c.library.len() + c.slides.len() + c.picked_templates.len() + c.library_templates.len();
         let label = if n == 0 { format!("{}  Add to BioCartoon library", ph::CLOUD_ARROW_UP) } else { format!("{}  Add to BioCartoon library ({n})", ph::CLOUD_ARROW_UP) };
         let b = ui.add_enabled(n > 0, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 38.0)));
         if b.on_disabled_hover_text("Pick icons or templates above first").clicked() {
@@ -890,13 +957,13 @@ impl BioCartoon {
         if uploads.is_empty() {
             ui.label(egui::RichText::new("No uploads yet.").color(theme::text_dim()));
         }
-        let per_row = ((ui.available_width() + 6.0) / (TILE + 6.0)).floor().max(1.0) as usize;
+        let (per_row, size) = self.icon_grid(ui);
         let mut remove: Option<usize> = None;
         egui::Grid::new("uploads").spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, p) in uploads.iter().enumerate() {
                 let name = std::path::Path::new(p).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 let state = self.images.file(p);
-                let r = tile(ui, &name, state, Some(("UP", theme::source_badge("user").1, "Upload")));
+                let r = tile(ui, size, &name, state, Some(("UP", theme::source_badge("user").1, "Upload")));
                 if r.clicked() {
                     self.actions.push(Action::InsertFile(p.into()));
                 }
@@ -1209,9 +1276,9 @@ impl BioCartoon {
                         Some(c) => ui.add(egui::Label::new(dim(c)).selectable(true)),
                         None => ui.label(dim(format!("Asset {aid}"))),
                     };
-                    let caption = crate::credits::caption(&crate::credits::collect([self.slide()], self.cur_slide + 1), false);
-                    if ui.add_enabled(!caption.is_empty(), egui::Button::new(format!("{}  Copy caption", ph::COPY)).small()).on_hover_text(caption.as_str()).clicked() {
-                        ui.ctx().copy_text(caption);
+                    let list = crate::credits::list(&crate::credits::collect([self.slide()], self.cur_slide + 1), false);
+                    if ui.add_enabled(!list.is_empty(), egui::Button::new(format!("{}  Copy slide credits", ph::COPY)).small()).on_hover_text(list.as_str()).clicked() {
+                        ui.ctx().copy_text(list);
                         self.toast("Copied the credits");
                     }
                 }
@@ -1569,6 +1636,35 @@ fn action_row(ui: &mut egui::Ui, icon: &str, label: &str, right: &str) -> egui::
     resp
 }
 
+/// A dropdown of checkboxes, any number of which can be on ("Any" with none). It stays open
+/// while they are ticked. Returns true when `chosen` changed.
+fn multi_select<T: Clone + PartialEq>(ui: &mut egui::Ui, id: &str, width: f32, chosen: &mut Vec<T>, options: &[(T, String)]) -> bool {
+    let text = match chosen.as_slice() {
+        [] => "Any".to_string(),
+        [one] => options.iter().find(|(v, _)| v == one).map_or_else(|| "1 selected".into(), |(_, l)| l.clone()),
+        many => format!("{} selected", many.len()),
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .width(width)
+        .selected_text(text)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            for (v, label) in options {
+                let mut on = chosen.contains(v);
+                if ui.checkbox(&mut on, label).changed() {
+                    if on {
+                        chosen.push(v.clone());
+                    } else {
+                        chosen.retain(|c| c != v);
+                    }
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
 fn row_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
     let r = egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1589,26 +1685,8 @@ fn row_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
     resp
 }
 
-fn row_button_count(ui: &mut egui::Ui, icon: &str, label: &str, count: i64) -> egui::Response {
-    let r = egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(icon).color(theme::accent()));
-            ui.label(label);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(ph::CARET_RIGHT).color(theme::text_dim()));
-                ui.label(egui::RichText::new(thousands(count)).small().color(theme::text_dim()));
-            });
-        });
-    });
-    let resp = ui.interact(r.response.rect, ui.id().with(label), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_stroke(r.response.rect, 8.0, Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
-    }
-    resp
-}
-
 /// `s` as an HTML form query value: "mitochondrial gene" -> "mitochondrial+gene".
+#[allow(dead_code)]
 fn form_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1634,15 +1712,9 @@ fn thousands(n: i64) -> String {
     if n < 0 { format!("-{out}") } else { out }
 }
 
-fn badge(ui: &mut egui::Ui, abbr: &str, col: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-    ui.painter().rect_filled(rect, 5.0, col);
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, abbr, FontId::proportional(9.5), Color32::WHITE);
-}
-
 /// A thumbnail tile with optional database badge in the lower-left corner.
-fn tile(ui: &mut egui::Ui, title: &str, state: &ImgState, badge: Option<(&str, Color32, &str)>) -> egui::Response {
-    let (rect, r) = ui.allocate_exact_size(Vec2::splat(TILE), Sense::click());
+fn tile(ui: &mut egui::Ui, size: f32, title: &str, state: &ImgState, badge: Option<(&str, Color32, &str)>) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let p = ui.painter();
     p.rect(rect, 8.0, Color32::WHITE, Stroke::new(if r.hovered() { 2.0 } else { 1.0 }, if r.hovered() { theme::accent() } else { theme::border() }), StrokeKind::Inside);
     match state {
@@ -1656,7 +1728,7 @@ fn tile(ui: &mut egui::Ui, title: &str, state: &ImgState, badge: Option<(&str, C
             p.text(rect.center(), egui::Align2::CENTER_CENTER, "...", FontId::proportional(14.0), Color32::from_gray(160));
         }
         ImgState::Failed(_) => {
-            let galley = p.layout(title.to_string(), FontId::proportional(10.0), Color32::from_gray(110), TILE - 16.0);
+            let galley = p.layout(title.to_string(), FontId::proportional(10.0), Color32::from_gray(110), size - 16.0);
             p.galley(Pos2::new(rect.min.x + 8.0, rect.center().y - galley.size().y / 2.0), galley, Color32::from_gray(110));
         }
     }
@@ -1682,23 +1754,28 @@ fn check_corner(ui: &egui::Ui, rect: Rect, on: bool, enabled: bool) {
     }
 }
 
-/// The star count in a tile's lower-right corner ("★ 1.2k", in the accent colour when one of
-/// them is the user's own). Empty at 0 stars, except that hovering the tile shows a bare star
-/// so the button can be found. Returns the corner's rectangle.
-fn star_corner(ui: &egui::Ui, rect: Rect, stars: i64, starred: bool, pointer: Option<Pos2>) -> Rect {
+/// The star in a tile's upper-right corner, with everyone's count next to it ("☆ 12"): empty,
+/// or filled gold once the user starred it (one of their favorites). At 0 stars it shows only
+/// while the tile is hovered, so the button can be found. `count` false leaves out the number
+/// and shows the star only when filled. Returns the clickable area.
+fn star_corner(ui: &egui::Ui, rect: Rect, stars: i64, starred: bool, count: bool, pointer: Option<Pos2>) -> Rect {
     let p = ui.painter();
-    let text = if stars > 0 { format!("{} {}", ph::STAR, format_stars(stars)) } else { ph::STAR.to_string() };
-    let galley = p.layout_no_wrap(text, FontId::proportional(9.5), Color32::WHITE);
-    let size = Vec2::new(galley.size().x + 10.0, 16.0);
-    let b = Rect::from_min_size(rect.right_bottom() - Vec2::new(5.0, 5.0) - size, size);
+    // The user's own star counts even before the Worker has answered.
+    let stars = stars.max(starred as i64);
+    let text = if count && stars > 0 { format_stars(stars) } else { String::new() };
+    let galley = p.layout_no_wrap(text, FontId::proportional(10.0), Color32::WHITE);
+    let (radius, gap) = (6.0, if galley.size().x > 0.0 { 3.0 } else { 0.0 });
+    let size = Vec2::new(4.0 + 2.0 * radius + gap + galley.size().x + 5.0, 18.0);
+    let b = Rect::from_min_size(rect.right_top() + Vec2::new(-5.0 - size.x, 5.0), size);
     let hot = pointer.is_some_and(|q| b.contains(q));
-    if stars > 0 || pointer.is_some_and(|q| rect.contains(q)) {
-        let fill = if starred { theme::accent() } else if hot { Color32::from_black_alpha(200) } else { Color32::from_black_alpha(140) };
-        p.rect_filled(b, 4.0, fill);
+    let shown = starred || (count && (stars > 0 || pointer.is_some_and(|q| rect.contains(q))));
+    if shown {
+        p.rect_filled(b, 4.0, Color32::from_black_alpha(if hot { 200 } else { 140 }));
         if hot {
             p.rect_stroke(b, 4.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
         }
-        p.galley(b.center() - galley.size() / 2.0, galley, Color32::WHITE);
+        star_shape(p, Pos2::new(b.min.x + 4.0 + radius, b.center().y), radius, starred);
+        p.galley(Pos2::new(b.max.x - 5.0 - galley.size().x, b.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
     }
     b
 }
@@ -1714,24 +1791,47 @@ fn info_ui(r: egui::Response, info: impl Fn(&mut egui::Ui)) -> egui::Response {
     r.on_hover_ui(info)
 }
 
-/// `hold` draws the tile as still loading even if its image is ready. The second value is true
-/// when the click landed on the star (add / remove the user's star) rather than the tile; the
-/// third when the user picked "Remove from library" on one of their own uploads.
-/// A catalog asset's tile. `colors` > 1 marks it with a colour wheel in the lower-right corner
-/// (the colours are picked in Edit once it is placed); the star count moves left of it.
-fn asset_tile(ui: &mut egui::Ui, row: &AssetRow, local: Option<&str>, images: &mut crate::assets::ImageCache, hold: bool, colors: usize) -> (egui::Response, bool, bool) {
+/// The gold of a favorite's star.
+const GOLD: Color32 = Color32::from_rgb(0xf5, 0xb3, 0x01);
+
+/// What a click on an asset tile asked for, besides placing the asset.
+enum TileAct {
+    /// Star / unstar it, i.e. Favorite / Unfavorite (the star count, or the right-click menu).
+    Favorite,
+    /// Remove from library, on one of the user's own uploads.
+    Remove,
+}
+
+/// What an asset tile shows besides its image (the Settings > General choices, and whether it is
+/// one of the user's favorites).
+struct TileMarks {
+    /// The database's badge, lower left.
+    database: bool,
+    /// How many colours to mark with a colour wheel, lower right (1: none).
+    colors: usize,
+    /// The star and everyone's count, upper right.
+    stars: bool,
+    /// The user starred it (one of their favorites): the star is filled gold.
+    fav: bool,
+}
+
+/// A catalog asset's tile. `hold` draws it as still loading even if its image is ready. `colors`
+/// is how many colours it comes in (the colours are picked in Edit once it is placed); `marks`
+/// what to show on it. Clicking the star stars it, which makes it a favorite. Right-click
+/// (or a long press) opens its info with Favorite, Copy name and Copy credit.
+fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>, images: &mut crate::assets::ImageCache, hold: bool, colors: usize, marks: TileMarks) -> (egui::Response, Option<TileAct>) {
+    let fav = marks.fav;
     let state = images.asset(&row.png_key, local);
     let loading = ImgState::Loading;
     let state = if hold { &loading } else { state };
     let (abbr, col, name) = theme::source_badge(theme::asset_source(&row.source, &row.author));
-    let r = tile(ui, &row.title, state, Some((abbr, col, name)));
-    let mut star_area = r.rect;
-    if colors > 1 {
+    let r = tile(ui, size, &row.title, state, marks.database.then_some((abbr, col, name)));
+    if marks.colors > 1 {
         color_wheel(ui.painter(), r.rect.right_bottom() - Vec2::new(13.0, 13.0), 7.0);
-        star_area.max.x -= 20.0;
     }
-    let star_rect = star_corner(ui, star_area, row.stars, row.starred, r.hover_pos());
-    let star_clicked = r.clicked() && r.interact_pointer_pos().is_some_and(|q| star_rect.contains(q));
+    let star_rect = star_corner(ui, r.rect, row.stars, fav, marks.stars, r.hover_pos());
+    let star_clickable = marks.stars || fav;
+    let mut act = (star_clickable && r.clicked() && r.interact_pointer_pos().is_some_and(|q| star_rect.contains(q))).then_some(TileAct::Favorite);
     let info = |ui: &mut egui::Ui| {
         ui.label(egui::RichText::new(&row.title).strong());
         if !row.variant.is_empty() {
@@ -1745,35 +1845,73 @@ fn asset_tile(ui: &mut egui::Ui, row: &AssetRow, local: Option<&str>, images: &m
         }
         ui.label(format!("{name}  ·  {}", row.license));
         ui.label(egui::RichText::new(&row.credit).small().color(theme::text_dim()));
-        let stars = match (row.stars, row.starred) {
-            (0, _) => "No stars yet. Click the star to add yours.".to_string(),
-            (n, true) => format!("{} {n} star{}, yours among them. Click the star to take it back.", ph::STAR, if n == 1 { "" } else { "s" }),
-            (n, false) => format!("{} {n} star{}. Click the star to add yours.", ph::STAR, if n == 1 { "" } else { "s" }),
+        let stars = match (row.stars, fav) {
+            (_, true) => format!("{} In your favorites ({}). Right-click to take it out.", ph::STAR, star_count(row.stars.max(1))),
+            (0, _) => "No stars yet. Star it to add it to your favorites.".to_string(),
+            (n, false) => format!("{} {}. Star it to add it to your favorites.", ph::STAR, star_count(n)),
         };
         ui.label(egui::RichText::new(stars).small().color(theme::text_dim()));
     };
-    // The user's own uploads (published ones have no local copy) get a context menu, which a long
-    // press opens too, so the info goes there.
-    let mut remove = false;
-    let r = if row.source == "user" && row.png_local.is_some() {
-        let r = r.on_hover_ui(info);
-        r.context_menu(|ui| {
-            info(ui);
+    // A long press opens the context menu too, so the info goes there for touch screens.
+    let r = r.on_hover_ui(info);
+    r.context_menu(|ui| {
+        info(ui);
+        ui.separator();
+        if ui.button(format!("{}  {}", ph::STAR, if fav { "Unfavorite" } else { "Favorite" })).clicked() {
+            act = Some(TileAct::Favorite);
+            ui.close();
+        }
+        if ui.button(format!("{}  Copy name", ph::COPY)).clicked() {
+            ui.ctx().copy_text(row.title.clone());
+            ui.close();
+        }
+        if ui.button(format!("{}  Copy credit", ph::QUOTES)).clicked() {
+            ui.ctx().copy_text(row.credit.clone());
+            ui.close();
+        }
+        // The user's own uploads (published ones have no local copy) can be taken out again.
+        if row.source == "user" && row.png_local.is_some() {
             ui.separator();
-            if ui.button("Remove from library").clicked() {
-                remove = true;
+            if ui.button(format!("{}  Remove from library", ph::TRASH)).clicked() {
+                act = Some(TileAct::Remove);
                 ui.close();
             }
-        });
-        r
-    } else {
-        info_ui(r, info)
-    };
+        }
+    });
     if let ImgState::Failed(e) = images.get(&format!("asset:{}", row.png_key)).unwrap_or(&ImgState::Loading) {
         let e = e.clone();
-        return (r.on_hover_text(e), star_clicked, remove);
+        return (r.on_hover_text(e), act);
     }
-    (r, star_clicked, remove)
+    (r, act)
+}
+
+/// "1 star", "12 stars": everyone's stars on an asset.
+fn star_count(n: i64) -> String {
+    format!("{n} star{}", if n == 1 { "" } else { "s" })
+}
+
+/// A five-pointed star centred on `c`: filled gold (a favorite), or an empty white outline.
+fn star_shape(p: &egui::Painter, c: Pos2, radius: f32, filled: bool) {
+    let pts: Vec<Pos2> = (0..10)
+        .map(|k| {
+            let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 5.0;
+            c + Vec2::angled(a) * if k % 2 == 0 { radius } else { radius * 0.45 }
+        })
+        .collect();
+    if !filled {
+        p.add(egui::Shape::closed_line(pts, Stroke::new(1.2, Color32::WHITE)));
+        return;
+    }
+    // A star is concave but every point sees the centre, so a fan from it fills it.
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(c, GOLD);
+    for q in &pts {
+        mesh.colored_vertex(*q, GOLD);
+    }
+    for k in 0..10u32 {
+        mesh.add_triangle(0, 1 + k, 1 + (k + 1) % 10);
+    }
+    p.add(mesh);
 }
 
 /// A small colour wheel: the mark of an icon that comes in several colours.

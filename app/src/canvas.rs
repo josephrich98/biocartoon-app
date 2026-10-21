@@ -2,10 +2,11 @@
 //! grid snapping, marquee selection, pan / zoom, on-canvas cropping and the right-click menu.
 
 use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon};
-use crate::assets::{ImageCache, ImgState};
+use crate::assets::{ImageCache, ImgState, IMAGE_EXTS};
 use crate::doc::{c32, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, ShapeKind, Slide, TextAlign, TextVAlign, Unit, DPI};
 use crate::theme;
 use egui::emath::Rot2;
+use std::path::Path;
 use egui::{Color32, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2};
 use egui_phosphor::regular as ph;
 
@@ -468,7 +469,7 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
             let rs = xf.rect(it.rect());
             let key = source.cache_key();
             let state = match source {
-                crate::doc::ImageSource::Asset { key, .. } => images.asset(key, local_dir_hint),
+                crate::doc::ImageSource::Asset { key, svg, .. } => images.asset_image(key, svg.as_deref(), local_dir_hint),
                 crate::doc::ImageSource::File { path, .. } => images.file(path),
             };
             match state {
@@ -796,6 +797,51 @@ fn draw_slide_except(painter: &egui::Painter, xf: &Xform, slide: &Slide, page: R
 }
 
 impl BioCartoon {
+    /// Images dragged in from the OS: outline the page while they hover, and on drop add them to
+    /// Uploads and the page. The desktop gets file paths; in the browser the bytes are read and saved
+    /// to app storage like a picked upload.
+    fn image_drop(&mut self, ui: &egui::Ui, rect: Rect, page_s: Rect, xf: &Xform, painter: &egui::Painter) {
+        let (hovering, dropped, ptr) = ui.input(|i| (!i.raw.hovered_files.is_empty(), i.raw.dropped_files.clone(), i.pointer.hover_pos()));
+        if hovering {
+            painter.rect_stroke(page_s.expand(4.0), 4.0, Stroke::new(3.0, theme::accent()), StrokeKind::Outside);
+            painter.text(page_s.center_top() + Vec2::new(0.0, -8.0), egui::Align2::CENTER_BOTTOM, "Drop images to add them", FontId::proportional(13.0), theme::accent());
+        }
+        if dropped.is_empty() {
+            return;
+        }
+        let is_image = |p: &Path| p.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+        let (images, other): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|f| is_image(f.path()));
+        if !other.is_empty() {
+            self.toast(format!("Only images can be dropped ({})", IMAGE_EXTS.join(", ")));
+        }
+        if images.is_empty() {
+            return;
+        }
+        let at = ptr.filter(|p| rect.contains(*p)).map(|p| xf.to_doc(p));
+        #[cfg(not(target_arch = "wasm32"))]
+        self.actions.push(Action::DropImages(images.iter().map(|f| f.path().to_path_buf()).collect(), at));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (tx, ctx) = (self.action_tx.clone(), ui.ctx().clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let stamp = crate::projects::now_ms();
+                let mut paths = Vec::new();
+                for (i, f) in images.iter().enumerate() {
+                    let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "image.png".into());
+                    let path = std::path::PathBuf::from("uploads").join(format!("{stamp}-{i}")).join(&name);
+                    match f.bytes_async().await.and_then(|b| crate::storage::write(&path, &b).map_err(|e| e.to_string())) {
+                        Ok(()) => paths.push(path),
+                        Err(e) => log::error!("dropped {name}: {e}"),
+                    }
+                }
+                if !paths.is_empty() {
+                    let _ = tx.send(Action::DropImages(paths, at));
+                    ctx.request_repaint();
+                }
+            });
+        }
+    }
+
     pub fn canvas_ui(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::canvas_bg());
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -867,6 +913,7 @@ impl BioCartoon {
             self.draw_guides(&painter, rect, &xf);
             painter.text(page_s.left_top() + Vec2::new(0.0, -8.0), egui::Align2::LEFT_BOTTOM, self.doc.size_label(), FontId::proportional(11.0), theme::text_dim());
             self.draw_rulers(&painter, rect, &xf);
+            self.image_drop(ui, rect, page_s, &xf, &painter);
 
             // Interaction
             self.canvas_interaction(ui, &response, rect, &xf);
@@ -1586,6 +1633,10 @@ impl BioCartoon {
             [it] => self.item_credit(it).map(|(title, _)| (Some(it.id), Some(title))).unwrap_or_default(),
             _ => (None, None),
         };
+        let asset_id = match items[..] {
+            [it] => self.item_asset_id(it),
+            _ => None,
+        };
         let mut acts: Vec<Action> = Vec::new();
         let mut item = |ui: &mut egui::Ui, enabled: bool, icon: &str, label: &str, shortcut: &str, act: Action| {
             let b = egui::Button::new(format!("{icon}  {label}")).shortcut_text(shortcut);
@@ -1636,6 +1687,13 @@ impl BioCartoon {
         item(ui, single_image, ph::SPARKLE, "AI", "", Action::OpenAiEdit);
         self.actions.extend(acts);
         ui.separator();
+        let fav = asset_id.as_ref().is_some_and(|id| self.settings.favorites.contains(id));
+        let tip = if asset_id.is_some() { "Favorites are listed in the Icons panel" } else { "Only library artwork can be a favorite" };
+        let b = egui::Button::new(format!("{}  {}", ph::STAR, if fav { "Unfavorite" } else { "Favorite" }));
+        if ui.add_enabled(asset_id.is_some(), b).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+            self.actions.extend(asset_id.map(Action::ToggleFavorite));
+            ui.close();
+        }
         let tip = if icon_name.is_some() { "Copy this icon's name to the clipboard" } else { "Only library artwork has a name" };
         if ui.add_enabled(icon_name.is_some(), egui::Button::new(format!("{}  Copy name", ph::COPY))).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
             ui.ctx().copy_text(icon_name.unwrap_or_default());
@@ -1674,7 +1732,7 @@ impl BioCartoon {
         let Some(it) = self.item(g.id).cloned() else { return };
         let ItemKind::Image { source, .. } = &it.kind else { return };
         let state = match source {
-            crate::doc::ImageSource::Asset { key, .. } => self.images.asset(key, None),
+            crate::doc::ImageSource::Asset { key, svg, .. } => self.images.asset_image(key, svg.as_deref(), None),
             crate::doc::ImageSource::File { path, .. } => self.images.file(path),
         };
         let (f, full) = (g.frame, g.full);

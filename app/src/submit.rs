@@ -51,21 +51,40 @@ pub fn submit(url: &str, parts: &[Part]) -> Result<String, String> {
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    post(url, &boundary, body)
+    post(url, "submit", &format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// A request for an icon or template the library lacks, sent to `<url>/suggest`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Suggestion {
+    /// "icon" or "template".
+    pub kind: &'static str,
+    pub title: String,
+    pub description: String,
+    pub name: String,
+}
+
+/// POST a suggestion; returns its id.
+pub fn suggest(url: &str, s: &Suggestion) -> Result<String, String> {
+    if cfg!(target_arch = "wasm32") {
+        return Err("Sending suggestions isn't available in the web version yet.".into());
+    }
+    let body = serde_json::to_vec(s).map_err(|e| e.to_string())?;
+    post(url, "suggest", "application/json", body)
 }
 
 /// Web build: submissions run inside blocking jobs, which the browser can't do yet.
 #[cfg(target_arch = "wasm32")]
-fn post(_url: &str, _boundary: &str, _body: Vec<u8>) -> Result<String, String> {
+fn post(_url: &str, _path: &str, _content_type: &str, _body: Vec<u8>) -> Result<String, String> {
     Err("Submitting to the shared library isn't available in the web version yet; it was saved to your own library.".into())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn post(url: &str, boundary: &str, body: Vec<u8>) -> Result<String, String> {
+fn post(url: &str, path: &str, content_type: &str, body: Vec<u8>) -> Result<String, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(120))).http_status_as_error(false).build().into();
     let mut res = agent
-        .post(&format!("{}/submit", url.trim_end_matches('/')))
-        .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .post(&format!("{}/{path}", url.trim_end_matches('/')))
+        .header("Content-Type", content_type)
         .send(&body[..])
         .map_err(|e| format!("Couldn't reach the submission server: {e}"))?;
     let status = res.status();

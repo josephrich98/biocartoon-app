@@ -2,7 +2,7 @@
 
 use crate::ai::{AiClient, AiJob, AiOp, AiResult, BackendKind};
 use crate::assets::{ImageCache, ImgState};
-use crate::catalog::{cached_catalog, AssetRow, CatalogClient, CatalogSync, CategoryInfo, IconSort, Req, Resp, SourceInfo, StarUpdate, TaxonCount};
+use crate::catalog::{cached_catalog, AssetRow, CatalogClient, CatalogSync, CategoryInfo, Facets, Filter, IconSort, Req, Resp, SourceInfo, StarUpdate};
 use crate::stars::{StarsClient, StarsMsg};
 use crate::export::{ExportFormat, ExportOptions};
 use crate::doc::{CodeLang, CodeTheme, Document, ImageSource, Item, ItemId, ItemKind, LineKind, LineStyle, ShapeKind, Slide, TextAlign, TextFont, Unit, DPI};
@@ -39,6 +39,12 @@ pub struct Settings {
     pub ai_model: String,
     pub api_key: String,
     pub uploads: Vec<String>,
+    /// Ids of the assets the user starred (their favorites), most recent first. This is what
+    /// counts as "mine": the star counts on the Worker follow it (see `pending_stars`).
+    pub favorites: Vec<String>,
+    /// Star changes the Worker has not confirmed yet (asset id, starred), sent again when it can
+    /// be reached, so favorites work offline.
+    pub pending_stars: Vec<(String, bool)>,
     pub grid_snap: bool,
     /// Moved and resized items snap to guides.
     pub guide_snap: bool,
@@ -52,6 +58,14 @@ pub struct Settings {
     pub text_size: theme::TextSize,
     /// The Icons panel on the left is open.
     pub show_icons: bool,
+    /// Number of tile columns in the Icons panel (1 to 5).
+    pub icon_columns: usize,
+    /// Icon tiles show their database's badge (lower left).
+    pub tile_database: bool,
+    /// Icon tiles that come in several colours show a colour wheel (lower right).
+    pub tile_colors: bool,
+    /// Icon tiles show their star count (lower right).
+    pub tile_stars: bool,
     pub export: ExportOptions,
     pub home_sort: SortKey,
     pub home_ascending: bool,
@@ -88,6 +102,8 @@ impl Default for Settings {
             ai_model: BackendKind::OpenAi.models()[0].into(),
             api_key: String::new(),
             uploads: Vec::new(),
+            favorites: Vec::new(),
+            pending_stars: Vec::new(),
             grid_snap: false,
             guide_snap: true,
             show_grid: false,
@@ -97,6 +113,10 @@ impl Default for Settings {
             theme: theme::ThemeMode::System,
             text_size: theme::TextSize::Medium,
             show_icons: true,
+            icon_columns: 3,
+            tile_database: true,
+            tile_colors: true,
+            tile_stars: true,
             export: ExportOptions::default(),
             home_sort: SortKey::LastOpened,
             home_ascending: false,
@@ -188,13 +208,16 @@ pub enum IconsMode {
     Home,
     Search,
     Generate,
-    Categories,
-    Databases,
-    UserGenerated,
+    /// Icons the user starred as favorites (kept in [`Settings::favorites`]).
+    Favorites,
+    /// "Your library": the user's own uploads and saved templates.
+    Library,
     /// Image files from this computer.
     Uploads,
     /// Pick uploads and slides to submit to the shared library.
     Contribute,
+    /// Ask the BioCartoon team for an icon or template.
+    Suggest,
 }
 
 /// What a browse or search shows: catalog icons, saved templates, or both.
@@ -222,19 +245,47 @@ impl Include {
     }
 }
 
-/// A choice in a browse menu: the "All" row, or one named entry.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Pick {
-    All,
-    One(String),
+/// The filters under the search box's funnel. Each one keeps what matches any of its entries
+/// (none keeps everything), and a result has to pass all of them.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SearchFilter {
+    pub sources: Vec<String>,
+    /// Parts of author names, separated by commas.
+    pub authors: String,
+    /// Categories of `crate::taxonomy`.
+    pub cats: Vec<String>,
+    /// (category, subcategory) of `crate::taxonomy`: narrows its category to these subcategories.
+    pub subs: Vec<(String, String)>,
+    /// A database's own categories: (database, category), shown as "BA: Viruses".
+    pub db_cats: Vec<(String, String)>,
+    pub licenses: Vec<String>,
 }
 
-impl Pick {
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Pick::All => None,
-            Pick::One(s) => Some(s),
+impl SearchFilter {
+    pub fn authors(&self) -> Vec<String> {
+        self.authors.split(',').map(|a| a.trim().to_lowercase()).filter(|a| !a.is_empty()).collect()
+    }
+
+    /// How many of the filters are set.
+    pub fn active(&self) -> usize {
+        [!self.sources.is_empty(), !self.authors().is_empty(), !self.cats.is_empty() || !self.subs.is_empty(), !self.db_cats.is_empty(), !self.licenses.is_empty()]
+            .iter()
+            .filter(|&&on| on)
+            .count()
+    }
+
+    /// The catalog's form: a category with some of its subcategories picked is just those.
+    pub fn catalog(&self) -> Filter {
+        let mut taxa = Vec::new();
+        for (cat, _) in crate::taxonomy::TAXONOMY {
+            let subs: Vec<_> = self.subs.iter().filter(|(c, _)| c == cat).cloned().collect();
+            if !subs.is_empty() {
+                taxa.extend(subs);
+            } else if self.cats.iter().any(|c| c == cat) {
+                taxa.push((cat.to_string(), String::new()));
+            }
         }
+        Filter { sources: self.sources.clone(), authors: self.authors(), licenses: self.licenses.clone(), taxa, db_cats: self.db_cats.clone() }
     }
 }
 
@@ -245,8 +296,10 @@ pub struct IconsState {
     pub mode: IconsMode,
     pub query: String,
     pub last_sent_query: String,
-    /// Search: the databases to search; empty searches them all.
-    pub source_filter: Vec<String>,
+    pub filter: SearchFilter,
+    pub last_sent_filter: SearchFilter,
+    /// The filters are open under the search box.
+    pub show_filters: bool,
     pub results: Vec<AssetRow>,
     /// How many colours the `results` that come in several have, by result id (the others are
     /// picked in Edit once one is placed).
@@ -255,16 +308,11 @@ pub struct IconsState {
     pub more: bool,
     /// Every match of the current search or browse, not just the loaded `results`.
     pub total: Option<i64>,
-    /// Browse databases: the database, then one of its own categories.
-    pub db: Option<String>,
-    pub db_cat: Option<Pick>,
-    /// Browse categories: one of BioCartoon's categories, then a subcategory
-    /// (see `crate::taxonomy`), and the databases to show (empty shows them all).
-    pub taxon_cat: Option<Pick>,
-    pub taxon_sub: Option<Pick>,
-    pub taxon_filter: Vec<String>,
-    pub taxa: Option<Vec<TaxonCount>>,
-    pub taxa_req: u64,
+    /// The filters' choices that find icons, for their dropdowns (kept while newer ones load).
+    pub facets: Option<Facets>,
+    /// The filter `facets` are for (or are loading for); `None` loads them again.
+    pub facets_for: Option<SearchFilter>,
+    pub facets_req: u64,
     pub browse_offset: usize,
     pub categories: HashMap<String, Vec<CategoryInfo>>,
     pub sources: Vec<SourceInfo>,
@@ -280,19 +328,17 @@ impl Default for IconsState {
             mode: IconsMode::Home,
             query: String::new(),
             last_sent_query: "\u{0}".into(),
-            source_filter: Vec::new(),
+            filter: SearchFilter::default(),
+            last_sent_filter: SearchFilter::default(),
+            show_filters: false,
             results: Vec::new(),
             colors: HashMap::new(),
             results_req: 0,
             more: false,
             total: None,
-            db: None,
-            db_cat: None,
-            taxon_cat: None,
-            taxon_sub: None,
-            taxon_filter: Vec::new(),
-            taxa: None,
-            taxa_req: 0,
+            facets: None,
+            facets_for: None,
+            facets_req: 0,
             browse_offset: 0,
             categories: HashMap::new(),
             sources: Vec::new(),
@@ -319,6 +365,8 @@ pub enum UploadTarget {
     Generated,
     /// An image file (from the Uploads tab).
     File(PathBuf),
+    /// An icon of the user's library (with a local copy); the new copy replaces it.
+    Library(Box<AssetRow>),
     /// A slide, as a template.
     Template(Box<TemplateSlide>),
 }
@@ -330,6 +378,25 @@ pub struct TemplateSlide {
     pub width: f32,
     pub height: f32,
     pub background: [u8; 4],
+    /// The saved template this is, when it comes from the user's library: its details fill in
+    /// the library dialog, and the new copy replaces it.
+    pub saved: Option<TemplateMeta>,
+}
+
+impl UploadTarget {
+    /// The image file of an upload or library icon.
+    pub fn image_path(&self) -> Option<String> {
+        match self {
+            UploadTarget::File(p) => Some(p.display().to_string()),
+            UploadTarget::Library(row) => row.png_local.clone(),
+            _ => None,
+        }
+    }
+}
+
+/// Read and decode an image to add to the library.
+fn read_image(p: &Path) -> Result<image::RgbaImage, String> {
+    crate::storage::read(p).map_err(|e| e.to_string()).and_then(|b| crate::assets::load_image(&b, crate::submit::MAX_IMAGE_SIDE)).map_err(|e| format!("{}: {e}", p.display()))
 }
 
 impl TemplateSlide {
@@ -338,11 +405,25 @@ impl TemplateSlide {
     }
 }
 
+/// The Icons panel's "Submit a suggestion" form.
+#[derive(Default)]
+pub struct SuggestState {
+    pub template: bool,
+    pub title: String,
+    pub description: String,
+    pub name: String,
+    pub busy: bool,
+}
+
 /// The Icons panel's "Contribute artwork" page: what is picked to submit.
 #[derive(Default)]
 pub struct ContributeState {
     /// Picked uploads, by path.
     pub icons: HashSet<String>,
+    /// Picked icons of the user's library, by id.
+    pub library: HashSet<String>,
+    /// Picked templates of the user's library, by id.
+    pub library_templates: HashSet<String>,
     /// Picked slides of the open document, by index.
     pub slides: HashSet<usize>,
     /// Slides from .biocartoon files picked under Templates (kept for this session).
@@ -376,9 +457,13 @@ pub struct UploadDialog {
 /// Results of library work done on worker threads.
 pub enum LibraryMsg {
     /// A submitted asset: its local row, and the submission id or the error.
-    AssetSubmitted { row: AssetRow, result: Result<String, String> },
-    TemplateSaved(crate::templates::SaveResult),
+    /// A submitted asset, the submission's id or error, and the library icon it replaces.
+    AssetSubmitted { row: AssetRow, result: Result<String, String>, replaces: Option<String> },
+    /// A saved template, and the library template it replaces.
+    TemplateSaved(crate::templates::SaveResult, Option<String>),
     TemplateLoaded(Result<TemplateFile, String>, bool),
+    /// A sent suggestion: its title, and the id or the error.
+    SuggestionSent(String, Result<String, String>),
 }
 
 /// The Page panel's own state; the page's size, unit and colour live in the document.
@@ -440,9 +525,10 @@ pub enum ArrangeKind {
 pub enum Action {
     InsertAsset(AssetRow),
     /// Add or remove this install's star on an asset.
-    ToggleStar(AssetRow),
     /// Remove one of the user's own assets from their library (its PNG stays on disk).
     RemoveUserAsset(AssetRow),
+    /// Star the asset with this id (add it to Favorites), or take the star back.
+    ToggleFavorite(String),
     InsertFile(PathBuf),
     InsertText { text: String, size: f32, bold: bool },
     /// Arm (or disarm) the Text tool: the next click on the canvas places a text box.
@@ -517,11 +603,17 @@ pub enum Action {
     BackupAll,
     /// Images picked for the Uploads panel.
     AddUploads(Vec<PathBuf>),
+    /// Images dropped on the canvas: added to Uploads and placed on the page, centred on the
+    /// drop point (page coordinates) when there is one.
+    DropImages(Vec<PathBuf>, Option<Pos2>),
     /// Ask for .biocartoon files whose slides to offer under Contribute artwork > Templates.
     PickTemplateFiles,
     AddTemplateFiles(Vec<PathBuf>),
     /// Open the library dialog for everything picked under Contribute artwork, one at a time.
     ContributeSelected,
+    /// Open Submit a suggestion, with this title when it is not empty.
+    OpenSuggest(String),
+    SubmitSuggestion,
     AddSlide,
     DuplicateSlide(usize),
     DeleteSlide(usize),
@@ -551,11 +643,20 @@ pub struct BioCartoon {
     pub future: Vec<(Document, usize)>,
     pub clipboard: Vec<Item>,
     pub paste_count: u32,
+    /// The primary button went down with Ctrl held on macOS, so it is being treated as a right click.
+    ctrl_click: bool,
+    /// A paste event came in since ⌘V went down. With an image on the system clipboard there is
+    /// none, so the key's release pastes instead.
+    pasted: bool,
     pub rail: Option<RailTab>,
     pub icons: IconsState,
     pub generate: GenerateState,
     pub catalog: CatalogClient,
     pub stars: StarsClient,
+    /// Assets whose star change is on its way to the Worker.
+    pub stars_in_flight: HashSet<String>,
+    /// The stars from before favorites were kept in Settings have been carried over.
+    stars_migrated: bool,
     /// Web: the optional account that keeps projects online.
     pub account: crate::account::Account,
     pub images: ImageCache,
@@ -610,7 +711,7 @@ pub struct BioCartoon {
     pub home: HomeState,
     thumb_tx: std::sync::mpsc::Sender<ThumbDone>,
     /// Actions from callbacks that finish later (file pickers in the browser).
-    action_tx: std::sync::mpsc::Sender<Action>,
+    pub(crate) action_tx: std::sync::mpsc::Sender<Action>,
     action_rx: std::sync::mpsc::Receiver<Action>,
     thumb_rx: std::sync::mpsc::Receiver<ThumbDone>,
     /// Cache keys of thumbnails being rendered.
@@ -642,6 +743,7 @@ pub struct BioCartoon {
     pub pending_edits: HashMap<ItemId, String>,
     pub upload_dialog: Option<UploadDialog>,
     pub contribute: ContributeState,
+    pub suggest: SuggestState,
     pub upload_rate: RateLimit,
     pub templates: TemplateStore,
     pub template_rows: Vec<TemplateRow>,
@@ -732,11 +834,15 @@ impl BioCartoon {
             future: Vec::new(),
             clipboard: Vec::new(),
             paste_count: 0,
+            ctrl_click: false,
+            pasted: false,
             rail: Some(RailTab::Slides),
             icons: IconsState::default(),
             generate: GenerateState::default(),
             catalog: CatalogClient::new(PathBuf::new(), PathBuf::new()),
             stars: StarsClient::new(Some(cc.egui_ctx.clone())),
+            stars_in_flight: HashSet::new(),
+            stars_migrated: false,
             account: crate::account::Account::new(app_dir.join("account.json"), cc.egui_ctx.clone()),
             catalog_sync: None,
             offline: Default::default(),
@@ -799,6 +905,7 @@ impl BioCartoon {
             pending_edits: HashMap::new(),
             upload_dialog: None,
             contribute: ContributeState::default(),
+            suggest: SuggestState::default(),
             upload_rate: RateLimit::default(),
             template_rows: templates.list(),
             templates,
@@ -844,10 +951,13 @@ impl BioCartoon {
         self.credit_lookups.clear();
         self.icons.categories.clear();
         self.icons.sources.clear();
-        self.icons.taxa = None;
+        self.icons.facets = None;
+        self.icons.facets_for = None;
         self.icons.last_sent_query = "\u{0}".into(); // re-run the current search
         if self.catalog.ok {
             self.catalog.send(Req::Sources);
+            // For the library dialog's category suggestions.
+            self.catalog.send(Req::Categories { source: "user".into() });
         }
     }
 
@@ -858,12 +968,22 @@ impl BioCartoon {
             Some(Ok(Some(path))) => {
                 log::info!("catalog updated: {}", path.display());
                 self.load_catalog(path);
+                if std::mem::take(&mut self.offline.syncing) {
+                    self.toast("Icon catalog updated");
+                }
             }
-            Some(Ok(None)) => {}
+            Some(Ok(None)) => {
+                if std::mem::take(&mut self.offline.syncing) {
+                    self.toast("Icon catalog is up to date");
+                }
+            }
             Some(Err(e)) => {
                 log::warn!("catalog sync: {e}");
                 if !self.catalog.ok {
                     self.catalog.status = format!("Couldn't download the icon catalog ({e}).");
+                }
+                if std::mem::take(&mut self.offline.syncing) {
+                    self.toast_err(format!("Couldn't check the icon catalog ({e})"));
                 }
             }
         }
@@ -1111,6 +1231,7 @@ impl BioCartoon {
         ImageSource::Asset {
             id: row.id.clone(),
             key: row.png_key.clone(),
+            svg: row.svg_key.clone(),
             title: row.title.clone(),
             source: row.source.clone(),
             credit: row.credit.clone(),
@@ -1158,7 +1279,17 @@ impl BioCartoon {
                 let s = target / w.max(h);
                 Vec2::new(w * s, h * s)
             }
-            _ => Vec2::splat(self.doc.width.min(self.doc.height) * 0.3),
+            // Not decoded yet (e.g. just dropped): read the header for the aspect ratio.
+            _ => {
+                let target = (self.doc.width.min(self.doc.height) * 0.3).max(60.0);
+                match crate::storage::read(path).ok().and_then(|b| crate::assets::image_size(&b)) {
+                    Some((w, h)) if w > 0.0 && h > 0.0 => {
+                        let s = target / w.max(h);
+                        Vec2::new(w * s, h * s)
+                    }
+                    _ => Vec2::splat(target),
+                }
+            }
         };
         let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Image".into());
         let id = self.doc.alloc_id();
@@ -1168,6 +1299,29 @@ impl BioCartoon {
             overlay: [255, 255, 255, 0],
         };
         self.insert_item(Item::new(id, name, kind, Pos2::ZERO, size));
+    }
+
+    /// Images dropped on the canvas: remembered in Uploads and placed on the page, fanned out
+    /// around `at` when given, then all selected.
+    fn drop_images(&mut self, files: &[PathBuf], at: Option<Pos2>) {
+        let mut placed = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let s = f.display().to_string();
+            if !self.settings.uploads.contains(&s) {
+                self.settings.uploads.push(s);
+            }
+            self.insert_file(f);
+            let Some(&id) = self.selection.first() else { continue };
+            placed.push(id);
+            if let Some(p) = at {
+                let off = i as f32 * 12.0;
+                if let Some(item) = self.item_mut(id) {
+                    let size = item.rect().size();
+                    item.pos = [p.x - size.x / 2.0 + off, p.y - size.y / 2.0 + off];
+                }
+            }
+        }
+        self.selection = placed;
     }
 
     pub fn delete_selection(&mut self) {
@@ -1188,9 +1342,30 @@ impl BioCartoon {
         self.close_edit_tab();
     }
 
+    /// Copies the selection to the app's clipboard and, as a picture, to the system clipboard.
     pub fn copy_selection(&mut self) {
         self.clipboard = self.selected_items().into_iter().cloned().collect();
         self.paste_count = 0;
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let mut cached = HashMap::new();
+        for it in &self.clipboard {
+            if let ItemKind::Image { source, .. } = &it.kind {
+                let key = source.cache_key();
+                if let Some(img) = self.images.cpu_image(&key) {
+                    cached.insert(key, img);
+                }
+            }
+        }
+        let items: Vec<&Item> = self.clipboard.iter().collect();
+        match crate::export::snapshot(&self.ctx, &items, &cached, 4096) {
+            Ok(img) => {
+                let (w, h) = img.dimensions();
+                self.ctx.copy_image(egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw()));
+            }
+            Err(e) => log::warn!("copy: {e}"),
+        }
     }
 
     pub fn paste(&mut self) {
@@ -1223,7 +1398,8 @@ impl BioCartoon {
         }
         let keep = self.clipboard.clone();
         let keep_count = self.paste_count;
-        self.copy_selection();
+        self.clipboard = self.selected_items().into_iter().cloned().collect();
+        self.paste_count = 0;
         self.paste();
         self.clipboard = keep;
         self.paste_count = keep_count;
@@ -1522,7 +1698,7 @@ impl BioCartoon {
                         self.icons.total = Some(total);
                         self.fetch_stars(&rows);
                         if self.icons.browse_offset > 0
-                            && matches!(self.icons.mode, IconsMode::Search | IconsMode::Categories | IconsMode::Databases | IconsMode::UserGenerated)
+                            && matches!(self.icons.mode, IconsMode::Search | IconsMode::Library)
                         {
                             self.icons.results.extend(rows);
                             self.icons.colors.extend(colors);
@@ -1536,9 +1712,9 @@ impl BioCartoon {
                 Resp::Categories { source, cats, .. } => {
                     self.icons.categories.insert(source, cats);
                 }
-                Resp::Taxonomy { req_id, counts } => {
-                    if req_id == self.icons.taxa_req {
-                        self.icons.taxa = Some(counts);
+                Resp::Facets { req_id, facets } => {
+                    if req_id == self.icons.facets_req {
+                        self.icons.facets = Some(facets);
                     }
                 }
                 Resp::Sources { mut sources, .. } => {
@@ -1546,7 +1722,13 @@ impl BioCartoon {
                     sources.sort_by_key(|s| theme::source_badge(&s.source).0);
                     self.icons.sources = sources;
                     self.catalog.ok = true;
+                    if !self.stars_migrated {
+                        self.stars_migrated = true;
+                        self.catalog.send(Req::MyStars);
+                        self.sync_stars();
+                    }
                 }
+                Resp::MyStars { ids, .. } => self.adopt_stars(ids),
                 Resp::Variants { req_id, rows } => {
                     if req_id == self.variants_req {
                         self.fetch_stars(&rows);
@@ -1563,12 +1745,10 @@ impl BioCartoon {
                     Ok(()) => {
                         // Counts changed; the asset may also belong in (or leave) what's on screen.
                         self.icons.categories.remove("user");
+                        self.catalog.send(Req::Categories { source: "user".into() });
                         self.catalog.send(Req::Sources);
-                        self.icons.taxa = None;
-                        if self.icons.mode == IconsMode::Categories {
-                            self.request_taxa();
-                        }
-                        if matches!(self.icons.mode, IconsMode::UserGenerated | IconsMode::Categories | IconsMode::Databases) {
+                        self.icons.facets_for = None;
+                        if matches!(self.icons.mode, IconsMode::Library | IconsMode::Favorites | IconsMode::Contribute) {
                             self.icons.browse_offset = 0;
                             self.request_browse();
                         }
@@ -1605,15 +1785,41 @@ impl BioCartoon {
     fn poll_stars(&mut self) {
         for m in self.stars.poll() {
             match m {
-                StarsMsg::Counts(updates) => self.apply_stars(updates),
-                StarsMsg::Toggled(Ok(u)) => self.apply_stars(vec![u]),
-                StarsMsg::Toggled(Err((id, wanted, e))) => {
-                    // Undo the optimistic change.
-                    if let Some(r) = self.icons.results.iter().chain(&self.variants).find(|r| r.id == id) {
-                        let u = StarUpdate { id, n: (r.stars - if wanted { 1 } else { -1 }).max(0), mine: !wanted };
-                        self.apply_stars(vec![u]);
+                StarsMsg::Counts(updates) => {
+                    self.adopt_stars(updates.iter().filter(|u| u.mine).map(|u| u.id.clone()).collect());
+                    self.apply_stars(updates);
+                    // The Worker answers again: send what waited for it.
+                    if self.stars_in_flight.is_empty() && !self.settings.pending_stars.is_empty() {
+                        self.sync_stars();
                     }
-                    self.toast_err(format!("Couldn't {} the star: {e}", if wanted { "add" } else { "remove" }));
+                }
+                StarsMsg::Toggled(Ok(u)) => {
+                    self.stars_in_flight.remove(&u.id);
+                    match self.settings.pending_stars.iter().position(|(p, _)| *p == u.id) {
+                        // Changed again while this one was on its way: send the latest.
+                        Some(i) if self.settings.pending_stars[i].1 != u.mine => self.sync_stars(),
+                        Some(i) => {
+                            self.settings.pending_stars.remove(i);
+                        }
+                        None => {}
+                    }
+                    let mine = self.settings.favorites.contains(&u.id);
+                    self.apply_stars(vec![StarUpdate { mine, ..u }]);
+                }
+                StarsMsg::Toggled(Err((id, wanted, e))) => {
+                    self.stars_in_flight.remove(&id);
+                    if e.starts_with("Couldn't reach") || e.starts_with("The submission server answered") {
+                        // Offline: it stays pending, and goes once the Worker answers again.
+                    } else if e.starts_with("Limit reached") {
+                        self.toast_err(format!("Your star is saved in Favorites and will be counted later. {e}"));
+                    } else {
+                        // Not on the server (one of the user's own uploads), or refused: the
+                        // favorite stays, uncounted.
+                        self.settings.pending_stars.retain(|(p, _)| *p != id);
+                        if e != "No such asset" {
+                            log::warn!("star {id} ({wanted}): {e}");
+                        }
+                    }
                 }
             }
         }
@@ -1630,33 +1836,69 @@ impl BioCartoon {
         self.catalog.send(Req::SetStars { updates });
     }
 
-    fn toggle_star(&mut self, row: &AssetRow) {
-        let Some(url) = self.submit_url() else {
-            self.toast_err("Starring needs the submission server (Settings > Library)");
-            return;
-        };
-        if row.id.is_empty() || row.png_key.is_empty() {
+    /// Star the asset `id` (add it to Favorites), or take the star back. Favorites are kept in
+    /// Settings, so this works offline; the Worker's count follows now, or once it can be reached.
+    fn toggle_favorite(&mut self, id: String) {
+        if id.is_empty() {
             return;
         }
-        let on = !row.starred;
-        // Shown right away; the Worker's answer (or an error) corrects it.
-        self.apply_stars(vec![StarUpdate { id: row.id.clone(), n: (row.stars + if on { 1 } else { -1 }).max(0), mine: on }]);
-        self.stars.toggle(&url, &self.settings.client_id, row.id.clone(), on);
+        let on = !self.settings.favorites.contains(&id);
+        if on {
+            self.settings.favorites.insert(0, id.clone());
+        } else {
+            self.settings.favorites.retain(|f| *f != id);
+        }
+        // The count is shown right away; the Worker's answer corrects it.
+        if let Some(r) = self.icons.results.iter().chain(&self.variants).find(|r| r.id == id) {
+            let u = StarUpdate { id: id.clone(), n: (r.stars + if on { 1 } else { -1 }).max(0), mine: on };
+            self.apply_stars(vec![u]);
+        }
+        if self.icons.mode == IconsMode::Favorites {
+            if on {
+                self.reload_results();
+            } else {
+                self.icons.results.retain(|r| r.id != id);
+                self.icons.total = Some(self.icons.results.len() as i64);
+            }
+        }
+        self.settings.pending_stars.retain(|(p, _)| *p != id);
+        self.settings.pending_stars.push((id, on));
+        self.sync_stars();
+    }
+
+    /// Send the star changes the Worker has not confirmed yet, one request per asset at a time.
+    fn sync_stars(&mut self) {
+        let Some(url) = self.submit_url() else { return };
+        for (id, on) in self.settings.pending_stars.clone() {
+            if self.stars_in_flight.insert(id.clone()) {
+                self.stars.toggle(&url, &self.settings.client_id, id, on);
+            }
+        }
+    }
+
+    /// Stars this install gave (by the Worker or the usage file) become favorites, unless a
+    /// change of the user's own is still on its way.
+    fn adopt_stars(&mut self, ids: Vec<String>) {
+        for id in ids {
+            if !self.settings.favorites.contains(&id) && !self.settings.pending_stars.iter().any(|(p, _)| *p == id) {
+                self.settings.favorites.push(id);
+            }
+        }
     }
 
     pub fn request_search(&mut self) {
         self.icons.browse_offset = 0;
         self.request_search_page();
         self.icons.last_sent_query = self.icons.query.clone();
+        self.icons.last_sent_filter = self.icons.filter.clone();
     }
 
     /// Load (or, past offset 0, extend) the results of the current search.
     fn request_search_page(&mut self) {
-        let sources = self.icons.source_filter.clone();
         self.icons.loading = true;
         self.icons.results_req = self.catalog.send(Req::Search {
             query: self.icons.query.clone(),
-            sources,
+            filter: self.icons.filter.catalog(),
             offset: self.icons.browse_offset,
             limit: RESULTS_PAGE,
             sort: self.settings.search_sort,
@@ -1680,34 +1922,40 @@ impl BioCartoon {
     pub fn request_browse(&mut self) {
         let (offset, sort) = (self.icons.browse_offset, self.settings.icon_sort);
         let req = match self.icons.mode {
-            IconsMode::Categories => {
-                if self.icons.taxon_cat.is_none() {
-                    return;
-                }
-                let name = |p: &Option<Pick>| p.as_ref().and_then(Pick::name).map(str::to_string);
-                Req::BrowseTaxon {
-                    cat: name(&self.icons.taxon_cat),
-                    sub: name(&self.icons.taxon_sub),
-                    sources: self.icons.taxon_filter.clone(),
-                    offset,
-                    limit: RESULTS_PAGE,
-                    sort,
-                }
-            }
-            IconsMode::UserGenerated => Req::Browse { source: "user".into(), category: None, offset, limit: RESULTS_PAGE, sort },
-            _ => {
-                let (Some(source), Some(cat)) = (self.icons.db.clone(), self.icons.db_cat.clone()) else { return };
-                Req::Browse { source, category: cat.name().map(str::to_string), offset, limit: RESULTS_PAGE, sort }
-            }
+            IconsMode::Library => Req::Library { offset, limit: RESULTS_PAGE, sort },
+            // All of the library at once, to pick from.
+            IconsMode::Contribute => Req::Library { offset: 0, limit: 10_000, sort },
+            IconsMode::Favorites if offset == 0 => Req::Favorites { ids: self.settings.favorites.clone() },
+            _ => return,
         };
         self.icons.loading = true;
         self.icons.results_req = self.catalog.send(req);
     }
 
-    /// Ask for the icon counts of BioCartoon's categories under the current database filter.
-    pub fn request_taxa(&mut self) {
-        self.icons.taxa = None;
-        self.icons.taxa_req = self.catalog.send(Req::Taxonomy { sources: self.icons.taxon_filter.clone() });
+    /// Ask which of the filters' choices find icons under the current filter.
+    pub fn request_facets(&mut self) {
+        self.icons.facets_for = Some(self.icons.filter.clone());
+        self.icons.facets_req = self.catalog.send(Req::Facets { filter: self.icons.filter.catalog() });
+    }
+
+    /// The Icons panel's Contribute artwork page, with the library's icons to pick from.
+    pub fn open_contribute(&mut self) {
+        self.icons.mode = IconsMode::Contribute;
+        self.icons.results.clear();
+        self.icons.total = None;
+        self.icons.browse_offset = 0;
+        self.request_browse();
+    }
+
+    /// Search one database: from the Databases list on the Icons panel's start.
+    pub fn search_database(&mut self, source: &str) {
+        self.icons.mode = IconsMode::Search;
+        self.icons.query.clear();
+        self.icons.filter = SearchFilter { sources: vec![source.to_string()], ..SearchFilter::default() };
+        self.icons.show_filters = true;
+        self.icons.results.clear();
+        self.icons.total = None;
+        self.request_search();
     }
 
     /// Re-run whatever produced the current results (after the sort order changed).
@@ -1787,7 +2035,7 @@ impl BioCartoon {
     /// Slide `i` of the open document, to save as a template.
     pub fn template_target(&self, i: usize) -> UploadTarget {
         let slide = self.doc.slides.get(i).cloned().unwrap_or_default();
-        UploadTarget::Template(Box::new(TemplateSlide { slide, width: self.doc.width, height: self.doc.height, background: self.doc.background }))
+        UploadTarget::Template(Box::new(TemplateSlide { slide, width: self.doc.width, height: self.doc.height, background: self.doc.background, saved: None }))
     }
 
     pub fn open_upload_dialog(&mut self, target: UploadTarget) {
@@ -1801,16 +2049,20 @@ impl BioCartoon {
             return;
         }
         let target = targets.remove(0);
-        let name = match &target {
-            UploadTarget::Generated => self.generate.result_prompt.chars().take(60).collect(),
-            UploadTarget::File(p) => p.file_stem().map(|s| s.to_string_lossy().replace(['_', '-'], " ")).unwrap_or_default(),
-            UploadTarget::Template(t) => t.slide.name.clone(),
+        let (name, category, description) = match &target {
+            UploadTarget::Generated => (self.generate.result_prompt.chars().take(60).collect(), String::new(), String::new()),
+            UploadTarget::File(p) => (p.file_stem().map(|s| s.to_string_lossy().replace(['_', '-'], " ")).unwrap_or_default(), String::new(), String::new()),
+            UploadTarget::Library(row) => (row.title.clone(), row.category.clone(), String::new()),
+            UploadTarget::Template(t) => match &t.saved {
+                Some(m) => (m.title.clone(), m.category.clone(), m.description.clone()),
+                None => (t.slide.name.clone(), String::new(), String::new()),
+            },
         };
         self.upload_dialog = Some(UploadDialog {
             target,
             name,
-            category: String::new(),
-            description: String::new(),
+            category,
+            description,
             license,
             share: self.submit_url().is_some(),
             credit: self.settings.contributor_name.clone(),
@@ -1825,12 +2077,23 @@ impl BioCartoon {
     fn contribute_selected(&mut self) {
         let c = std::mem::take(&mut self.contribute.icons);
         let mut targets: Vec<UploadTarget> = self.settings.uploads.iter().filter(|p| c.contains(*p)).map(|p| UploadTarget::File(p.into())).collect();
+        let lib = std::mem::take(&mut self.contribute.library);
+        targets.extend(self.icons.results.iter().filter(|r| r.png_local.is_some() && lib.contains(&r.id)).map(|r| UploadTarget::Library(Box::new(r.clone()))));
         let mut slides: Vec<usize> = std::mem::take(&mut self.contribute.slides).into_iter().filter(|&i| i < self.doc.slides.len()).collect();
         slides.sort_unstable();
         targets.extend(slides.into_iter().map(|i| self.template_target(i)));
         let mut picked: Vec<usize> = std::mem::take(&mut self.contribute.picked_templates).into_iter().collect();
         picked.sort_unstable();
         targets.extend(picked.into_iter().filter_map(|i| self.contribute.templates.get(i)).map(|t| UploadTarget::Template(Box::new(t.clone()))));
+        let saved = std::mem::take(&mut self.contribute.library_templates);
+        let rows: Vec<TemplateRow> = self.template_rows.iter().filter(|r| r.json_local.is_some() && saved.contains(&r.meta.id)).cloned().collect();
+        for row in &rows {
+            // A local file, so reading it here is quick.
+            match crate::templates::load(row, "") {
+                Ok(t) => targets.push(UploadTarget::Template(Box::new(TemplateSlide { slide: t.slide, width: t.width, height: t.height, background: t.background, saved: Some(row.meta.clone()) }))),
+                Err(e) => self.toast_err(format!("\"{}\": {e}", row.meta.title)),
+            }
+        }
         if targets.is_empty() {
             return self.toast("Pick icons or templates to add first");
         }
@@ -1845,7 +2108,7 @@ impl BioCartoon {
             match crate::storage::read(p).map_err(|e| e.to_string()).and_then(|b| crate::projects::from_file(&b, &uploads)) {
                 Ok(doc) => {
                     for slide in doc.slides.into_iter().filter(|s| !s.items.is_empty()) {
-                        self.contribute.templates.push(TemplateSlide { slide, width: doc.width, height: doc.height, background: doc.background });
+                        self.contribute.templates.push(TemplateSlide { slide, width: doc.width, height: doc.height, background: doc.background, saved: None });
                     }
                 }
                 Err(e) => failed.push(format!("{}: {e}", p.display())),
@@ -1939,8 +2202,13 @@ impl BioCartoon {
                         Some((img, _)) => Ok(img.clone()),
                         None => Err("Nothing generated yet".to_string()),
                     },
-                    UploadTarget::File(p) => image::open(p).map(|i| i.to_rgba8()).map_err(|e| format!("{}: {e}", p.display())),
+                    UploadTarget::File(p) => read_image(p),
+                    UploadTarget::Library(row) => read_image(Path::new(row.png_local.as_deref().unwrap_or_default())),
                     UploadTarget::Template(_) => unreachable!(),
+                };
+                let replaces = match target {
+                    UploadTarget::Library(row) => Some(row.id.clone()),
+                    _ => None,
                 };
                 let credit_line = match target {
                     UploadTarget::Generated => format!("\"{name}\" generated with BioCartoon. Prompt: {}", self.generate.result_prompt),
@@ -1961,11 +2229,12 @@ impl BioCartoon {
                     png_local: None,
                     png_width: 0,
                     png_height: 0,
+                    svg_key: None,
                     stars: 0,
                     starred: false,
                 };
                 match img {
-                    Ok(img) => self.upload_asset(img, row, share),
+                    Ok(img) => self.upload_asset(img, row, share, replaces),
                     Err(e) => self.toast_err(e),
                 }
             }
@@ -1974,10 +2243,44 @@ impl BioCartoon {
         self.open_upload_queue(d.queue, d.license, d.step.0 + 1);
     }
 
+    /// Send the Submit a suggestion form to the submissions Worker.
+    fn submit_suggestion(&mut self) {
+        let title: String = self.suggest.title.trim().chars().take(80).collect();
+        if title.is_empty() {
+            return self.toast_err("Give the suggestion a title first");
+        }
+        let Some(url) = self.submit_url() else {
+            return self.toast_err("No submission server is set up");
+        };
+        let now = self.ctx.input(|i| i.time);
+        if let Err(e) = self.upload_rate.try_take(now) {
+            return self.toast_err(e);
+        }
+        let name: String = self.suggest.name.trim().chars().take(60).collect();
+        if !name.is_empty() {
+            self.settings.contributor_name = name.clone();
+        }
+        let s = crate::submit::Suggestion {
+            kind: if self.suggest.template { "template" } else { "icon" },
+            title: title.clone(),
+            description: self.suggest.description.trim().chars().take(1000).collect(),
+            name,
+        };
+        self.suggest.busy = true;
+        let (tx, ctx) = (self.library_tx.clone(), self.ctx.clone());
+        self.library_busy += 1;
+        crate::platform::spawn("suggest", move || {
+            let _ = tx.send(LibraryMsg::SuggestionSent(title, crate::submit::suggest(&url, &s)));
+            ctx.request_repaint();
+        });
+    }
+
     /// Save an image as a user asset in the local catalog and, with `share`, submit it for review.
     /// The local row is added once the submission answers, under the server's id when accepted,
     /// so the approved copy published later replaces it instead of appearing twice.
-    fn upload_asset(&mut self, img: image::RgbaImage, mut row: AssetRow, share: Option<(String, SubmitMeta)>) {
+    /// Save an image to the library, and submit it if `share` says where. The library icon it
+    /// `replaces`, if any, is removed once the new one is in.
+    fn upload_asset(&mut self, img: image::RgbaImage, mut row: AssetRow, share: Option<(String, SubmitMeta)>, replaces: Option<String>) {
         let (png, w, h) = match crate::templates::encode_png(img) {
             Ok(v) => v,
             Err(e) => return self.toast_err(e),
@@ -1995,6 +2298,9 @@ impl BioCartoon {
         let Some((url, meta)) = share else {
             self.toast(format!("Added \"{}\" to your library", row.title));
             self.catalog.send(Req::InsertUser { row });
+            if let Some(id) = replaces {
+                self.catalog.send(Req::RemoveUser { id });
+            }
             return;
         };
         let (tx, ctx) = (self.library_tx.clone(), self.ctx.clone());
@@ -2004,7 +2310,7 @@ impl BioCartoon {
             let result = serde_json::to_string(&meta).map_err(|e| e.to_string()).and_then(|m| {
                 crate::submit::submit(&url, &[Part::Text("kind", "asset".into()), Part::Text("meta", m), Part::File("image", png, "image/png")])
             });
-            let _ = tx.send(LibraryMsg::AssetSubmitted { row, result });
+            let _ = tx.send(LibraryMsg::AssetSubmitted { row, result, replaces });
             ctx.request_repaint();
         });
     }
@@ -2040,6 +2346,7 @@ impl BioCartoon {
             thumb_key: format!("templates/{slug}/thumb.png"),
         };
         let (page, bg) = (t.page_rect(), t.background);
+        let replaces = t.saved.map(|m| m.id);
         let mut slide = t.slide;
         slide.name = meta.title.clone();
         let file = TemplateFile { meta: meta.clone(), width: t.width, height: t.height, background: t.background, slide };
@@ -2053,7 +2360,7 @@ impl BioCartoon {
         crate::platform::spawn("template-save", move || {
             let thumb = crate::export::thumbnail(&ctx, &file.slide, page, bg, &requests, &cached, 480);
             let res = crate::templates::save(crate::templates::SaveJob { meta, file, dir, thumb, submit });
-            let _ = tx.send(LibraryMsg::TemplateSaved(res));
+            let _ = tx.send(LibraryMsg::TemplateSaved(res, replaces));
             ctx.request_repaint();
         });
     }
@@ -2139,7 +2446,7 @@ impl BioCartoon {
         while let Ok(msg) = self.library_rx.try_recv() {
             self.library_busy = self.library_busy.saturating_sub(1);
             match msg {
-                LibraryMsg::AssetSubmitted { mut row, result } => {
+                LibraryMsg::AssetSubmitted { mut row, result, replaces } => {
                     let title = row.title.clone();
                     match result {
                         Ok(id) => {
@@ -2150,13 +2457,21 @@ impl BioCartoon {
                         Err(e) => self.toast_err(format!("\"{title}\" is in your library but was not submitted: {e}")),
                     }
                     self.catalog.send(Req::InsertUser { row });
+                    if let Some(id) = replaces {
+                        self.catalog.send(Req::RemoveUser { id });
+                    }
                 }
-                LibraryMsg::TemplateSaved(res) => match res {
+                LibraryMsg::TemplateSaved(res, replaces) => match res {
                     Ok((row, submitted)) => {
                         let title = row.meta.title.clone();
                         if let Err(e) = self.templates.insert(&row) {
                             self.toast_err(e);
                         } else {
+                            if let Some(id) = replaces.filter(|id| *id != row.meta.id) {
+                                if let Err(e) = self.templates.remove_local(&id) {
+                                    self.toast_err(e);
+                                }
+                            }
                             match submitted {
                                 None => self.toast(format!("Saved template \"{title}\"")),
                                 Some(Ok(())) => self.toast(format!("Submitted template \"{title}\" for review. It is saved here and shared once approved.")),
@@ -2171,6 +2486,17 @@ impl BioCartoon {
                     Ok(t) => self.insert_template(t, own),
                     Err(e) => self.toast_err(e),
                 },
+                LibraryMsg::SuggestionSent(title, res) => {
+                    self.suggest.busy = false;
+                    match res {
+                        Ok(_) => {
+                            self.toast(format!("Thanks! Sent your suggestion \"{title}\" to the BioCartoon team."));
+                            self.suggest.title.clear();
+                            self.suggest.description.clear();
+                        }
+                        Err(e) => self.toast_err(format!("Suggestion not sent: {e}")),
+                    }
+                }
             }
         }
     }
@@ -2528,7 +2854,7 @@ impl BioCartoon {
             return self.toast_err(format!("email: {e}"));
         }
         let png = dir.join(format!("{slug}.png"));
-        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, save_credits: false, all_slides: false };
+        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, save_credits: false, save_required_credits: false, all_slides: false };
         self.pending_email = Some((doc.title.clone(), vec![png.clone(), file]));
         let job = self.export_job_for(&doc, &[0], png, opts);
         self.export_job = Some(crate::export::start(ctx.clone(), job));
@@ -2640,7 +2966,7 @@ impl BioCartoon {
                 }
             }
         }
-        crate::export::ExportJob { path, opts, slides, page: doc.page_rect(), background: doc.background, requests, fallbacks }
+        crate::export::ExportJob { path, opts, slides, page: doc.page_rect(), background: doc.background, requests, fallbacks, downloads: HashMap::new() }
     }
 
     fn poll_export(&mut self, ctx: &egui::Context) {
@@ -2691,6 +3017,7 @@ impl BioCartoon {
             (None, false) => "Export slide".into(),
         };
         let credits = if all { crate::credits::collect(&doc.slides, 1) } else { crate::credits::collect([&doc.slides[slide]], slide + 1) };
+        let stem = Self::slugify(&doc.title);
         // Show credits opens the Attributions popup as a modal over this one.
         let show_id = egui::Id::new("export_show_credits");
         let mut show_credits = ctx.data(|d| d.get_temp::<bool>(show_id)).unwrap_or(false);
@@ -2784,8 +3111,19 @@ impl BioCartoon {
                     if ui.button(format!("{}  Show credits", ph::QUOTES)).clicked() {
                         show_credits = true;
                     }
-                    ui.checkbox(&mut opts.save_credits, "Save credits")
-                        .on_hover_text("Also save the credits as a text file next to the export");
+                    // One credits file at most: checking either unchecks the other.
+                    if ui.checkbox(&mut opts.save_required_credits, "Save required credits")
+                        .on_hover_text("Also save the credits the licenses require as a text file next to the export, one per line")
+                        .changed() && opts.save_required_credits
+                    {
+                        opts.save_credits = false;
+                    }
+                    if ui.checkbox(&mut opts.save_credits, "Save all credits")
+                        .on_hover_text("Also save every credit as a text file next to the export, one per line")
+                        .changed() && opts.save_credits
+                    {
+                        opts.save_required_credits = false;
+                    }
                 });
             }
             ui.add_space(10.0);
@@ -2799,7 +3137,7 @@ impl BioCartoon {
             open = false;
         }
         if show_credits {
-            show_credits = self.attributions_modal(ctx, &credits);
+            show_credits = self.attributions_modal(ctx, &credits, &stem);
         }
         ctx.data_mut(|d| d.insert_temp(show_id, show_credits && open && !go && !cancel));
         if n_images == 0 {
@@ -2907,7 +3245,6 @@ impl BioCartoon {
     fn apply(&mut self, a: Action, ctx: &egui::Context) {
         match a {
             Action::InsertAsset(row) => self.insert_asset(&row),
-            Action::ToggleStar(row) => self.toggle_star(&row),
             Action::RemoveUserAsset(row) => {
                 // Out of the results now; the reply refreshes counts and browse views.
                 let before = self.icons.results.len();
@@ -2918,6 +3255,7 @@ impl BioCartoon {
                 self.catalog.send(Req::RemoveUser { id: row.id.clone() });
                 self.toast(format!("Removed \"{}\" from your library", row.title));
             }
+            Action::ToggleFavorite(id) => self.toggle_favorite(id),
             Action::InsertFile(p) => self.insert_file(&p),
             Action::InsertText { text, size, bold } => {
                 let id = self.doc.alloc_id();
@@ -3169,7 +3507,7 @@ impl BioCartoon {
             Action::OpenUploadDialog(target) => self.open_upload_dialog(target),
             Action::PickLibraryFile => {
                 let tx = self.action_tx.clone();
-                crate::platform::pick_files("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"], false, move |mut paths| {
+                crate::platform::pick_files("Images", &crate::assets::IMAGE_EXTS, false, move |mut paths| {
                     let _ = tx.send(Action::LibraryFilePicked(paths.remove(0)));
                 });
             }
@@ -3182,6 +3520,16 @@ impl BioCartoon {
             }
             Action::SubmitUpload => self.submit_upload(),
             Action::ContributeSelected => self.contribute_selected(),
+            Action::OpenSuggest(title) => {
+                self.icons.mode = IconsMode::Suggest;
+                if !title.is_empty() {
+                    self.suggest.title = title;
+                }
+                if self.suggest.name.is_empty() {
+                    self.suggest.name = self.settings.contributor_name.clone();
+                }
+            }
+            Action::SubmitSuggestion => self.submit_suggestion(),
             Action::PickTemplateFiles => {
                 let tx = self.action_tx.clone();
                 crate::platform::pick_files("biocartoon", &["biocartoon", "json"], true, move |paths| {
@@ -3198,7 +3546,7 @@ impl BioCartoon {
             }
             Action::PickUploads => {
                 let tx = self.action_tx.clone();
-                crate::platform::pick_files("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"], true, move |paths| {
+                crate::platform::pick_files("Images", &crate::assets::IMAGE_EXTS, true, move |paths| {
                     let _ = tx.send(Action::AddUploads(paths));
                 });
             }
@@ -3210,6 +3558,7 @@ impl BioCartoon {
                     }
                 }
             }
+            Action::DropImages(files, at) => self.drop_images(&files, at),
             Action::OpenFile(p) => self.open_file(&p),
             Action::ImportFiles(paths) => self.import_files(&paths),
             Action::BackupAll => self.backup_all(),
@@ -3230,6 +3579,9 @@ impl BioCartoon {
                 let catalog_changed = s.catalog_path != self.settings.catalog_path
                     || (s.catalog_path.is_empty() && s.asset_base_url != self.settings.asset_base_url);
                 let backend_changed = s.ai_provider != self.settings.ai_provider;
+                // Not edited in the dialog, and may have changed while it was open.
+                s.favorites = std::mem::take(&mut self.settings.favorites);
+                s.pending_stars = std::mem::take(&mut self.settings.pending_stars);
                 self.settings = s;
                 let local = if self.settings.local_data_dir.is_empty() { None } else { Some(PathBuf::from(&self.settings.local_data_dir)) };
                 self.images.configure(self.settings.asset_base_url.clone(), local);
@@ -3349,7 +3701,15 @@ impl BioCartoon {
                 match e {
                     egui::Event::Copy => acts.push(Action::Copy),
                     egui::Event::Cut => acts.push(Action::Cut),
-                    egui::Event::Paste(_) => acts.push(Action::Paste),
+                    egui::Event::Paste(_) => {
+                        acts.push(Action::Paste);
+                        self.pasted = true;
+                    }
+                    egui::Event::Key { key: Key::V, pressed: false, modifiers, .. } if modifiers.command => {
+                        if !std::mem::take(&mut self.pasted) {
+                            acts.push(Action::Paste);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3400,7 +3760,10 @@ impl BioCartoon {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // Debounced search.
-        if self.settings.show_icons && self.icons.mode == IconsMode::Search && self.icons.query != self.icons.last_sent_query {
+        if self.settings.show_icons
+            && self.icons.mode == IconsMode::Search
+            && (self.icons.query != self.icons.last_sent_query || self.icons.filter != self.icons.last_sent_filter)
+        {
             self.request_search();
         }
         self.keyboard(&ctx);
@@ -3586,6 +3949,20 @@ impl BioCartoon {
                                 }
                             });
                             ui.end_row();
+                            ui.label("Icon columns");
+                            ui.horizontal(|ui| {
+                                for n in 1..=5 {
+                                    ui.selectable_value(&mut d.icon_columns, n, n.to_string());
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("On icons");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut d.tile_database, "Database").on_hover_text("The database's badge, lower left");
+                                ui.checkbox(&mut d.tile_colors, "Multicolor").on_hover_text("A color wheel on icons that come in several colors");
+                                ui.checkbox(&mut d.tile_stars, "Stars").on_hover_text("The star and how many people starred the icon, upper right. Without it, your favorites still show a gold star.");
+                            });
+                            ui.end_row();
                         });
                     }
                     SettingsTab::Ai => {
@@ -3622,7 +3999,7 @@ impl BioCartoon {
                     linked_line(ui, "Web app: ", "app.biocartoon.com", "https://app.biocartoon.com");
                     ui.add_space(10.0);
                     linked_line(ui, "Free and open source under the ", "GNU AGPL v3.0", "https://www.gnu.org/licenses/agpl-3.0.html");
-                    linked_line(ui, "Database: ", "github.com/josephrich98/biocartoon", "https://github.com/josephrich98/biocartoon");
+                    linked_line(ui, "Database and CLI Source Code: ", "github.com/josephrich98/biocartoon", "https://github.com/josephrich98/biocartoon");
                     linked_line(ui, "App source code: ", "github.com/josephrich98/biocartoon-app", crate::GITHUB_URL);
                 });
             });
@@ -3875,7 +4252,7 @@ impl BioCartoon {
         }
         let content: Option<Vec2> = match &d.target {
             UploadTarget::Generated => self.generate.result.as_ref().map(|(_, t)| t.size_vec2()),
-            UploadTarget::File(p) => match self.images.file(&p.display().to_string()) {
+            UploadTarget::File(_) | UploadTarget::Library(_) => match self.images.file(&d.target.image_path().unwrap_or_default()) {
                 ImgState::Ready { size, .. } => Some(Vec2::new(size[0] as f32, size[1] as f32)),
                 _ => None,
             },
@@ -3911,8 +4288,8 @@ impl BioCartoon {
                         painter.image(tex.id(), shown, uv, Color32::WHITE);
                     }
                 }
-                UploadTarget::File(p) => {
-                    if let ImgState::Ready { tex, .. } = self.images.file(&p.display().to_string()) {
+                UploadTarget::File(_) | UploadTarget::Library(_) => {
+                    if let ImgState::Ready { tex, .. } = self.images.file(&d.target.image_path().unwrap_or_default()) {
                         painter.image(tex.id(), shown, uv, Color32::WHITE);
                     }
                 }
@@ -3972,7 +4349,7 @@ impl BioCartoon {
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, about, templates, savetemplate, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
-    /// rail=<text|lines|shapes|table|edit|slides|page|none|icons|noicons|uploads>).
+    /// fav=<id>, rail=<text|lines|shapes|table|edit|slides|page|none|icons|noicons|uploads|favorites|library>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -4106,6 +4483,13 @@ impl BioCartoon {
                         self.actions.push(Action::Export(p));
                     }
                     s if s.starts_with("exportdpi=") => self.settings.export.dpi = s["exportdpi=".len()..].parse().unwrap_or(300),
+                    // fav=<asset id>: mark it as a favorite.
+                    s if s.starts_with("fav=") => {
+                        let id = s["fav=".len()..].to_string();
+                        if !self.settings.favorites.contains(&id) {
+                            self.settings.favorites.push(id);
+                        }
+                    }
                     "exporttransparent" => self.settings.export.transparent = true,
                     "exportindividual" => self.settings.export.individual = true,
                     "exportcrop" => self.settings.export.crop = true,
@@ -4115,7 +4499,7 @@ impl BioCartoon {
                     "attributions" => {
                         self.show_settings = false;
                         for (i, (id, title)) in [("scidraw/9e80cff8-4f88-47cf-b1ed-a8840ac13809", "mouse"), ("servier/abdominal-aorta", "Abdominal aorta"), ("bioart/369_638402", "Mouse Brain")].into_iter().enumerate() {
-                            let mut source = ImageSource::Asset { id: id.into(), key: format!("{id}.png"), title: title.into(), source: id.split('/').next().unwrap_or_default().into(), credit: String::new(), license: String::new() };
+                            let mut source = ImageSource::Asset { id: id.into(), key: format!("{id}.png"), svg: None, title: title.into(), source: id.split('/').next().unwrap_or_default().into(), credit: String::new(), license: String::new() };
                             if i == 1 {
                                 source = source.derived(self.app_dir.join("generated").join("missing.png").display().to_string());
                             }
@@ -4135,10 +4519,7 @@ impl BioCartoon {
                     "about" => self.show_about = true,
                     "templates" => {
                         self.settings.show_icons = true;
-                        self.icons.mode = IconsMode::Databases;
-                        self.icons.db = Some(theme::BIOCARTOON_SOURCE.into());
-                        self.icons.db_cat = None;
-                        self.catalog.send(crate::catalog::Req::Categories { source: theme::BIOCARTOON_SOURCE.into() });
+                        self.search_database(theme::BIOCARTOON_SOURCE);
                     }
                     "savetemplate" => self.open_upload_dialog(self.template_target(self.cur_slide)),
                     "aisetup" => self.open_ai_setup(None),
@@ -4148,6 +4529,11 @@ impl BioCartoon {
                         self.settings.show_icons = true;
                         self.icons.mode = IconsMode::Search;
                         self.icons.query = s["search=".len()..].to_string();
+                    }
+                    "filters" => {
+                        self.settings.show_icons = true;
+                        self.icons.mode = IconsMode::Search;
+                        self.icons.show_filters = true;
                     }
                     s if s.starts_with("localdir=") => {
                         self.settings.local_data_dir = s["localdir=".len()..].to_string();
@@ -4159,7 +4545,10 @@ impl BioCartoon {
                             "icons" => self.settings.show_icons = true,
                             "noicons" => self.settings.show_icons = false,
                             "uploads" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Uploads; }
-                            "contribute" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Contribute; }
+                            "contribute" => { self.settings.show_icons = true; self.open_contribute(); }
+                            "suggest" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Suggest; }
+                            "favorites" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Favorites; self.request_browse(); }
+                            "library" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Library; self.request_browse(); }
                             t => {
                                 self.rail = match t {
                                     "text" => { self.placing_text = true; self.rail }, "lines" => Some(RailTab::Lines), "shapes" => Some(RailTab::Shapes),
@@ -4270,6 +4659,30 @@ fn linked_line(ui: &mut egui::Ui, text: &str, link: &str, url: &str) {
 impl eframe::App for BioCartoon {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
+    }
+
+    /// On macOS, Ctrl+click is a right click: the press and its release become secondary-button events.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if ctx.os() != egui::os::OperatingSystem::Mac {
+            return;
+        }
+        for e in raw_input.events.iter_mut() {
+            if let egui::Event::PointerButton { button, pressed, modifiers, .. } = e {
+                if *button != egui::PointerButton::Primary {
+                    continue;
+                }
+                if *pressed {
+                    self.ctrl_click = modifiers.ctrl && !modifiers.mac_cmd;
+                }
+                if self.ctrl_click {
+                    *button = egui::PointerButton::Secondary;
+                    modifiers.ctrl = false;
+                    if !*pressed {
+                        self.ctrl_click = false;
+                    }
+                }
+            }
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

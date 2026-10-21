@@ -2,7 +2,7 @@
 //! responses), and the published catalog is downloaded in the background. The search itself is
 //! [`biocartoon_catalog::catalog::Worker`], shared with the command line.
 
-pub use biocartoon_catalog::catalog::{AssetRow, CategoryInfo, IconSort, SourceInfo, StarUpdate, TaxonCount, Worker};
+pub use biocartoon_catalog::catalog::{AssetRow, CategoryInfo, Facets, Filter, IconSort, SourceInfo, StarUpdate, TaxonCount, Worker};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -17,13 +17,17 @@ use std::thread;
 
 #[derive(Clone, Debug)]
 pub enum Req {
-    Search { query: String, sources: Vec<String>, offset: usize, limit: usize, sort: IconSort },
-    Browse { source: String, category: Option<String>, offset: usize, limit: usize, sort: IconSort },
-    /// Browse BioCartoon's own categories across `sources` (all when empty); `None` is "All".
-    BrowseTaxon { cat: Option<String>, sub: Option<String>, sources: Vec<String>, offset: usize, limit: usize, sort: IconSort },
+    /// An empty `query` lists everything `filter` keeps.
+    Search { query: String, filter: Filter, offset: usize, limit: usize, sort: IconSort },
+    /// The user's own uploads (source `user` with a local copy), not the published ones.
+    Library { offset: usize, limit: usize, sort: IconSort },
+    /// The assets with these ids, in this order (the user's favorites).
+    Favorites { ids: Vec<String> },
+    /// Ids of the assets this install starred, as the usage file remembers them.
+    MyStars,
     Categories { source: String },
-    /// Icon counts of every category and subcategory of `crate::taxonomy::TAXONOMY`.
-    Taxonomy { sources: Vec<String> },
+    /// The search filters' choices that still find icons under `filter` (see [`Worker::facets`]).
+    Facets { filter: Filter },
     Sources,
     /// Style presets of the asset with this id.
     Variants { id: String },
@@ -45,7 +49,8 @@ pub enum Resp {
     /// `rows` returned. `colors` counts the colours of each row that comes in several, by row id.
     Assets { req_id: u64, rows: Vec<AssetRow>, more: bool, total: i64, colors: HashMap<String, usize> },
     Categories { req_id: u64, source: String, cats: Vec<CategoryInfo> },
-    Taxonomy { req_id: u64, counts: Vec<TaxonCount> },
+    MyStars { req_id: u64, ids: Vec<String> },
+    Facets { req_id: u64, facets: Facets },
     Sources { req_id: u64, sources: Vec<SourceInfo> },
     Variants { req_id: u64, rows: Vec<AssetRow> },
     Lookup { req_id: u64, rows: Vec<AssetRow> },
@@ -86,45 +91,62 @@ fn assets(w: &Worker, req_id: u64, rows: Vec<AssetRow>, more: bool, total: i64) 
     Resp::Assets { req_id, rows, more, total, colors }
 }
 
+/// One more than `limit` ids of the user's own uploads from `offset` (to tell whether there are
+/// more), and how many there are in all. Popular falls back to newest first.
+fn library(w: &Worker, offset: usize, limit: usize, sort: IconSort) -> rusqlite::Result<(Vec<String>, i64)> {
+    let own = "source='user' AND png_local IS NOT NULL AND png_key IS NOT NULL";
+    let order = match sort {
+        IconSort::Alphabetical => "lower(coalesce(title,'')), id",
+        IconSort::ReverseAlphabetical => "lower(coalesce(title,'')) DESC, id",
+        _ => "rowid DESC",
+    };
+    let mut st = w.conn.prepare(&format!("SELECT id FROM assets WHERE {own} ORDER BY {order} LIMIT ?1 OFFSET ?2"))?;
+    let ids = st.query_map(rusqlite::params![limit as i64 + 1, offset as i64], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    let total = w.conn.query_row(&format!("SELECT count(*) FROM assets WHERE {own}"), [], |r| r.get(0))?;
+    Ok((ids, total))
+}
+
 fn handle(w: &Worker, req_id: u64, req: Req) -> Resp {
     let err = |e: rusqlite::Error| Resp::Error { req_id, message: e.to_string() };
     match req {
-        Req::Search { query, sources, offset, limit, sort } => match w.search_page(&query, &sources, None, offset, limit + 1, sort) {
+        Req::Search { query, filter, offset, limit, sort } => match w.search_filtered(&query, &filter, offset, limit + 1, sort) {
             Ok(mut rows) => {
                 let more = rows.len() > limit;
                 rows.truncate(limit);
-                let total = w.search_total(&query, &sources).unwrap_or((offset + rows.len()) as i64).max((offset + rows.len()) as i64);
+                let total = w.search_filtered_total(&query, &filter).unwrap_or((offset + rows.len()) as i64).max((offset + rows.len()) as i64);
                 assets(w, req_id, rows, more, total)
             }
             Err(e) => err(e),
         },
-        Req::Browse { source, category, offset, limit, sort } => {
-            match w.browse(&source, category.as_deref(), offset, limit + 1, sort) {
+        Req::Library { offset, limit, sort } => match library(w, offset, limit, sort) {
+            Ok((ids, total)) => match w.by_ids(&ids) {
                 Ok(mut rows) => {
                     let more = rows.len() > limit;
                     rows.truncate(limit);
-                    let total = w.browse_total(&source, category.as_deref()).unwrap_or((offset + rows.len()) as i64);
                     assets(w, req_id, rows, more, total)
                 }
                 Err(e) => err(e),
+            },
+            Err(e) => err(e),
+        },
+        Req::Favorites { ids } => match w.by_ids(&ids) {
+            Ok(rows) => {
+                let total = rows.len() as i64;
+                assets(w, req_id, rows, false, total)
             }
-        }
-        Req::BrowseTaxon { cat, sub, sources, offset, limit, sort } => {
-            match w.browse_taxon(cat.as_deref(), sub.as_deref(), &sources, offset, limit + 1, sort) {
-                Ok((mut rows, total)) => {
-                    let more = rows.len() > limit;
-                    rows.truncate(limit);
-                    assets(w, req_id, rows, more, total)
-                }
-                Err(e) => err(e),
-            }
+            Err(e) => err(e),
+        },
+        // No usage file (or one from before stars): none.
+        Req::MyStars => {
+            let ids = w.conn.prepare("SELECT id FROM usage.stars WHERE mine = 1").and_then(|mut st| st.query_map([], |r| r.get(0))?.collect()).unwrap_or_default();
+            Resp::MyStars { req_id, ids }
         }
         Req::Categories { source } => match w.categories(&source) {
             Ok(cats) => Resp::Categories { req_id, source, cats },
             Err(e) => err(e),
         },
-        Req::Taxonomy { sources } => match w.taxonomy(&sources) {
-            Ok(counts) => Resp::Taxonomy { req_id, counts },
+        Req::Facets { filter } => match w.facets(&filter) {
+            Ok(facets) => Resp::Facets { req_id, facets },
             Err(e) => err(e),
         },
         Req::Sources => match w.sources() {

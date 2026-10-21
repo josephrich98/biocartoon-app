@@ -11,12 +11,16 @@ pub type ItemId = u64;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ImageSource {
-    /// An asset from the catalog (`assets.sqlite`); `key` is the R2 object key of the PNG.
-    /// `credit` and `license` are copied from the catalog when it is placed, so the document
-    /// can list its attributions on its own (documents from before then fill them in on load).
+    /// An asset from the catalog (`assets.sqlite`); `key` is the R2 object key of the PNG, and
+    /// `svg` that of the same image as an SVG when the source has one (it is drawn and exported
+    /// from that, with the PNG as the fallback). `credit` and `license` are copied from the
+    /// catalog when it is placed, so the document can list its attributions on its own
+    /// (documents from before then fill them in on load).
     Asset {
         id: String,
         key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        svg: Option<String>,
         title: String,
         source: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -37,7 +41,7 @@ impl ImageSource {
     /// Cache key used by [`crate::assets::ImageCache`].
     pub fn cache_key(&self) -> String {
         match self {
-            ImageSource::Asset { key, .. } => format!("asset:{key}"),
+            ImageSource::Asset { key, svg, .. } => format!("asset:{}", svg.as_deref().unwrap_or(key)),
             ImageSource::File { path, .. } => format!("file:{path}"),
         }
     }

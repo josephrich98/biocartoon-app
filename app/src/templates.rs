@@ -309,7 +309,7 @@ pub fn validate(file: &TemplateFile) -> Result<(), String> {
 /// Read and re-encode a local image as a PNG within the size limits.
 pub fn png_bytes(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     let bytes = crate::storage::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let img = image::load_from_memory(&bytes).map_err(|e| format!("{}: {e}", path.display()))?.to_rgba8();
+    let img = crate::assets::load_image(&bytes, submit::MAX_IMAGE_SIDE).map_err(|e| format!("{}: {e}", path.display()))?;
     encode_png(img)
 }
 
@@ -365,7 +365,7 @@ fn submit_template(url: &str, meta: &SubmitMeta, mut file: TemplateFile, thumb_p
                 let (png, _, _) = png_bytes(Path::new(path.as_str()))?;
                 let name = format!("img-{}.png", images.len() + 1);
                 let credit = crate::credits::template_credit(&it.name, &meta.author, &meta.license, &meta.title);
-                *source = ImageSource::Asset { id: name.clone(), key: name.clone(), title: it.name.clone(), source: "template".into(), credit, license: meta.license.clone() };
+                *source = ImageSource::Asset { id: name.clone(), key: name.clone(), svg: None, title: it.name.clone(), source: "template".into(), credit, license: meta.license.clone() };
                 images.push((name, png));
             }
         }

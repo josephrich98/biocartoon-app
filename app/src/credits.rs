@@ -79,19 +79,15 @@ pub fn collect<'a>(slides: impl IntoIterator<Item = &'a Slide>, first: usize) ->
     out
 }
 
-/// The credits of a set of items, one per line (embedded in exported files).
-pub fn for_items(items: &[&Item]) -> String {
+/// The credits of a set of items, one per line (embedded in exported files, or saved beside them).
+pub fn for_items(items: &[&Item], only_required: bool) -> String {
     let slide = Slide { name: String::new(), items: items.iter().map(|it| (*it).clone()).collect() };
-    collect([&slide], 1).iter().filter(|c| !c.credit.is_empty()).map(|c| c.credit.clone()).collect::<Vec<_>>().join("\n")
+    list(&collect([&slide], 1), only_required)
 }
 
-/// A figure-legend sentence: "Image credits: <line>; <line>."
-pub fn caption(credits: &[Credit], only_required: bool) -> String {
-    let lines: Vec<&str> = credits.iter().filter(|c| !only_required || c.required).map(|c| c.credit.as_str()).filter(|c| !c.is_empty()).collect();
-    if lines.is_empty() {
-        return String::new();
-    }
-    format!("Image credits: {}.", lines.join("; "))
+/// The credit lines, one per line, optionally just those the licenses require.
+pub fn list(credits: &[Credit], only_required: bool) -> String {
+    credits.iter().filter(|c| !only_required || c.required).map(|c| c.credit.as_str()).filter(|c| !c.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 /// Ids of catalog assets in `doc` that don't carry their credit yet (documents saved before
@@ -133,6 +129,12 @@ impl BioCartoon {
         Some((title.clone(), credit))
     }
 
+    /// The catalog id of the asset an image item is, or was made from.
+    pub fn item_asset_id(&self, it: &Item) -> Option<String> {
+        let (ImageSource::Asset { id, .. }, _) = origin(it)? else { return None };
+        Some(id.clone())
+    }
+
     /// Right-click > Show credit: one image's credit, with a button to copy it.
     pub fn credit_window(&mut self, ctx: &egui::Context) {
         let Some(id) = self.credit_item else { return };
@@ -172,12 +174,13 @@ impl BioCartoon {
         if !self.show_attributions {
             return;
         }
-        let (credits, title) = match self.attributions_slide.filter(|&i| i < self.doc.slides.len()) {
-            Some(i) => (collect([&self.doc.slides[i]], i + 1), format!("{}  Attributions: slide {}", ph::QUOTES, i + 1)),
-            None => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES)),
+        let stem = BioCartoon::slugify(&self.doc.title);
+        let (credits, title, stem) = match self.attributions_slide.filter(|&i| i < self.doc.slides.len()) {
+            Some(i) => (collect([&self.doc.slides[i]], i + 1), format!("{}  Attributions: slide {}", ph::QUOTES, i + 1), format!("{stem}-slide{}", i + 1)),
+            None => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES), stem),
         };
         let mut open = true;
-        let mut copied: Option<String> = None;
+        let mut action = None;
         let center = ctx.content_rect().center();
         egui::Window::new(title)
             .id(egui::Id::new("attributions_window"))
@@ -186,21 +189,25 @@ impl BioCartoon {
             .default_size([480.0, 460.0])
             .default_pos(center - Vec2::new(240.0, 230.0))
             .show(ctx, |ui| {
-                copied = attributions_ui(ui, &credits, &mut self.attributions_required_only);
+                action = attributions_ui(ui, &credits, &mut self.attributions_required_only);
             });
-        if let Some(text) = copied {
-            ctx.copy_text(text);
-            self.toast("Copied the credits");
+        if let Some(a) = action {
+            self.credits_action(ctx, a, &credits, &stem);
         }
         self.show_attributions = open;
     }
 
     /// The Attributions popup as a modal, for opening over another modal (the export dialog),
-    /// which an ordinary window can't sit above. Returns false once it is closed.
-    pub fn attributions_modal(&mut self, ctx: &egui::Context, credits: &[Credit]) -> bool {
+    /// which an ordinary window can't sit above. `stem` names saved credit files. Returns false
+    /// once it is closed.
+    pub fn attributions_modal(&mut self, ctx: &egui::Context, credits: &[Credit], stem: &str) -> bool {
         let mut open = true;
-        let mut copied: Option<String> = None;
-        let modal = egui::Modal::new(egui::Id::new("attributions_modal")).show(ctx, |ui| {
+        let mut action = None;
+        let id = egui::Id::new("attributions_modal");
+        // egui remembers a closed modal's place in the stacking order, so a reopened one would sit
+        // under the export dialog; keep it on top.
+        ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+        let modal = egui::Modal::new(id).show(ctx, |ui| {
             ui.set_width(480.0);
             ui.horizontal(|ui| {
                 ui.heading(format!("{}  Attributions", ph::QUOTES));
@@ -211,22 +218,46 @@ impl BioCartoon {
                 });
             });
             ui.set_max_height(ctx.content_rect().height() * 0.7);
-            copied = attributions_ui(ui, credits, &mut self.attributions_required_only);
+            action = attributions_ui(ui, credits, &mut self.attributions_required_only);
         });
         if modal.should_close() {
             open = false;
         }
-        if let Some(text) = copied {
-            ctx.copy_text(text);
-            self.toast("Copied the credits");
+        if let Some(a) = action {
+            self.credits_action(ctx, a, credits, stem);
         }
         open
     }
+
+    /// Copy or save the credit list (one per line), as a button of the Attributions popup asked.
+    fn credits_action(&mut self, ctx: &egui::Context, action: CreditsAction, credits: &[Credit], stem: &str) {
+        match action {
+            CreditsAction::Copy { required } => {
+                ctx.copy_text(list(credits, required));
+                self.toast(if required { "Copied the required credits" } else { "Copied all credits" });
+            }
+            CreditsAction::Save { required } => {
+                let name = format!("{stem}-{}credits.txt", if required { "required-" } else { "" });
+                let Some(path) = crate::platform::save_path("Text", "txt", &name) else { return };
+                match crate::platform::write_output(&path, format!("{}\n", list(credits, required)).as_bytes()) {
+                    Ok(()) => self.toast(if required { "Saved the required credits" } else { "Saved all credits" }),
+                    Err(e) => self.toast_err(&format!("{}: {e}", path.display())),
+                }
+            }
+        }
+    }
 }
 
-/// The body of the Attributions popup. Returns the text to copy, if a copy button was clicked.
-fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Option<String> {
-    let mut copied = None;
+/// A button of the Attributions popup: copy or save the credits (`required`: only those the
+/// licenses require).
+enum CreditsAction {
+    Copy { required: bool },
+    Save { required: bool },
+}
+
+/// The body of the Attributions popup. Returns what a copy or save button asked for, if one was clicked.
+fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Option<CreditsAction> {
+    let mut action = None;
     let pending = credits.iter().filter(|c| c.credit.is_empty()).count();
     let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
     if credits.is_empty() {
@@ -241,8 +272,8 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
         if credits.len() == 1 { "piece of artwork" } else { "pieces of artwork" },
         if required == 1 { "requires" } else { "require" }
     ));
-    ui.label(dim("Paste the caption into your figure legend. Exported SVG and PNG files carry the same credits."));
-    ui.checkbox(only, "Only the credits the licenses require")
+    ui.label(dim("Copy or save the credits, one per line, for your figure legend. Exported SVG and PNG files carry the same credits."));
+    ui.checkbox(only, "Only show credits for licenses requiring credit")
         .on_hover_text("Public-domain and CC0 artwork needs no credit, but artists still appreciate it.");
     if pending > 0 {
         ui.horizontal(|ui| {
@@ -251,14 +282,22 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
         });
     }
     ui.add_space(4.0);
+    let has_required = !list(credits, true).is_empty();
+    let has_any = !list(credits, false).is_empty();
     ui.horizontal(|ui| {
-        let caption = caption(credits, *only);
-        if ui.add_enabled(!caption.is_empty(), egui::Button::new(format!("{}  Copy caption", ph::COPY))).clicked() {
-            copied = Some(caption);
+        if ui.add_enabled(has_required, egui::Button::new(format!("{}  Copy required credits", ph::COPY))).clicked() {
+            action = Some(CreditsAction::Copy { required: true });
         }
-        let list: Vec<&str> = credits.iter().filter(|c| !*only || c.required).map(|c| c.credit.as_str()).filter(|c| !c.is_empty()).collect();
-        if ui.add_enabled(!list.is_empty(), egui::Button::new("Copy as list")).on_hover_text("One credit per line").clicked() {
-            copied = Some(list.join("\n"));
+        if ui.add_enabled(has_any, egui::Button::new(format!("{}  Copy all credits", ph::COPY))).clicked() {
+            action = Some(CreditsAction::Copy { required: false });
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_required, egui::Button::new(format!("{}  Save required credits", ph::FLOPPY_DISK))).clicked() {
+            action = Some(CreditsAction::Save { required: true });
+        }
+        if ui.add_enabled(has_any, egui::Button::new(format!("{}  Save all credits", ph::FLOPPY_DISK))).clicked() {
+            action = Some(CreditsAction::Save { required: false });
         }
     });
     ui.separator();
@@ -280,7 +319,7 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
             ui.add_space(6.0);
         }
     });
-    copied
+    action
 }
 
 #[cfg(test)]
@@ -289,7 +328,7 @@ mod tests {
     use egui::{Pos2, Vec2};
 
     fn asset(id: &str, credit: &str, license: &str) -> ImageSource {
-        ImageSource::Asset { id: id.into(), key: format!("{id}.png"), title: id.into(), source: "servier".into(), credit: credit.into(), license: license.into() }
+        ImageSource::Asset { id: id.into(), key: format!("{id}.png"), svg: None, title: id.into(), source: "servier".into(), credit: credit.into(), license: license.into() }
     }
 
     fn image(n: u64, source: ImageSource) -> Item {
@@ -307,8 +346,8 @@ mod tests {
         assert_eq!(c[0].slides, vec![1, 2]);
         assert!(c[0].derived && c[0].required);
         assert!(!c[1].required);
-        assert_eq!(caption(&c, true), "Image credits: \"Cell\", Servier Medical Art, CC-BY-4.0.");
-        assert!(caption(&c, false).contains("; \"Tube\""));
+        assert_eq!(list(&c, true), "\"Cell\", Servier Medical Art, CC-BY-4.0");
+        assert!(list(&c, false).ends_with("CC-BY-4.0\n\"Tube\", NIAID NIH BioArt Source, public domain"));
         // An edit of an edit still points at the catalog asset.
         let twice = ImageSource::file("/tmp/a.png".into()).derived("/tmp/b.png".into());
         assert!(twice.origin().is_none());
@@ -337,6 +376,7 @@ mod tests {
             png_local: None,
             png_width: 1,
             png_height: 1,
+            svg_key: None,
             stars: 0,
             starred: false,
         };

@@ -1,0 +1,5 @@
+# Adds the Content-Security-Policy and the other security headers (csp.py).
+[[hooks]]
+stage = "post_build"
+command = "python3"
+command_arguments = ["csp.py"]

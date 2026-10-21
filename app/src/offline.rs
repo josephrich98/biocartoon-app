@@ -752,6 +752,8 @@ pub struct OfflineState {
     scan: Option<Receiver<Result<Vec<Collection>, String>>>,
     /// The catalog file `collections` was read from.
     scanned: Option<PathBuf>,
+    /// Sync pressed: a catalog check is running and its result should be reported.
+    pub(crate) syncing: bool,
 }
 
 /// The tab's name: the browser can't work offline, it only downloads zips.
@@ -781,6 +783,17 @@ impl crate::app::BioCartoon {
             return;
         }
         self.offline.scan = Some(scan(db, self.images.cache_dir()));
+    }
+
+    /// Fetch the catalog's current version from the asset URL (installing it if it is newer) and
+    /// recount what is downloaded.
+    fn offline_sync(&mut self) {
+        if self.settings.catalog_path.is_empty() {
+            let dir = self.app_dir.join("catalog");
+            self.catalog_sync = Some(crate::catalog::CatalogSync::start(&self.settings.asset_base_url, dir));
+            self.offline.syncing = true;
+        }
+        self.offline_rescan();
     }
 
     /// Collect scan and download results. Call once per frame.
@@ -883,21 +896,26 @@ impl crate::app::BioCartoon {
                 }
                 ui.end_row();
             }
-        });
-        ui.add_space(8.0);
-        let (count, bytes): (usize, u64) = self.offline.collections.iter().fold((0, 0), |(n, b), c| (n + c.count, b + c.bytes));
-        let (have, have_bytes): (usize, u64) = self.offline.collections.iter().fold((0, 0), |(n, b), c| (n + c.have, b + c.have_bytes));
-        let all_done = !web && have >= count;
-        ui.horizontal(|ui| {
-            let text = if web {
-                format!("{}  Download all as .zip ({count} images, {})", ph::DOWNLOAD_SIMPLE, human_bytes(bytes))
+            let (count, bytes): (usize, u64) = self.offline.collections.iter().fold((0, 0), |(n, b), c| (n + c.count, b + c.bytes));
+            let have: usize = self.offline.collections.iter().map(|c| c.have).sum();
+            let all_done = !web && have >= count;
+            // A line across the grid, between the collections and their total. The cursor is at
+            // the new row's top; half the row spacing above it is between the rows.
+            let span = ui.min_rect().x_range();
+            ui.painter().hline(span, ui.cursor().top() - 3.0, egui::Stroke::new(1.0, theme::border()));
+            ui.label(egui::RichText::new("All").strong());
+            ui.label(egui::RichText::new(if web { count.to_string() } else { format!("{have} / {count}") }).strong());
+            ui.label(egui::RichText::new(human_bytes(bytes)).strong());
+            let download = if web {
+                egui::Button::new(format!("{}  .zip", ph::DOWNLOAD_SIMPLE))
             } else if all_done {
-                format!("{}  Everything is downloaded", ph::CHECK_CIRCLE)
+                egui::Button::new(egui::RichText::new(format!("{}  Download", ph::CHECK_CIRCLE)).color(theme::accent()))
             } else {
-                format!("{}  Download all ({} images, {})", ph::DOWNLOAD_SIMPLE, count.saturating_sub(have), human_bytes(bytes.saturating_sub(have_bytes)))
+                egui::Button::new(format!("{}  Download", ph::DOWNLOAD_SIMPLE))
             };
-            let btn = egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE)).fill(theme::accent());
-            if ui.add_enabled(!busy && !all_done, btn).clicked() {
+            let r = ui.add_enabled(!busy && !all_done, download.small());
+            let r = if all_done { r.on_disabled_hover_text("Everything is downloaded") } else { r };
+            if r.clicked() {
                 #[cfg(not(target_arch = "wasm32"))]
                 if self.choose_offline_dir().is_some() {
                     start_with = Some(Vec::new());
@@ -907,6 +925,19 @@ impl crate::app::BioCartoon {
                     start_with = Some(Vec::new());
                 }
             }
+            if !web && ui.add_enabled(!busy && have > 0, egui::Button::new(format!("{}  Delete", ph::TRASH)).small()).on_hover_text("Delete every downloaded image, the catalog copy and the README").clicked() {
+                remove_these = Some(Vec::new());
+            }
+            ui.end_row();
+        });
+        ui.add_space(8.0);
+        let have_bytes: u64 = self.offline.collections.iter().map(|c| c.have_bytes).sum();
+        ui.horizontal(|ui| {
+            let syncing = self.offline.syncing || self.offline.scan.is_some();
+            let sync = egui::Button::new(format!("{}  {}", ph::ARROWS_CLOCKWISE, if syncing { "Syncing..." } else { "Sync" }));
+            if ui.add_enabled(!busy && !syncing, sync).on_hover_text("Check for a newer icon catalog and recount the downloaded images").clicked() {
+                self.offline_sync();
+            }
             #[cfg(not(target_arch = "wasm32"))]
             {
                 if ui.add_enabled(!busy, egui::Button::new(format!("{}  Choose directory", ph::FOLDER_SIMPLE))).on_hover_text("Where downloaded and cached images are kept").clicked() {
@@ -914,9 +945,6 @@ impl crate::app::BioCartoon {
                 }
                 if ui.button(format!("{}  Show folder", ph::FOLDER_OPEN)).clicked() {
                     show_folder(&self.offline_dir());
-                }
-                if have > 0 && ui.add_enabled(!busy, egui::Button::new(format!("{}  Delete all", ph::TRASH))).on_hover_text("Delete every downloaded image, the catalog copy and the README").clicked() {
-                    remove_these = Some(Vec::new());
                 }
             }
         });
@@ -975,9 +1003,30 @@ mod tests {
         std::fs::write(dir.join("bioart/a.png"), b"x").unwrap();
         let images = crate::assets::ImageCache::new("https://example.invalid".into(), None);
         images.set_cache_dir(dir.clone());
-        let src = |key: &str| crate::doc::ImageSource::Asset { id: String::new(), key: key.into(), title: String::new(), source: String::new(), credit: String::new(), license: String::new() };
+        let src = |key: &str| crate::doc::ImageSource::Asset { id: String::new(), key: key.into(), svg: None, title: String::new(), source: String::new(), credit: String::new(), license: String::new() };
         assert!(matches!(images.request_for(&src("bioart/a.png")), Ok(crate::assets::Request::Path(p)) if p == dir.join("bioart/a.png")));
         assert!(matches!(images.request_for(&src("bioart/b.png")), Ok(crate::assets::Request::Url(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An asset with an SVG loads that, and falls back to the PNG when it can't be fetched (as
+    /// offline with a pack, which holds only PNGs).
+    #[test]
+    fn svg_first_then_png() {
+        use crate::assets::{fetch, Request};
+        let dir = std::env::temp_dir().join(format!("biocartoon-svg-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bioart")).unwrap();
+        std::fs::write(dir.join("bioart/a.png"), b"png").unwrap();
+        let images = crate::assets::ImageCache::new("https://example.invalid".into(), None);
+        images.set_cache_dir(dir.clone());
+        let src = crate::doc::ImageSource::Asset { id: String::new(), key: "bioart/a.png".into(), svg: Some("bioart/a.svg".into()), title: String::new(), source: String::new(), credit: String::new(), license: String::new() };
+        assert_eq!(src.cache_key(), "asset:bioart/a.svg");
+        let req = images.request_for(&src).unwrap();
+        assert!(matches!(&req, Request::Either(svg, png) if matches!(**svg, Request::Url(ref u) if u.ends_with("/bioart/a.svg")) && matches!(**png, Request::Path(_))));
+        assert_eq!(fetch(&req).unwrap(), b"png");
+        // Once the SVG is on disk it is read from there.
+        std::fs::write(dir.join("bioart/a.svg"), b"svg").unwrap();
+        assert_eq!(fetch(&images.request_for(&src).unwrap()).unwrap(), b"svg");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

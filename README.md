@@ -116,3 +116,7 @@ Application and website source code: [github.com/josephrich98/biocartoon-app](ht
 Icon SQLite database: [assets.biocartoon.com/catalog/assets.sqlite.gz](https://assets.biocartoon.com/catalog/assets.sqlite.gz)
 
 Template SQLite database: [assets.biocartoon.com/catalog/templates.sqlite.gz](https://assets.biocartoon.com/catalog/templates.sqlite.gz)
+
+## Support
+
+If biocartoon is useful to you, you can [buy me a coffee](https://buymeacoffee.com/josephrich) ☕
