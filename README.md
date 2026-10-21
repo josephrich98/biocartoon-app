@@ -133,6 +133,10 @@ A: Yes. The figures you make are yours. The illustrations in them keep their own
 
 A: No. Open the web app and start creating. An account is an option if you want your data to be saved long-term.
 
+**Q: What user information do you store?**
+
+A: By default, we don't store any user data. You can use the web app or desktop app without an account, and your figures, uploaded icons, and favorites stay on your own device. If you would like long-term storage of your figures in the web app, you can sign in with Google or GitHub, and then only your name, email, and an online copy of your figures are stored in a secure database. No passwords are ever stored, and you can delete your account and everything in it from the app at any time. Starring an icon only adds to its public count under a random ID, not anything tied to you.
+
 **Q: How do I contribute an illustration or template?**
 
 A: In the app, upload an icon or save a slide as a template and tick "Submit to the shared library". Submissions are reviewed before they appear for everyone. You keep the copyright and choose CC0 or CC BY 4.0.
