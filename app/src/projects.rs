@@ -95,7 +95,7 @@ fn new_id() -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn random_bytes() -> [u8; 16] {
+pub(crate) fn random_bytes() -> [u8; 16] {
     let mut b = [0u8; 16];
     let crypto = web_sys::window().and_then(|w| w.crypto().ok());
     if crypto.and_then(|c| c.get_random_values_with_u8_array(&mut b).ok()).is_none() {
@@ -105,7 +105,7 @@ fn random_bytes() -> [u8; 16] {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn random_bytes() -> [u8; 16] {
+pub(crate) fn random_bytes() -> [u8; 16] {
     use std::hash::{BuildHasher, Hasher};
     // RandomState is keyed from the OS; two hashers give 128 bits.
     let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;

@@ -33,6 +33,8 @@ pub enum Req {
     Variants { id: String },
     /// The rows with these ids (to fill in credits of documents saved before they were stored).
     Lookup { ids: Vec<String> },
+    /// One icon of the whole library, the `seed`th modulo how many there are.
+    Random { seed: u64 },
     /// Record a user-generated asset (already written to `png_local`).
     InsertUser { row: AssetRow },
     /// Take one of the user's own assets back out of the local catalog.
@@ -54,6 +56,8 @@ pub enum Resp {
     Sources { req_id: u64, sources: Vec<SourceInfo> },
     Variants { req_id: u64, rows: Vec<AssetRow> },
     Lookup { req_id: u64, rows: Vec<AssetRow> },
+    /// `None` when the library is empty.
+    Random { req_id: u64, row: Option<AssetRow> },
     Inserted { req_id: u64, result: Result<(), String> },
     Removed { req_id: u64, result: Result<(), String> },
     /// Reply to requests with nothing to report.
@@ -161,6 +165,17 @@ fn handle(w: &Worker, req_id: u64, req: Req) -> Resp {
             Ok(rows) => Resp::Lookup { req_id, rows },
             Err(e) => err(e),
         },
+        Req::Random { seed } => {
+            let filter = Filter::default();
+            match w.search_filtered_total("", &filter) {
+                Ok(0) => Resp::Random { req_id, row: None },
+                Ok(total) => match w.search_filtered("", &filter, (seed % total as u64) as usize, 1, IconSort::Alphabetical) {
+                    Ok(rows) => Resp::Random { req_id, row: rows.into_iter().next() },
+                    Err(e) => err(e),
+                },
+                Err(e) => err(e),
+            }
+        }
         Req::InsertUser { row } => Resp::Inserted { req_id, result: w.insert_user(&row).map_err(|e| e.to_string()) },
         Req::RemoveUser { id } => Resp::Removed { req_id, result: w.remove_user(&id).map(|_| ()).map_err(|e| e.to_string()) },
         Req::RecordUse { source, title } => {

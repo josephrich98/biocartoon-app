@@ -290,7 +290,12 @@ impl BioCartoon {
         let f = &mut self.icons.filter;
         egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).inner_margin(8).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let w = ui.available_width() - 84.0;
+            // The second column takes what the labels leave; any wider and the grid would push the
+            // panel out (it grows to fit), a little more each frame.
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let labels = ["Database", "Author", "Category", "Subcategory", "Database category", "License", "File type"];
+            let label_w = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), Color32::WHITE).size().x).fold(0.0, f32::max);
+            let w = (ui.available_width() - label_w - 8.0).max(60.0);
             egui::Grid::new("search_filters").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label("Database");
                 if multi_select(ui, "filter_db", w, &mut f.sources, &dbs) && !f.sources.is_empty() {
@@ -1714,23 +1719,28 @@ fn multi_select<T: Clone + PartialEq>(ui: &mut egui::Ui, id: &str, width: f32, c
         many => format!("{} selected", many.len()),
     };
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id)
-        .width(width)
-        .selected_text(text)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show_ui(ui, |ui| {
-            for (v, label) in options {
-                let mut on = chosen.contains(v);
-                if ui.checkbox(&mut on, label).changed() {
-                    if on {
-                        chosen.push(v.clone());
-                    } else {
-                        chosen.retain(|c| c != v);
+    // The button stays `width` wide, truncating a long choice, so picking one never widens the
+    // panel; the open list can still be wider and hang over it.
+    ui.allocate_ui(Vec2::new(width, ui.spacing().interact_size.y), |ui| {
+        egui::ComboBox::from_id_salt(id)
+            .width(width)
+            .truncate()
+            .selected_text(text)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                for (v, label) in options {
+                    let mut on = chosen.contains(v);
+                    if ui.checkbox(&mut on, label).changed() {
+                        if on {
+                            chosen.push(v.clone());
+                        } else {
+                            chosen.retain(|c| c != v);
+                        }
+                        changed = true;
                     }
-                    changed = true;
                 }
-            }
-        });
+            });
+    });
     changed
 }
 

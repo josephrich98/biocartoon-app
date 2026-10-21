@@ -555,6 +555,8 @@ pub enum ArrangeKind {
 #[derive(Clone, Debug)]
 pub enum Action {
     InsertAsset(AssetRow),
+    /// Insert an icon picked at random from the whole library.
+    InsertRandom,
     /// Add or remove this install's star on an asset.
     /// Remove one of the user's own assets from their library (its PNG stays on disk).
     RemoveUserAsset(AssetRow),
@@ -1858,6 +1860,15 @@ impl BioCartoon {
                         crate::credits::fill(d.slides.iter_mut(), &rows);
                     }
                 }
+                Resp::Random { row, .. } => match row {
+                    Some(row) => {
+                        // A new icon, not a replacement for one waiting in the Edit tab.
+                        self.replace_target = None;
+                        self.insert_asset(&row);
+                        self.toast(format!("Inserted {}", row.title));
+                    }
+                    None => self.toast_err("The icon library is empty".to_string()),
+                },
                 Resp::Inserted { result, .. } | Resp::Removed { result, .. } => match result {
                     Ok(()) => {
                         // Counts changed; the asset may also belong in (or leave) what's on screen.
@@ -3421,6 +3432,11 @@ impl BioCartoon {
     fn apply(&mut self, a: Action, ctx: &egui::Context) {
         match a {
             Action::InsertAsset(row) => self.insert_asset(&row),
+            Action::InsertRandom => {
+                let b = crate::projects::random_bytes();
+                let seed = u64::from_le_bytes(b[..8].try_into().unwrap());
+                self.catalog.send(Req::Random { seed });
+            }
             Action::RemoveUserAsset(row) => {
                 // Out of the results now; the reply refreshes counts and browse views.
                 let before = self.icons.results.len();
@@ -3980,6 +3996,7 @@ impl BioCartoon {
                         ui.separator();
                         if ui.button("Settings...").clicked() { self.open_settings(SettingsTab::General); ui.close(); }
                         if ui.button(if cfg!(target_arch = "wasm32") { "Bulk download..." } else { "Download..." }).clicked() { self.open_settings(SettingsTab::Offline); ui.close(); }
+                        if ui.button("I'm feeling lucky").on_hover_text("Insert a random icon from the library").clicked() { self.actions.push(Action::InsertRandom); ui.close(); }
                         if ui.button("About BioCartoon").clicked() { self.show_about = true; ui.close(); }
                         // A browser tab is closed by the browser.
                         if !cfg!(target_arch = "wasm32") && ui.button("Quit").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
@@ -4505,7 +4522,7 @@ impl BioCartoon {
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, about, templates, savetemplate, export=<path>, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
-    /// fav=<id>, open=<project id>, rail=<text|lines|shapes|table|edit|slides|page|none|icons|noicons|uploads|favorites|library>).
+    /// fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|edit|slides|page|none|icons|noicons|uploads|favorites|library>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -4518,6 +4535,7 @@ impl BioCartoon {
             for step in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 match step {
                     "home" => self.screen = Screen::Home,
+                    "lucky" => self.actions.push(Action::InsertRandom),
                     // A few projects in the (temporary) smoke-test store, two versions each.
                     "seedprojects" => {
                         for (i, name) in ["Medical Imaging Modalities", "Untitled", "T cell activation pathway with a long name that elides", "tmp"].iter().enumerate() {
