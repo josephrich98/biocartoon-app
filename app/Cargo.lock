@@ -206,6 +206,7 @@ dependencies = [
  "image",
  "js-sys",
  "log",
+ "pdf-writer",
  "resvg",
  "rfd",
  "rusqlite",

@@ -759,6 +759,8 @@ pub struct BioCartoon {
     pub thumbs_pending: HashSet<String>,
     /// Exporting a project from the home screen: its document (first slide is exported).
     pub export_doc: Option<Document>,
+    /// The id of the project in `export_doc`, marked backed up once it is saved as a .biocartoon file.
+    export_project: Option<String>,
     /// Emailing a project: subject and attachments, sent once the PNG export finishes.
     pub pending_email: Option<(String, Vec<PathBuf>)>,
     pub dirty: bool,
@@ -931,6 +933,7 @@ impl BioCartoon {
             action_rx,
             thumbs_pending: HashSet::new(),
             export_doc: None,
+            export_project: None,
             pending_email: None,
             dirty: false,
             actions: Vec::new(),
@@ -2953,7 +2956,11 @@ impl BioCartoon {
         let Some(path) = crate::platform::save_path("biocartoon", "biocartoon", &format!("{}.biocartoon", Self::slugify(&doc.title))) else {
             return false;
         };
-        match crate::projects::to_file(doc).and_then(|b| crate::platform::write_output(&path, &b).map_err(|e| e.to_string())) {
+        self.write_project_file(doc, &path)
+    }
+
+    fn write_project_file(&mut self, doc: &Document, path: &Path) -> bool {
+        match crate::projects::to_file(doc).and_then(|b| crate::platform::write_output(path, &b).map_err(|e| e.to_string())) {
             Ok(()) => {
                 self.toast(format!("Saved a copy to {}", path.display()));
                 true
@@ -3038,6 +3045,7 @@ impl BioCartoon {
         match self.store.load(id) {
             Ok(doc) => {
                 self.export_doc = Some(doc);
+                self.export_project = Some(id.to_string());
                 self.show_export = true;
             }
             Err(e) => self.toast_err(format!("export: {e}")),
@@ -3065,7 +3073,7 @@ impl BioCartoon {
             return self.toast_err(format!("email: {e}"));
         }
         let png = dir.join(format!("{slug}.png"));
-        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false };
+        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: false };
         self.pending_email = Some((doc.title.clone(), vec![png.clone(), file]));
         let job = self.export_job_for(&doc, &[0], png, opts);
         self.export_job = Some(crate::export::start(ctx.clone(), job));
@@ -3125,7 +3133,8 @@ impl BioCartoon {
     fn pick_export_path(&mut self) {
         let fmt = self.settings.export.format;
         let (doc, slide) = self.export_source();
-        let name = if self.settings.export.all_slides && doc.slides.len() > 1 {
+        // The project file always holds every slide.
+        let name = if fmt == ExportFormat::Biocartoon || (self.settings.export.all_slides && doc.slides.len() > 1) {
             format!("{}.{}", Self::slugify(&doc.title), fmt.ext())
         } else {
             format!("{}-slide{}.{}", Self::slugify(&doc.title), slide + 1, fmt.ext())
@@ -3151,10 +3160,19 @@ impl BioCartoon {
             self.toast("An export is already running");
             return;
         }
-        let (doc, slide) = match self.export_doc.take() {
-            Some(d) => (d, 0),
-            None => (self.doc.clone(), self.cur_slide),
+        let (doc, slide, project) = match self.export_doc.take() {
+            Some(d) => (d, 0, self.export_project.take()),
+            None => (self.doc.clone(), self.cur_slide, self.project.clone()),
         };
+        if self.settings.export.format == ExportFormat::Biocartoon {
+            if self.write_project_file(&doc, &path) {
+                if let Some(id) = project {
+                    self.store.mark_backed_up(&id);
+                    self.refresh_projects();
+                }
+            }
+            return;
+        }
         let slides: Vec<usize> = if self.settings.export.all_slides { (0..doc.slides.len()).collect() } else { vec![slide] };
         // Its credits pop up once it is done.
         let credits = if slides.len() > 1 { crate::credits::collect(&doc.slides, 1) } else { crate::credits::collect([&doc.slides[slide]], slide + 1) };
@@ -3234,8 +3252,10 @@ impl BioCartoon {
         let multi = n_slides > 1;
         let all = self.settings.export.all_slides && multi;
         let n_images = if all { all_images } else { slide_images };
+        let project_file = self.settings.export.format == ExportFormat::Biocartoon;
         let heading = match (&self.export_doc, all) {
             (Some(_), _) => format!("Export \"{}\"", doc.title),
+            (None, _) if project_file => "Export project".into(),
             (None, true) => "Export slides".into(),
             (None, false) => "Export slide".into(),
         };
@@ -3243,7 +3263,7 @@ impl BioCartoon {
         let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(heading);
-            if multi && !all && self.export_doc.is_some() {
+            if multi && !all && !project_file && self.export_doc.is_some() {
                 ui.label(egui::RichText::new("Exports the first slide. Open the project to export another slide alone.").color(theme::text_dim()));
             }
             ui.add_space(8.0);
@@ -3255,6 +3275,11 @@ impl BioCartoon {
                     }
                 });
                 ui.end_row();
+
+                // The project file has no rendering options.
+                if project_file {
+                    return;
+                }
 
                 ui.label("Resolution (dpi)");
                 ui.add_enabled_ui(opts.format.is_raster(), |ui| {
@@ -3301,25 +3326,37 @@ impl BioCartoon {
                 ui.end_row();
             });
             ui.add_space(6.0);
+            if project_file {
+                let slides = if multi { format!("all {n_slides} slides") } else { "the slide".into() };
+                ui.label(egui::RichText::new(format!("Stays editable: {slides} and their images in one file, which anyone can open with Open file.")).color(theme::text_dim()));
+            }
             if opts.format == ExportFormat::Png {
                 ui.checkbox(&mut opts.transparent, "Transparent background");
             }
-            ui.add_enabled_ui(n_images > 0 && !opts.individual, |ui| {
-                ui.checkbox(&mut opts.crop, "Crop to images")
-                    .on_hover_text("Crop the sheet to the area covered by the images, instead of exporting the whole slide.");
-            });
-            ui.add_enabled_ui(n_images > 0, |ui| {
-                let counts = if multi { format!("{slide_images} on this slide, {all_images} on all slides") } else { format!("{slide_images} on this slide") };
-                ui.checkbox(&mut opts.individual, format!("Export images individually ({counts})"))
-                    .on_hover_text("Save one file per image, cropped tightly to the image, instead of the whole slide. Files are named <name>-01-<image>, <name>-02-<image>, ...");
-            });
-            ui.add_enabled_ui(multi, |ui| {
-                ui.checkbox(&mut opts.all_slides, format!("Export all slides ({n_slides})"))
-                    .on_hover_text("Save every slide, one file each, named <name>-slide1, <name>-slide2, ...");
-            });
+            if !project_file {
+                ui.add_enabled_ui(n_images > 0 && !opts.individual, |ui| {
+                    ui.checkbox(&mut opts.crop, "Crop to images")
+                        .on_hover_text("Crop the sheet to the area covered by the images, instead of exporting the whole slide.");
+                });
+                ui.add_enabled_ui(n_images > 0, |ui| {
+                    let counts = if multi { format!("{slide_images} on this slide, {all_images} on all slides") } else { format!("{slide_images} on this slide") };
+                    ui.checkbox(&mut opts.individual, format!("Export images individually ({counts})"))
+                        .on_hover_text("Save one file per image, cropped tightly to the image, instead of the whole slide. Files are named <name>-01-<image>, <name>-02-<image>, ...");
+                });
+                ui.add_enabled_ui(multi, |ui| {
+                    ui.checkbox(&mut opts.all_slides, format!("Export all slides ({n_slides})"))
+                        .on_hover_text("Save every slide, one file each, named <name>-slide1, <name>-slide2, ... (a PDF can instead hold them all)");
+                });
+                if all && opts.format == ExportFormat::Pdf && !opts.individual {
+                    ui.indent("pdf_pages", |ui| {
+                        ui.checkbox(&mut opts.pdf_pages, "One PDF, a page per slide")
+                            .on_hover_text("Off: one PDF per slide, named <name>-slide1.pdf, <name>-slide2.pdf, ...");
+                    });
+                }
+            }
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can = !((opts.individual || opts.crop) && n_images == 0);
+                let can = project_file || !((opts.individual || opts.crop) && n_images == 0);
                 if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(Color32::WHITE)).fill(theme::accent())).clicked() { go = true; }
                 if ui.button("Cancel").clicked() { cancel = true; }
             });
@@ -3980,7 +4017,7 @@ impl BioCartoon {
                         if ui.button("New").clicked() { self.actions.push(Action::NewDoc); ui.close(); }
                         if ui.button("Open file...").clicked() { self.actions.push(Action::Open); ui.close(); }
                         if ui.button("Save").clicked() { self.actions.push(Action::Save); ui.close(); }
-                        if ui.button("Save a copy as file...").clicked() { self.actions.push(Action::SaveAs); ui.close(); }
+                        if ui.button("Save as .biocartoon file...").on_hover_text("A copy of the whole project, still editable: anyone can open it with Open file").clicked() { self.actions.push(Action::SaveAs); ui.close(); }
                         if ui.button("Version history...").clicked() { self.actions.push(Action::VersionHistory); ui.close(); }
                         ui.separator();
                         // A button rather than ui.checkbox so the box sits on the right.
@@ -3991,7 +4028,7 @@ impl BioCartoon {
                         }
                         if ui.button("Check spelling and grammar...").clicked() { self.show_spell_window = true; ui.close(); }
                         ui.separator();
-                        if ui.button("Export slide...").clicked() { self.actions.push(Action::OpenExport); ui.close(); }
+                        if ui.button("Export...").clicked() { self.actions.push(Action::OpenExport); ui.close(); }
                         if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = None; self.attributions_export = None; ui.close(); }
                         ui.separator();
                         if ui.button("Settings...").clicked() { self.open_settings(SettingsTab::General); ui.close(); }
@@ -4679,6 +4716,12 @@ impl BioCartoon {
                     "exporttransparent" => self.settings.export.transparent = true,
                     "exportindividual" => self.settings.export.individual = true,
                     "exportcrop" => self.settings.export.crop = true,
+                    "exportall" => self.settings.export.all_slides = true,
+                    s if s.starts_with("exportformat=") => {
+                        if let Some(f) = ExportFormat::from_ext(&s["exportformat=".len()..]) {
+                            self.settings.export.format = f;
+                        }
+                    }
                     "exportdialog" => { self.show_settings = false; self.show_export = true; }
                     // Export the slide to a path, to see the credits pop up afterwards.
                     s if s.starts_with("export=") => { self.show_attributions = false; self.start_export(ctx, PathBuf::from(&s[7..])); }

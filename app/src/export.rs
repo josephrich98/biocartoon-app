@@ -1,5 +1,6 @@
 //! Slide export. The slide (or each image on it) is written out as SVG, which is then either saved
-//! as-is, rasterised with resvg (PNG / JPEG / TIFF at any DPI) or converted with svg2pdf (PDF).
+//! as-is, rasterised with resvg (PNG / JPEG / TIFF at any DPI) or converted with svg2pdf (PDF;
+//! several slides go into one PDF, a page each).
 //! Geometry mirrors `canvas::draw_item` at zoom 1, and text is laid out with egui's own fonts so
 //! line breaks match the canvas. Runs on a worker thread.
 
@@ -24,10 +25,13 @@ pub enum ExportFormat {
     Tif,
     Pdf,
     Svg,
+    /// The editable project file (see [`crate::projects::to_file`]), written by the app rather than
+    /// rendered here.
+    Biocartoon,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 5] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg];
+    pub const ALL: [ExportFormat; 6] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Biocartoon];
     pub fn label(self) -> &'static str {
         match self {
             ExportFormat::Png => "PNG",
@@ -35,6 +39,7 @@ impl ExportFormat {
             ExportFormat::Tif => "TIFF",
             ExportFormat::Pdf => "PDF",
             ExportFormat::Svg => "SVG",
+            ExportFormat::Biocartoon => "BioCartoon",
         }
     }
     pub fn ext(self) -> &'static str {
@@ -44,6 +49,7 @@ impl ExportFormat {
             ExportFormat::Tif => "tif",
             ExportFormat::Pdf => "pdf",
             ExportFormat::Svg => "svg",
+            ExportFormat::Biocartoon => "biocartoon",
         }
     }
     pub fn is_raster(self) -> bool {
@@ -56,6 +62,7 @@ impl ExportFormat {
             "tif" | "tiff" => Some(ExportFormat::Tif),
             "pdf" => Some(ExportFormat::Pdf),
             "svg" => Some(ExportFormat::Svg),
+            "biocartoon" => Some(ExportFormat::Biocartoon),
             _ => None,
         }
     }
@@ -77,11 +84,13 @@ pub struct ExportOptions {
     /// Starts off each session.
     #[serde(skip)]
     pub all_slides: bool,
+    /// PDF of several slides: one file with a page per slide, instead of a file per slide.
+    pub pdf_pages: bool,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false }
+        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: true }
     }
 }
 
@@ -215,6 +224,9 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
     let multi = job.slides.len() > 1;
     let dir = job.path.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = job.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+    // One PDF with a page per slide: collect the pages, write them after the loop.
+    let combine = multi && !opts.individual && opts.format == ExportFormat::Pdf && opts.pdf_pages;
+    let mut pages = Vec::new();
     for (n, slide) in &job.slides {
         let stem = if multi { format!("{stem}-slide{n}") } else { stem.clone() };
         if opts.individual {
@@ -239,16 +251,25 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
             };
             let items: Vec<&Item> = slide.items.iter().collect();
             let svg = build_svg(ctx, &items, region, bg, &images);
+            if combine {
+                pages.push(svg);
+                continue;
+            }
             let path = if multi { dir.join(format!("{stem}.{}", opts.format.ext())) } else { job.path.clone() };
             write_file(&svg, region, opts, &path, &crate::credits::for_items(&items, false))?;
             written.push(path);
         }
     }
-    if written.is_empty() {
+    if !pages.is_empty() {
+        let bytes = pdf_pages(&pages).map_err(|e| format!("{}: {e}", job.path.display()))?;
+        crate::platform::write_output(&job.path, &bytes).map_err(|e| format!("{}: {e}", job.path.display()))?;
+    }
+    if written.is_empty() && pages.is_empty() {
         return Err(if multi { "There are no images on these slides" } else { "There are no images on this slide" }.into());
     }
 
     let mut msg = match written.as_slice() {
+        [] => format!("Exported {} slides to {}", pages.len(), job.path.display()),
         [one] => format!("Exported {}", one.display()),
         many => format!("Exported {} {} to {}", many.len(), if opts.individual { "images" } else { "slides" }, many[0].parent().map(|p| p.display().to_string()).unwrap_or_default()),
     };
@@ -915,6 +936,41 @@ fn png_with_credits(png: Vec<u8>, credits: &str) -> Vec<u8> {
     out
 }
 
+/// One PDF with a page per SVG, each page the size of its SVG.
+fn pdf_pages(svgs: &[String]) -> Result<Vec<u8>, String> {
+    use pdf_writer::{Content, Finish, Name, Pdf, Rect as PdfRect, Ref};
+    let mut alloc = Ref::new(1);
+    let catalog = alloc.bump();
+    let tree_ref = alloc.bump();
+    let mut pdf = Pdf::new();
+    let mut kids = Vec::new();
+    for svg in svgs {
+        let tree = parse(svg)?;
+        // Document pixels to points.
+        let (w, h) = (tree.size().width() * 72.0 / DPI, tree.size().height() * 72.0 / DPI);
+        let (chunk, svg_ref) = svg2pdf::to_chunk(&tree, svg2pdf::ConversionOptions::default()).map_err(|e| e.to_string())?;
+        let mut map = HashMap::new();
+        let chunk = chunk.renumber(|old| *map.entry(old).or_insert_with(|| alloc.bump()));
+        let svg_ref = map[&svg_ref];
+        let (page_ref, content_ref) = (alloc.bump(), alloc.bump());
+        let mut page = pdf.page(page_ref);
+        page.media_box(PdfRect::new(0.0, 0.0, w, h));
+        page.parent(tree_ref);
+        page.contents(content_ref);
+        page.resources().x_objects().pair(Name(b"S"), svg_ref);
+        page.finish();
+        // The SVG's form XObject is a unit square: scale it to the page.
+        let mut content = Content::new();
+        content.transform([w, 0.0, 0.0, h, 0.0, 0.0]).x_object(Name(b"S"));
+        pdf.stream(content_ref, &content.finish());
+        pdf.extend(&chunk);
+        kids.push(page_ref);
+    }
+    pdf.catalog(catalog).pages(tree_ref);
+    pdf.pages(tree_ref).count(kids.len() as i32).kids(kids);
+    Ok(pdf.finish())
+}
+
 /// `credits` (one per line, possibly empty) go into SVG and PNG files as metadata.
 fn write_file(svg: &str, region: Rect, opts: &ExportOptions, path: &Path, credits: &str) -> Result<(), String> {
     let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
@@ -922,6 +978,7 @@ fn write_file(svg: &str, region: Rect, opts: &ExportOptions, path: &Path, credit
     let bytes = match opts.format {
         ExportFormat::Svg if !credits.is_empty() => svg_with_credits(svg, credits).into_bytes(),
         ExportFormat::Svg => svg.as_bytes().to_vec(),
+        ExportFormat::Biocartoon => return Err("A .biocartoon file is a project, not a rendered slide".into()),
         ExportFormat::Pdf => {
             let tree = parse(svg)?;
             svg2pdf::to_pdf(&tree, svg2pdf::ConversionOptions::default(), svg2pdf::PageOptions { dpi: DPI }).map_err(|e| err(&e))?
@@ -1098,7 +1155,7 @@ mod tests {
         requests.insert(src.cache_key(), Request::Path(icon.clone()));
         let job = |format, dpi, transparent, individual, name: &str| ExportJob {
             path: dir.join(name),
-            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false },
+            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false, pdf_pages: true },
             slides: vec![(1, slide.clone())],
             page,
             background: [250, 245, 235, 255],
@@ -1153,5 +1210,20 @@ mod tests {
         crop.opts.crop = true;
         run(&ctx, crop).unwrap();
         assert!(dir.join("deckcrop-slide1.png").exists() && !dir.join("deckcrop-slide2.png").exists());
+
+        // PDF of all slides: one file with a page each, unless asked for a file per slide.
+        let mut pdf = job(ExportFormat::Pdf, 72, false, false, "deck.pdf");
+        pdf.slides = vec![(1, slide.clone()), (2, slide.clone()), (3, slide.clone())];
+        let msg = run(&ctx, pdf).unwrap();
+        assert!(msg.contains("3 slides"), "{msg}");
+        let bytes = std::fs::read(dir.join("deck.pdf")).unwrap();
+        assert!(bytes.windows(8).any(|w| w == b"/Count 3"));
+        assert_eq!(bytes.windows(10).filter(|w| w == b"/Type /Pag").count(), 4, "a page tree and three pages");
+        assert!(!dir.join("deck-slide1.pdf").exists());
+        let mut each = job(ExportFormat::Pdf, 72, false, false, "split.pdf");
+        each.slides = vec![(1, slide.clone()), (2, slide.clone())];
+        each.opts.pdf_pages = false;
+        run(&ctx, each).unwrap();
+        assert!(dir.join("split-slide1.pdf").exists() && dir.join("split-slide2.pdf").exists() && !dir.join("split.pdf").exists());
     }
 }
