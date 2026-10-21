@@ -8,7 +8,8 @@ which Cloudflare's static assets apply to every response.
 
 Keep connect-src in step with the hosts the app fetches from: DEFAULT_ASSET_URL (biocartoon
 catalog/src/lib.rs), DEFAULT_SUBMIT_URL (src/submit.rs) and the AI providers (src/ai.rs). A custom
-asset or submission URL set in Settings is blocked on the web build.
+asset or submission URL set in Settings is blocked on the web build, as is a vLLM server anywhere
+but localhost.
 """
 import base64
 import hashlib
@@ -26,14 +27,17 @@ APP_HOSTS = [
     "https://generativelanguage.googleapis.com",
     "https://api.anthropic.com",
 ]
-# trunk serve: a local Worker (wrangler dev) and trunk's own reload socket.
-DEV_HOSTS = ["http://localhost:*", "http://127.0.0.1:*", "ws://localhost:*", "ws://127.0.0.1:*"] if DEBUG else []
+# A vLLM server on the user's own machine (src/ai.rs); under trunk serve, also a local Worker
+# (wrangler dev).
+LOCAL_HOSTS = ["http://localhost:*", "http://127.0.0.1:*"]
+# trunk serve: trunk's own reload socket.
+DEV_HOSTS = ["ws://localhost:*", "ws://127.0.0.1:*"] if DEBUG else []
 
 # 'wasm-unsafe-eval' lets the page compile its own .wasm; it doesn't allow eval() of strings.
 POLICIES = {
     "index.html": {
         "script-src": ["'self'", "'wasm-unsafe-eval'"],
-        "connect-src": ["'self'", *APP_HOSTS, *DEV_HOSTS],
+        "connect-src": ["'self'", *APP_HOSTS, *LOCAL_HOSTS, *DEV_HOSTS],
         "img-src": ["'self'", "data:", "blob:"],
     },
     "download.html": {

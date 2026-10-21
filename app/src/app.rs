@@ -4853,6 +4853,16 @@ fn ai_fields(ui: &mut egui::Ui, provider: &mut BackendKind, model: &mut String, 
                 ui.hyperlink_to("Docs", provider.key_url());
             });
             ui.end_row();
+            // The web app's CSP (csp.py) only reaches localhost, and the server must allow its origin.
+            if cfg!(target_arch = "wasm32") {
+                ui.label("");
+                ui.label(
+                    egui::RichText::new("Start vLLM with --allowed-origins '[\"https://app.biocartoon.com\"]',\nthen enter http://localhost:8000.")
+                        .small()
+                        .color(theme::text_dim()),
+                );
+                ui.end_row();
+            }
             return;
         }
 
