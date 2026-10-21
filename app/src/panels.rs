@@ -312,7 +312,7 @@ impl BioCartoon {
                 ui.label("Subcategory");
                 multi_select(ui, "filter_sub", w, &mut f.subs, &subs);
                 ui.end_row();
-                ui.label("DB category").on_hover_text("A database's own categories, by its code (BA: NIAID NIH BioArt, ...)");
+                ui.label("Database category");
                 multi_select(ui, "filter_dbcat", w, &mut f.db_cats, &db_cats);
                 ui.end_row();
                 ui.label("License");
@@ -796,7 +796,7 @@ impl BioCartoon {
                 ui.label(&row.meta.description);
             }
             if !row.meta.category.is_empty() {
-                ui.label(format!("Category: {}", row.meta.category));
+                ui.label(format!("Database category: {}", row.meta.category));
             }
             ui.label(egui::RichText::new(format!("Template  ·  {}  ·  {}", row.meta.author, row.meta.license)).small().color(theme::text_dim()));
         };
@@ -1957,17 +1957,20 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
         if colors > 1 {
             ui.label(format!("Comes in {colors} colors: place it, then pick one in Edit."));
         }
-        if !row.category.is_empty() {
-            ui.label(format!("Category: {}", row.category));
+        if !row.taxa.is_empty() {
+            let taxa: Vec<String> = row.taxa.iter().map(|(c, s)| if s.is_empty() { c.to_string() } else { format!("{c} › {s}") }).collect();
+            ui.label(format!("Category: {}", taxa.join(", ")));
         }
-        ui.label(format!("{name}  ·  {}", row.license));
+        if !row.category.is_empty() {
+            ui.label(format!("Database category: {}", row.category));
+        }
+        let format = if row.svg_key.is_some() { crate::catalog::FORMAT_SVG } else { crate::catalog::FORMAT_PNG };
+        let mut last = format!("{name}  ·  {}  ·  {format}", row.license);
+        if row.png_width > 0 && row.png_height > 0 {
+            last += &format!("  ·  {} × {} px", row.png_width, row.png_height);
+        }
+        ui.label(last);
         ui.label(egui::RichText::new(&row.credit).small().color(theme::text_dim()));
-        let stars = match (row.stars, fav) {
-            (_, true) => format!("{} In your favorites ({}). Right-click to take it out.", ph::STAR, star_count(row.stars.max(1))),
-            (0, _) => "No stars yet. Star it to add it to your favorites.".to_string(),
-            (n, false) => format!("{} {}. Star it to add it to your favorites.", ph::STAR, star_count(n)),
-        };
-        ui.label(egui::RichText::new(stars).small().color(theme::text_dim()));
     };
     // A long press opens the context menu too, so the info goes there for touch screens.
     let r = r.on_hover_ui(info);
@@ -2000,11 +2003,6 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
         return (r.on_hover_text(e), act);
     }
     (r, act)
-}
-
-/// "1 star", "12 stars": everyone's stars on an asset.
-fn star_count(n: i64) -> String {
-    format!("{n} star{}", if n == 1 { "" } else { "s" })
 }
 
 /// A five-pointed star centred on `c`: filled gold (a favorite), or an empty white outline.

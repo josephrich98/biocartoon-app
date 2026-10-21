@@ -2173,6 +2173,7 @@ impl BioCartoon {
             svg_key: None,
             stars: 0,
             starred: false,
+            taxa: Vec::new(),
         };
         if let Err(e) = self.save_user_png(img, &mut row) {
             self.toast_err(e);
@@ -2412,6 +2413,7 @@ impl BioCartoon {
                     svg_key: None,
                     stars: 0,
                     starred: false,
+                    taxa: Vec::new(),
                 };
                 match img {
                     Ok(img) => self.upload_asset(img, row, share, replaces),

@@ -384,6 +384,7 @@ mod tests {
             svg_key: None,
             stars: 0,
             starred: false,
+            taxa: Vec::new(),
         };
         fill(doc.slides.iter_mut(), &[row]);
         assert!(missing(&doc).is_empty());

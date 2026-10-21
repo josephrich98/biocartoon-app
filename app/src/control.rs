@@ -521,6 +521,7 @@ impl BioCartoon {
                     svg_key: s(a, "svg_key").map(str::to_string),
                     stars: 0,
                     starred: false,
+                    taxa: Vec::new(),
                 };
                 if row.id.is_empty() || row.png_key.is_empty() {
                     return Err("asset needs at least id and png_key".into());
