@@ -425,6 +425,13 @@ impl UploadTarget {
     }
 }
 
+/// Screens narrower than this (in points) get the phone layout: one side panel at a time.
+const PHONE_WIDTH: f32 = 700.0;
+
+fn phone_width(ctx: &egui::Context) -> bool {
+    ctx.content_rect().width() < PHONE_WIDTH
+}
+
 /// Read and decode an image to add to the library.
 fn read_image(p: &Path) -> Result<image::RgbaImage, String> {
     crate::storage::read(p).map_err(|e| e.to_string()).and_then(|b| crate::assets::load_image(&b, crate::submit::MAX_IMAGE_SIDE)).map_err(|e| format!("{}: {e}", p.display()))
@@ -723,6 +730,9 @@ pub struct BioCartoon {
     pub rail_before_edit: Option<RailTab>,
     /// The tab the right panel showed last, which a drag in from the right edge reopens.
     pub last_rail: Option<RailTab>,
+    /// On a phone-width screen, the side panels open last frame (Icons, right panel); `None` on
+    /// wider screens. See [`BioCartoon::one_panel_on_phones`].
+    phone_panels: Option<(bool, Option<RailTab>)>,
     pub replace_target: Option<ItemId>,
     /// Image items placed before their picture had loaded, to take its shape once it has.
     pending_fit: Vec<(ItemId, Fit)>,
@@ -917,6 +927,7 @@ impl BioCartoon {
             ai_edit: None,
             rail_before_edit: None,
             last_rail: None,
+            phone_panels: None,
             replace_target: None,
             pending_fit: Vec::new(),
             crop_mode: false,
@@ -3568,9 +3579,20 @@ impl BioCartoon {
 
     // ---------- actions ----------
 
+    /// On a phone the Icons panel covers the canvas, so placing something from it closes it and
+    /// shows the page; on wider screens it stays open for the next pick.
+    fn hide_icons_on_phones(&mut self, ctx: &egui::Context) {
+        if phone_width(ctx) {
+            self.settings.show_icons = false;
+        }
+    }
+
     fn apply(&mut self, a: Action, ctx: &egui::Context) {
         match a {
-            Action::InsertAsset(row) => self.insert_asset(&row),
+            Action::InsertAsset(row) => {
+                self.insert_asset(&row);
+                self.hide_icons_on_phones(ctx);
+            }
             Action::InsertRandom => {
                 let b = crate::projects::random_bytes();
                 let seed = u64::from_le_bytes(b[..8].try_into().unwrap());
@@ -3588,7 +3610,10 @@ impl BioCartoon {
                 self.toast(format!("Removed \"{}\" from your library", row.title));
             }
             Action::ToggleFavorite(id) => self.toggle_favorite(id),
-            Action::InsertFile(p) => self.insert_file(&p),
+            Action::InsertFile(p) => {
+                self.insert_file(&p);
+                self.hide_icons_on_phones(ctx);
+            }
             Action::InsertText { text, size, bold } => {
                 let id = self.doc.alloc_id();
                 let kind = ItemKind::text(text.clone(), size, [30, 30, 30, 255], TextAlign::Left, bold);
@@ -3870,7 +3895,10 @@ impl BioCartoon {
                 });
             }
             Action::AddTemplateFiles(paths) => self.add_template_files(&paths),
-            Action::UseSavedTemplate(row) => self.load_saved_template(row),
+            Action::UseSavedTemplate(row) => {
+                self.load_saved_template(row);
+                self.hide_icons_on_phones(ctx);
+            }
             Action::RemoveTemplate(id) => {
                 if let Err(e) = self.templates.remove_local(&id) {
                     self.toast_err(e);
@@ -4037,6 +4065,29 @@ impl BioCartoon {
         }
     }
 
+    /// A phone-width screen has room for the canvas beside one side panel at most: opening one
+    /// closes the other (the Icons panel stays when both start open), and the page is fit to the
+    /// canvas whenever a panel closes and gives it room.
+    fn one_panel_on_phones(&mut self, ctx: &egui::Context) {
+        if !phone_width(ctx) {
+            self.phone_panels = None;
+            return;
+        }
+        if self.settings.show_icons && self.rail.is_some() {
+            // The right panel just opened beside the Icons panel: it wins.
+            if self.phone_panels.is_some_and(|(icons, rail)| icons && rail.is_none()) {
+                self.settings.show_icons = false;
+            } else {
+                self.rail = None;
+            }
+        }
+        let now = (self.settings.show_icons, self.rail);
+        if self.phone_panels.is_some_and(|(icons, rail)| (icons && !now.0) || (rail.is_some() && now.1.is_none())) {
+            self.view.fit_requested = true;
+        }
+        self.phone_panels = Some(now);
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
@@ -4081,6 +4132,7 @@ impl BioCartoon {
         self.refresh_spelling(&ctx);
         self.top_bar(ui);
         self.bottom_bar(ui);
+        self.one_panel_on_phones(&ctx);
         if self.settings.show_icons {
             self.left_panel(ui);
         }
