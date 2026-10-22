@@ -135,6 +135,12 @@ fn handle_cursor(h: usize) -> egui::CursorIcon {
 }
 
 const HANDLE_R: f32 = 5.0;
+/// A second click this soon (seconds) and this close (screen points) to the first is a double
+/// click. Egui's own test (0.3 s, 6 points) is made for a mouse: two finger taps are rarely that
+/// close or quick, and the browser build also sees every tap twice (as pointer and as touch
+/// events), so egui counts a quick double tap as a triple click.
+const DOUBLE_CLICK_SECS: f64 = 0.5;
+const DOUBLE_CLICK_DIST: f32 = 30.0;
 
 fn rotate_about(p: Pos2, c: Pos2, a: f32) -> Pos2 {
     c + Rot2::from_angle(a) * (p - c)
@@ -1648,7 +1654,14 @@ impl BioCartoon {
             }
         }
         // A click (or tap) only selects; a double click opens Edit, and long press the menu.
-        if response.double_clicked() {
+        let double_clicked = response.clicked() && ptr.is_some_and(|p| {
+            let now = ui.input(|i| i.time);
+            let double = self.last_canvas_click.is_some_and(|(t, q)| now - t < DOUBLE_CLICK_SECS && (p - q).length() < DOUBLE_CLICK_DIST);
+            // A third click starts over rather than counting as another double.
+            self.last_canvas_click = if double { None } else { Some((now, p)) };
+            double
+        });
+        if double_clicked {
             if let Some(p) = ptr {
                 let d = xf.to_doc(p);
                 if let Some(id) = self.item_at(d, tol) {

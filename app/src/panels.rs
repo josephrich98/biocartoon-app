@@ -97,7 +97,7 @@ impl BioCartoon {
                     IconsMode::Generate => ("Generate with AI".into(), true),
                     IconsMode::Uploads => ("Uploads".into(), true),
                     IconsMode::Contribute => ("Contribute artwork".into(), true),
-                    IconsMode::Suggest => ("Submit a suggestion".into(), true),
+                    IconsMode::Suggest => ("Submit an idea".into(), true),
                     IconsMode::Favorites => ("Favorites".into(), true),
                     IconsMode::Library => ("Your library".into(), true),
                 };
@@ -485,7 +485,7 @@ impl BioCartoon {
                 if row_button(ui, ph::CLOUD_ARROW_UP, "Contribute artwork").on_hover_text("Share your icons and templates with everyone").clicked() {
                     self.open_contribute();
                 }
-                if row_button(ui, ph::CHAT_CIRCLE_TEXT, "Submit a suggestion").on_hover_text("Ask the BioCartoon team for an icon or template").clicked() {
+                if row_button_with(ui, paint_thought_bubble, "Submit an idea").on_hover_text("Ask the BioCartoon team for an icon, a template or anything else").clicked() {
                     self.actions.push(Action::OpenSuggest(String::new()));
                 }
                 ui.add_space(4.0);
@@ -703,22 +703,24 @@ impl BioCartoon {
                 self.icons.mode = IconsMode::Generate;
             }
             ui.label(dim(", or "));
-            if ui.add(link("Submit a suggestion")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            if ui.add(link("Submit an idea")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.actions.push(Action::OpenSuggest(self.icons.query.trim().to_string()));
             }
             ui.label(dim("."));
         });
     }
 
-    /// Submit a suggestion: ask the BioCartoon team for an icon or template.
+    /// Submit an idea: ask the BioCartoon team for an icon, a template or anything else.
     fn suggest_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Submit a suggestion for an icon or template to the BioCartoon team.").color(theme::text_dim()));
+        ui.label(egui::RichText::new("Submit an idea for an icon or template (or anything else you would like to see) to the BioCartoon team.").color(theme::text_dim()));
         ui.add_space(8.0);
         let w = ui.available_width();
-        ui.label(egui::RichText::new("Item type").strong());
-        egui::ComboBox::from_id_salt("suggest_kind").width(w).selected_text(if self.suggest.template { "Template" } else { "Icon" }).show_ui(ui, |ui| {
-            ui.selectable_value(&mut self.suggest.template, false, "Icon");
-            ui.selectable_value(&mut self.suggest.template, true, "Template");
+        ui.label(egui::RichText::new("Idea type").strong());
+        let kinds = crate::submit::IDEA_KINDS;
+        egui::ComboBox::from_id_salt("suggest_kind").width(w).selected_text(kinds.get(self.suggest.kind).unwrap_or(&kinds[0]).1).show_ui(ui, |ui| {
+            for (i, (_, label)) in kinds.iter().enumerate() {
+                ui.selectable_value(&mut self.suggest.kind, i, *label);
+            }
         });
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Title").strong());
@@ -729,9 +731,13 @@ impl BioCartoon {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Name").strong());
         ui.add(egui::TextEdit::singleline(&mut self.suggest.name).hint_text("Optional").char_limit(60).desired_width(w));
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Email").strong());
+        ui.add(egui::TextEdit::singleline(&mut self.suggest.email).hint_text("Optional, never published").char_limit(254).desired_width(w))
+            .on_hover_text("Only the BioCartoon team sees it, in case they want to follow up on your idea");
         ui.add_space(12.0);
         let can = !self.suggest.title.trim().is_empty() && !self.suggest.busy;
-        let label = format!("{}  Submit suggestion", ph::PAPER_PLANE_TILT);
+        let label = format!("{}  Submit idea", ph::PAPER_PLANE_TILT);
         let b = ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent()).min_size(Vec2::new(w, 38.0)));
         if b.on_disabled_hover_text("Give it a title first").clicked() {
             self.actions.push(Action::SubmitSuggestion);
@@ -1821,12 +1827,15 @@ fn multi_select<T: Clone + PartialEq>(ui: &mut egui::Ui, id: &str, width: f32, c
 }
 
 fn row_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+    row_button_with(ui, |ui| { ui.label(egui::RichText::new(icon).size(16.0).color(Color32::WHITE)); }, label)
+}
+
+/// A [`row_button`] whose icon is drawn by `icon` (for icons the Phosphor font lacks).
+fn row_button_with(ui: &mut egui::Ui, icon: impl FnOnce(&mut egui::Ui), label: &str) -> egui::Response {
     let r = egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            egui::Frame::new().fill(theme::accent_dim()).corner_radius(6).inner_margin(4).show(ui, |ui| {
-                ui.label(egui::RichText::new(icon).size(16.0).color(Color32::WHITE));
-            });
+            egui::Frame::new().fill(theme::accent_dim()).corner_radius(6).inner_margin(4).show(ui, icon);
             ui.label(label);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(ph::CARET_RIGHT).color(theme::text_dim()));
@@ -1838,6 +1847,38 @@ fn row_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
         ui.painter().rect_stroke(r.response.rect, 8.0, Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
     }
     resp
+}
+
+/// A thought bubble, in the space and style of a 16 px Phosphor icon (Phosphor has none).
+fn paint_thought_bubble(ui: &mut egui::Ui) {
+    // A transparent glyph reserves exactly the room the other rows' icons take.
+    let r = ui.label(egui::RichText::new(ph::SQUARE).size(16.0).color(Color32::TRANSPARENT)).rect;
+    let s = r.height().min(r.width()) / 16.0;
+    let at = |x: f32, y: f32| r.center() + Vec2::new(x - 8.0, y - 8.0) * s;
+    let stroke = Stroke::new(1.4 * s, Color32::WHITE);
+    let p = ui.painter();
+    // A cloud of three overlapping puffs, its outline drawn as arcs so the overlaps don't show.
+    let puffs = [(at(6.6, 6.6), 3.6 * s), (at(10.6, 5.4), 3.9 * s), (at(11.4, 9.4), 3.0 * s), (at(7.4, 9.8), 2.8 * s)];
+    for (i, &(c, rad)) in puffs.iter().enumerate() {
+        let mut arc: Vec<Pos2> = Vec::new();
+        for k in 0..=48 {
+            let a = k as f32 / 48.0 * std::f32::consts::TAU;
+            let q = c + Vec2::angled(a) * rad;
+            if puffs.iter().enumerate().all(|(j, &(c2, r2))| j == i || q.distance(c2) >= r2 - 0.01) {
+                arc.push(q);
+            } else if arc.len() > 1 {
+                p.add(egui::Shape::line(std::mem::take(&mut arc), stroke));
+            } else {
+                arc.clear();
+            }
+        }
+        if arc.len() > 1 {
+            p.add(egui::Shape::line(arc, stroke));
+        }
+    }
+    // The trail of little bubbles down to the thinker.
+    p.circle_stroke(at(3.8, 12.6), 1.3 * s, stroke);
+    p.circle_filled(at(1.9, 14.9), 0.9 * s, Color32::WHITE);
 }
 
 /// `s` as an HTML form query value: "mitochondrial gene" -> "mitochondrial+gene".

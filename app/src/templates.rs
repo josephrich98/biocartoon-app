@@ -440,7 +440,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pic = dir.join("pic.png");
         image::RgbaImage::from_pixel(40, 30, image::Rgba([200, 60, 60, 255])).save(&pic).unwrap();
-        let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), author: "tester".into(), license: "CC0-1.0".into() };
+        let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), author: "tester".into(), license: "CC0-1.0".into(), email: String::new() };
         let image = ItemKind::Image { source: ImageSource::file(pic.display().to_string()), crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0] };
         let text = ItemKind::text("Step 1", 20.0, [0, 0, 0, 255], crate::doc::TextAlign::Left, true);
         let slide = Slide { name: "x".into(), items: vec![Item::new(1, "pic", image, egui::Pos2::ZERO, egui::Vec2::splat(50.0)), Item::new(2, "t", text, egui::Pos2::ZERO, egui::Vec2::splat(50.0))], comments: Vec::new() };

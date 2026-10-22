@@ -25,6 +25,9 @@ pub struct SubmitMeta {
     pub category: String,
     pub author: String,
     pub license: String,
+    /// Optional contact address for the reviewers; the Worker stores it privately and never publishes it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub email: String,
 }
 
 pub enum Part<'a> {
@@ -54,20 +57,35 @@ pub fn submit(url: &str, parts: &[Part]) -> Result<String, String> {
     post(url, "submit", &format!("multipart/form-data; boundary={boundary}"), body)
 }
 
-/// A request for an icon or template the library lacks, sent to `<url>/suggest`.
+/// Kinds of idea the "Submit an idea" form offers: (value sent, label).
+pub const IDEA_KINDS: [(&str, &str); 3] = [("icon", "Icon"), ("template", "Template"), ("other", "Something else")];
+
+/// An idea for the BioCartoon team (an icon or template the library lacks, or anything else),
+/// sent to `<url>/suggest`.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Suggestion {
-    /// "icon" or "template".
+    /// One of [`IDEA_KINDS`].
     pub kind: &'static str,
     pub title: String,
     pub description: String,
     pub name: String,
+    /// Optional contact address, seen only by the reviewers.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub email: String,
+}
+
+/// A plausible email address, or empty (the field is optional); the Worker checks the same way.
+pub fn check_email(s: &str) -> Result<String, String> {
+    let s = s.trim();
+    let ok = s.is_empty()
+        || (s.chars().count() <= 254 && !s.chars().any(char::is_whitespace) && s.split_once('@').is_some_and(|(user, host)| !user.is_empty() && !host.contains('@') && host.contains('.') && !host.starts_with('.') && !host.ends_with('.')));
+    if ok { Ok(s.to_string()) } else { Err(format!("\"{s}\" doesn't look like an email address")) }
 }
 
 /// POST a suggestion; returns its id.
 pub fn suggest(url: &str, s: &Suggestion) -> Result<String, String> {
     if cfg!(target_arch = "wasm32") {
-        return Err("Sending suggestions isn't available in the web version yet.".into());
+        return Err("Sending ideas isn't available in the web version yet.".into());
     }
     let body = serde_json::to_vec(s).map_err(|e| e.to_string())?;
     post(url, "suggest", "application/json", body)
@@ -117,6 +135,15 @@ impl RateLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emails() {
+        assert_eq!(check_email("  ").unwrap(), "");
+        assert_eq!(check_email(" ann@lab.org ").unwrap(), "ann@lab.org");
+        for bad in ["ann", "ann@lab", "@lab.org", "ann@@lab.org", "a b@lab.org", "ann@.org", "ann@lab."] {
+            assert!(check_email(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn rate_limit_window() {

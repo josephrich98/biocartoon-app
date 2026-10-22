@@ -80,6 +80,32 @@ fn bounce_downloads(path: &Path) {
     unsafe { NSDistributedNotificationCenter::defaultCenter().postNotificationName_object(&name, Some(&file)) };
 }
 
+/// Keep the browser from dropping unsaved work: ask for a save as soon as the tab is hidden or
+/// closing, and have the browser confirm leaving while changes or storage writes are pending. The
+/// desktop needs none of this, since `on_exit` saves. Call once at startup.
+pub fn guard_unsaved(ctx: &egui::Context) {
+    #[cfg(target_arch = "wasm32")]
+    web::guard_unsaved(ctx);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = ctx;
+}
+
+/// Tell [`guard_unsaved`] whether the open document has changes not yet saved.
+pub fn set_unsaved(unsaved: bool) {
+    #[cfg(target_arch = "wasm32")]
+    web::UNSAVED.with(|u| u.set(unsaved));
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = unsaved;
+}
+
+/// Whether the tab was hidden or started closing since the last call, so the app should save now.
+pub fn take_save_request() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    return web::SAVE_NOW.with(|s| s.replace(false));
+    #[cfg(not(target_arch = "wasm32"))]
+    false
+}
+
 /// Browser build: save a Blob (e.g. a zip assembled in parts) as a download.
 #[cfg(target_arch = "wasm32")]
 pub fn download_blob(name: &str, blob: &web_sys::Blob) -> Result<(), String> {
@@ -94,6 +120,43 @@ mod web {
 
     fn err(e: wasm_bindgen::JsValue) -> String {
         format!("{e:?}")
+    }
+
+    thread_local! {
+        pub static UNSAVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub static SAVE_NOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub fn guard_unsaved(ctx: &egui::Context) {
+        let Some(window) = web_sys::window() else { return };
+        let ctx = ctx.clone();
+        let save_now = move || {
+            SAVE_NOW.with(|s| s.set(true));
+            ctx.request_repaint();
+        };
+        // Hiding is the last reliable moment on phones, which often discard background tabs.
+        let on_hide = {
+            let save_now = save_now.clone();
+            Closure::<dyn FnMut()>::new(move || {
+                if web_sys::window().and_then(|w| w.document()).is_some_and(|d| d.hidden()) {
+                    save_now();
+                }
+            })
+        };
+        // No frame runs once the page unloads, so a save that isn't done yet needs the prompt;
+        // if the user stays, the requested save runs on the next frame.
+        let on_unload = Closure::<dyn FnMut(web_sys::BeforeUnloadEvent)>::new(move |e: web_sys::BeforeUnloadEvent| {
+            save_now();
+            if UNSAVED.with(std::cell::Cell::get) || crate::storage::writes_pending() {
+                e.prevent_default();
+            }
+        });
+        if let Some(doc) = window.document() {
+            let _ = doc.add_event_listener_with_callback("visibilitychange", on_hide.as_ref().unchecked_ref());
+        }
+        let _ = window.add_event_listener_with_callback("beforeunload", on_unload.as_ref().unchecked_ref());
+        on_hide.forget();
+        on_unload.forget();
     }
 
     /// Clicks a hidden `<input type="file">`. Browsers only open pickers shortly after a user

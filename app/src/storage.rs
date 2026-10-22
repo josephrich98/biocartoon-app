@@ -55,13 +55,18 @@ mod imp {
     pub fn persisted() -> Option<bool> {
         Some(true)
     }
+
+    /// Writes finish before [`write`] returns.
+    pub fn writes_pending() -> bool {
+        false
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::*;
     use idb::{Database, DatabaseEvent, Factory, ObjectStoreParams, TransactionMode};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -80,6 +85,13 @@ mod imp {
 
     thread_local! {
         static DB: RefCell<Option<Rc<Database>>> = const { RefCell::new(None) };
+        /// IndexedDB writes started by [`persist`] that haven't finished.
+        static PENDING: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Whether some writes haven't reached IndexedDB yet, so closing the tab now could lose them.
+    pub fn writes_pending() -> bool {
+        PENDING.with(Cell::get) > 0
     }
 
     /// Load everything saved in this browser. Call once before the app starts; without
@@ -150,6 +162,7 @@ mod imp {
     fn persist(key: &Path, value: Option<Vec<u8>>) {
         let Some(db) = DB.with(|d| d.borrow().clone()) else { return };
         let key = key.to_string_lossy().to_string();
+        PENDING.with(|n| n.set(n.get() + 1));
         wasm_bindgen_futures::spawn_local(async move {
             let res: Result<(), idb::Error> = async {
                 let tx = db.transaction(&[STORE], TransactionMode::ReadWrite)?;
@@ -165,6 +178,7 @@ mod imp {
                 Ok(())
             }
             .await;
+            PENDING.with(|n| n.set(n.get() - 1));
             if let Err(e) = res {
                 log::error!("storage: saving {key}: {e}");
             }

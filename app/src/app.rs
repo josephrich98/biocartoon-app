@@ -86,6 +86,8 @@ pub struct Settings {
     pub submit_url: String,
     /// Public credit for contributions (empty: "anonymous").
     pub contributor_name: String,
+    /// Optional contact address sent privately with contributions and ideas (never published).
+    pub contributor_email: String,
     /// Random id of this install, so the Worker counts its stars once (made on first run).
     pub client_id: String,
     /// Words added to the spelling dictionary ("Add to dictionary").
@@ -137,6 +139,7 @@ impl Default for Settings {
             search_sort: IconSort::Relevance,
             submit_url: String::new(),
             contributor_name: String::new(),
+            contributor_email: String::new(),
             client_id: String::new(),
             custom_words: Vec::new(),
             check_grammar: true,
@@ -447,13 +450,15 @@ impl TemplateSlide {
     }
 }
 
-/// The Icons panel's "Submit a suggestion" form.
+/// The Icons panel's "Submit an idea" form.
 #[derive(Default)]
 pub struct SuggestState {
-    pub template: bool,
+    /// Index into [`crate::submit::IDEA_KINDS`].
+    pub kind: usize,
     pub title: String,
     pub description: String,
     pub name: String,
+    pub email: String,
     pub busy: bool,
 }
 
@@ -487,6 +492,8 @@ pub struct UploadDialog {
     pub share: bool,
     /// Public credit name for a submission.
     pub credit: String,
+    /// Private contact address for a submission (optional).
+    pub email: String,
     /// Picked items still to go through the dialog after this one.
     pub queue: Vec<UploadTarget>,
     /// Where this one is in the batch: (1-based position, batch size).
@@ -680,7 +687,7 @@ pub enum Action {
     AddTemplateFiles(Vec<PathBuf>),
     /// Open the library dialog for everything picked under Contribute artwork, one at a time.
     ContributeSelected,
-    /// Open Submit a suggestion, with this title when it is not empty.
+    /// Open Submit an idea, with this title when it is not empty.
     OpenSuggest(String),
     SubmitSuggestion,
     AddSlide,
@@ -838,6 +845,8 @@ pub struct BioCartoon {
     /// The Attributions window lists only credits the licenses require.
     pub attributions_required_only: bool,
     pub drag: Option<crate::canvas::Drag>,
+    /// When and where (screen) the last click on the canvas landed, to spot a double click.
+    pub last_canvas_click: Option<(f64, Pos2)>,
     /// The guide (index into `doc.guides`) picked on the canvas: Delete removes it.
     pub selected_guide: Option<usize>,
     pub app_dir: PathBuf,
@@ -887,6 +896,7 @@ impl BioCartoon {
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         TextFont::install(&mut fonts);
         cc.egui_ctx.set_fonts(fonts);
+        crate::platform::guard_unsaved(&cc.egui_ctx);
 
         let mut settings: Settings = cc
             .storage
@@ -1011,6 +1021,7 @@ impl BioCartoon {
             credit_item: None,
             attributions_required_only: false,
             drag: None,
+            last_canvas_click: None,
             selected_guide: None,
             app_dir,
             pending_edits: HashMap::new(),
@@ -2347,6 +2358,7 @@ impl BioCartoon {
             license,
             share: self.submit_url().is_some(),
             credit: self.settings.contributor_name.clone(),
+            email: self.settings.contributor_email.clone(),
             step: (step, step + targets.len()),
             queue: targets,
             view_zoom: 1.0,
@@ -2454,6 +2466,14 @@ impl BioCartoon {
                     self.upload_dialog = Some(d);
                     return;
                 }
+                let email = match crate::submit::check_email(&d.email) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.toast_err(e);
+                        self.upload_dialog = Some(d);
+                        return;
+                    }
+                };
                 let now = self.ctx.input(|i| i.time);
                 if let Err(e) = self.upload_rate.try_take(now) {
                     self.toast_err(e);
@@ -2461,12 +2481,14 @@ impl BioCartoon {
                     return;
                 }
                 self.settings.contributor_name = credit.clone();
+                self.settings.contributor_email = email.clone();
                 let meta = SubmitMeta {
                     title: name.clone(),
                     description: description.clone(),
                     category: category.clone(),
                     author: if credit.is_empty() { "anonymous".into() } else { credit.clone() },
                     license: d.license.into(),
+                    email,
                 };
                 Some((url, meta))
             }
@@ -2518,12 +2540,16 @@ impl BioCartoon {
         self.open_upload_queue(d.queue, d.license, d.step.0 + 1);
     }
 
-    /// Send the Submit a suggestion form to the submissions Worker.
+    /// Send the Submit an idea form to the submissions Worker.
     fn submit_suggestion(&mut self) {
         let title: String = self.suggest.title.trim().chars().take(80).collect();
         if title.is_empty() {
-            return self.toast_err("Give the suggestion a title first");
+            return self.toast_err("Give the idea a title first");
         }
+        let email = match crate::submit::check_email(&self.suggest.email) {
+            Ok(e) => e,
+            Err(e) => return self.toast_err(e),
+        };
         let Some(url) = self.submit_url() else {
             return self.toast_err("No submission server is set up");
         };
@@ -2535,11 +2561,15 @@ impl BioCartoon {
         if !name.is_empty() {
             self.settings.contributor_name = name.clone();
         }
+        if !email.is_empty() {
+            self.settings.contributor_email = email.clone();
+        }
         let s = crate::submit::Suggestion {
-            kind: if self.suggest.template { "template" } else { "icon" },
+            kind: crate::submit::IDEA_KINDS.get(self.suggest.kind).unwrap_or(&crate::submit::IDEA_KINDS[0]).0,
             title: title.clone(),
             description: self.suggest.description.trim().chars().take(1000).collect(),
             name,
+            email,
         };
         self.suggest.busy = true;
         let (tx, ctx) = (self.library_tx.clone(), self.ctx.clone());
@@ -2775,11 +2805,11 @@ impl BioCartoon {
                     self.suggest.busy = false;
                     match res {
                         Ok(_) => {
-                            self.toast(format!("Thanks! Sent your suggestion \"{title}\" to the BioCartoon team."));
+                            self.toast(format!("Thanks! Sent your idea \"{title}\" to the BioCartoon team."));
                             self.suggest.title.clear();
                             self.suggest.description.clear();
                         }
-                        Err(e) => self.toast_err(format!("Suggestion not sent: {e}")),
+                        Err(e) => self.toast_err(format!("Idea not sent: {e}")),
                     }
                 }
             }
@@ -2949,6 +2979,7 @@ impl BioCartoon {
             Some(id) => id.clone(),
             None => {
                 if self.doc == Document::default() {
+                    self.dirty = false; // nothing worth keeping yet
                     return true;
                 }
                 match self.store.create(&self.doc) {
@@ -3044,15 +3075,26 @@ impl BioCartoon {
         }
     }
 
-    fn autosave(&mut self, now: f64) {
-        if self.screen != Screen::Editor || now - self.last_autosave < 2.0 {
+    fn autosave(&mut self, ctx: &egui::Context, now: f64) {
+        let save_now = crate::platform::take_save_request();
+        if self.screen != Screen::Editor {
+            crate::platform::set_unsaved(false);
             return;
         }
-        self.last_autosave = now;
-        if self.saved_doc.as_ref() != Some(&self.doc) {
-            self.dirty = true;
-            self.save_current(Snapshot::IfDue, "Autosaved");
+        let wait = 2.0 - (now - self.last_autosave);
+        if save_now || wait <= 0.0 {
+            self.last_autosave = now;
+            if self.saved_doc.as_ref() != Some(&self.doc) {
+                self.dirty = true;
+                self.save_current(Snapshot::IfDue, "Autosaved");
+            } else {
+                self.dirty = false; // e.g. an undo back to the saved state
+            }
+        } else if self.dirty {
+            // Egui only draws on input, so wake up for the save even if the user stops.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
+        crate::platform::set_unsaved(self.dirty);
     }
 
     // ---------- projects (home screen commands) ----------
@@ -4042,6 +4084,9 @@ impl BioCartoon {
                 if self.suggest.name.is_empty() {
                     self.suggest.name = self.settings.contributor_name.clone();
                 }
+                if self.suggest.email.is_empty() {
+                    self.suggest.email = self.settings.contributor_email.clone();
+                }
             }
             Action::SubmitSuggestion => self.submit_suggestion(),
             Action::PickTemplateFiles => {
@@ -4264,6 +4309,7 @@ impl BioCartoon {
         self.poll_offline(&ctx);
         self.poll_thumbs(&ctx);
         self.poll_library(&ctx);
+        self.autosave(&ctx, ctx.input(|i| i.time));
         if self.screen == Screen::Home {
             self.home_ui(ui);
             if self.show_export {
@@ -4274,7 +4320,6 @@ impl BioCartoon {
             self.run_actions(&ctx);
             return;
         }
-        self.autosave(ctx.input(|i| i.time));
         if self.images.loads_in_flight > 0 || self.ai.busy > 0 || self.icons.loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -4725,6 +4770,9 @@ impl BioCartoon {
                 });
                 field(ui, "Credit as");
                 ui.add(egui::TextEdit::singleline(&mut d.credit).char_limit(60).hint_text("your name").desired_width(w));
+                field(ui, "Email");
+                ui.add(egui::TextEdit::singleline(&mut d.email).char_limit(254).hint_text("optional, never published").desired_width(w))
+                    .on_hover_text("Only the BioCartoon team sees it, in case they have a question about your submission");
                 ui.add_space(10.0);
                 let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
                 if can_submit {
