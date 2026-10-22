@@ -721,6 +721,8 @@ pub struct BioCartoon {
     pub ai_edit: Option<AiEdit>,
     /// The right-rail tab shown before a selection opened Edit, restored when it is cleared.
     pub rail_before_edit: Option<RailTab>,
+    /// The tab the right panel showed last, which a drag in from the right edge reopens.
+    pub last_rail: Option<RailTab>,
     pub replace_target: Option<ItemId>,
     /// Image items placed before their picture had loaded, to take its shape once it has.
     pending_fit: Vec<(ItemId, Fit)>,
@@ -781,6 +783,9 @@ pub struct BioCartoon {
     /// The credits of what was just exported, and the stem for saving them: the Attributions
     /// window shows these instead of the document's while set.
     pub attributions_export: Option<(Vec<crate::credits::Credit>, String)>,
+    /// When the export whose credits the Attributions window shows finished, for the
+    /// "Image saved successfully" banner above it.
+    pub export_saved_at: Option<f64>,
     /// The credits of the export that is running, shown once it finishes.
     pub export_credits: Option<(Vec<crate::credits::Credit>, String)>,
     /// The image whose credit the Credit window shows (right-click > Show credit).
@@ -911,6 +916,7 @@ impl BioCartoon {
             page: PageState::default(),
             ai_edit: None,
             rail_before_edit: None,
+            last_rail: None,
             replace_target: None,
             pending_fit: Vec::new(),
             crop_mode: false,
@@ -951,6 +957,7 @@ impl BioCartoon {
             show_attributions: false,
             attributions_slide: None,
             attributions_export: None,
+            export_saved_at: None,
             export_credits: None,
             credit_item: None,
             attributions_required_only: false,
@@ -3227,6 +3234,7 @@ impl BioCartoon {
                         self.toast(msg);
                         if credits.is_some() {
                             self.attributions_export = credits;
+                            self.export_saved_at = Some(ctx.input(|i| i.time));
                             self.show_attributions = true;
                         }
                     }
@@ -4080,6 +4088,10 @@ impl BioCartoon {
         if self.rail.is_some() {
             self.right_panel(ui);
         }
+        if let Some(r) = self.rail.filter(|&r| r != RailTab::Text) {
+            self.last_rail = Some(r);
+        }
+        self.edge_swipes(ui);
         self.canvas_ui(ui);
         self.windows(&ctx);
         self.home_windows_in_editor(&ctx);
@@ -4107,6 +4119,14 @@ impl BioCartoon {
                 egui::Frame::new().fill(theme::panel()).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
                     ui.menu_button(egui::RichText::new(ph::LIST).size(18.0), |ui| {
                         if ui.button("All projects").clicked() { self.actions.push(Action::GoHome); ui.close(); }
+                        if ui.add_enabled(!self.settings.show_icons, egui::Button::new("Show icons menu"))
+                            .on_hover_text("Open the Icons panel on the left")
+                            .on_disabled_hover_text("Icon menu is already up")
+                            .clicked()
+                        {
+                            self.settings.show_icons = true;
+                            ui.close();
+                        }
                         ui.separator();
                         if ui.button("New").clicked() { self.actions.push(Action::NewDoc); ui.close(); }
                         if ui.button("Open file...").clicked() { self.actions.push(Action::Open); ui.close(); }
@@ -4832,6 +4852,12 @@ impl BioCartoon {
                             let item = Item::new(self.doc.alloc_id(), title, ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0] }, Pos2::new(80.0 + 280.0 * i as f32, 200.0), Vec2::splat(240.0));
                             self.doc.slides[self.cur_slide].items.push(item);
                         }
+                        self.show_attributions = true;
+                    }
+                    // The Attributions window as an export leaves it, with the "Image saved" banner.
+                    "exportsaved" => {
+                        self.attributions_export = Some((crate::credits::collect(&self.doc.slides, 1), Self::slugify(&self.doc.title)));
+                        self.export_saved_at = Some(0.0);
                         self.show_attributions = true;
                     }
                     "offline" => self.open_settings(SettingsTab::Offline),

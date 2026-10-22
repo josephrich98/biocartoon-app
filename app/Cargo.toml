@@ -51,6 +51,10 @@ ureq = "3"
 rfd = "0.17"
 env_logger = "0.11"
 
+# Tells the Dock a file landed in Downloads, so its stack bounces (see platform::write_output).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDistributedNotificationCenter", "NSNotification", "NSString"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 idb = "0.6"
 sqlite-wasm-rs = "0.5"

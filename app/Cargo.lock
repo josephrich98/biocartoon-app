@@ -206,6 +206,7 @@ dependencies = [
  "image",
  "js-sys",
  "log",
+ "objc2-foundation 0.3.2",
  "pdf-writer",
  "resvg",
  "rfd",

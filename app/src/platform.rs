@@ -51,12 +51,33 @@ pub fn save_path(filter: &str, ext: &str, file_name: &str) -> Option<PathBuf> {
 /// downloads `bytes` under the path's file name.
 pub fn write_output(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
-    return std::fs::write(path, bytes);
+    {
+        std::fs::write(path, bytes)?;
+        #[cfg(target_os = "macos")]
+        bounce_downloads(path);
+        Ok(())
+    }
     #[cfg(target_arch = "wasm32")]
     {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "download".into());
         web::download(&name, bytes).map_err(std::io::Error::other)
     }
+}
+
+/// If `path` is in ~/Downloads, bounce the Downloads stack in the Dock the way a browser does when a
+/// download finishes.
+#[cfg(target_os = "macos")]
+fn bounce_downloads(path: &Path) {
+    use objc2_foundation::{NSDistributedNotificationCenter, NSString};
+    let Some(downloads) = dirs::download_dir() else { return };
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let downloads = downloads.canonicalize().unwrap_or(downloads);
+    if !path.starts_with(&downloads) {
+        return;
+    }
+    let name = NSString::from_str("com.apple.DownloadFileFinished");
+    let file = NSString::from_str(&path.to_string_lossy());
+    unsafe { NSDistributedNotificationCenter::defaultCenter().postNotificationName_object(&name, Some(&file)) };
 }
 
 /// Browser build: save a Blob (e.g. a zip assembled in parts) as a download.

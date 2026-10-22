@@ -195,7 +195,7 @@ impl BioCartoon {
         let mut open = true;
         let mut action = None;
         let center = ctx.content_rect().center();
-        egui::Window::new(title)
+        let window = egui::Window::new(title)
             .id(egui::Id::new("attributions_window"))
             .open(&mut open)
             .collapsible(false)
@@ -204,12 +204,33 @@ impl BioCartoon {
             .show(ctx, |ui| {
                 action = attributions_ui(ui, &credits, &mut self.attributions_required_only);
             });
+        // For a few seconds after an export, a green banner just above the window says it worked.
+        let now = ctx.input(|i| i.time);
+        if let (Some(at), Some(w), Some(_)) = (self.export_saved_at, &window, &self.attributions_export) {
+            if now < at + SAVED_BANNER_SECS {
+                let rect = w.response.rect;
+                egui::Area::new(egui::Id::new("export_saved_banner"))
+                    .fixed_pos(rect.left_top() - Vec2::new(0.0, 40.0))
+                    .order(egui::Order::Foreground)
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::new().fill(theme::success()).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+                            ui.set_width(rect.width() - 24.0);
+                            ui.label(egui::RichText::new(format!("{}  Image saved successfully", ph::CHECK_CIRCLE)).color(egui::Color32::WHITE).strong());
+                        });
+                    });
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(at + SAVED_BANNER_SECS - now));
+            } else {
+                self.export_saved_at = None;
+            }
+        }
         if let Some(a) = action {
             self.credits_action(ctx, a, &credits, &stem);
         }
         self.show_attributions = open;
         if !open {
             self.attributions_export = None;
+            self.export_saved_at = None;
         }
     }
 
@@ -231,6 +252,9 @@ impl BioCartoon {
         }
     }
 }
+
+/// How long the "Image saved successfully" banner stays above the Attributions popup.
+const SAVED_BANNER_SECS: f64 = 4.0;
 
 /// A button of the Attributions popup: copy or save the credits (`required`: only those the
 /// licenses require).
@@ -256,7 +280,6 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
         if credits.len() == 1 { "piece of artwork" } else { "pieces of artwork" },
         if required == 1 { "requires" } else { "require" }
     ));
-    ui.label(dim("Copy or save the credits, one per line, for your figure legend. Exported SVG and PNG files carry the same credits."));
     ui.checkbox(only, "Only show credits for licenses requiring credit")
         .on_hover_text("Public-domain and CC0 artwork needs no credit, but artists still appreciate it.");
     if pending > 0 {
@@ -277,8 +300,8 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
         }
     });
     ui.horizontal(|ui| {
-        let save_all = egui::RichText::new(format!("{}  Save all credits", ph::FLOPPY_DISK)).color(theme::accent());
-        if ui.add_enabled(has_any, egui::Button::new(save_all)).clicked() {
+        let save_all = egui::RichText::new(format!("{}  Save all credits", ph::FLOPPY_DISK)).color(egui::Color32::WHITE);
+        if ui.add_enabled(has_any, egui::Button::new(save_all).fill(theme::accent())).clicked() {
             action = Some(CreditsAction::Save { required: false });
         }
         if ui.add_enabled(has_required, egui::Button::new(format!("{}  Save required credits", ph::FLOPPY_DISK))).clicked() {

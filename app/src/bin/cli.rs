@@ -18,7 +18,7 @@ fn main() {
 mod cli {
     use biocartoon::query::{self, Catalog};
     use biocartoon::{control, mcp};
-    use biocartoon_catalog::cli::{print_json, run_command, version, Args, CATALOG_COMMANDS, CATALOG_OPTIONS};
+    use biocartoon_catalog::cli::{command_help, print_json, run_command, version, Args, CATALOG_COMMANDS, CATALOG_OPTIONS};
     use serde_json::{json, Value};
 
     fn usage() -> String {
@@ -65,7 +65,7 @@ ASSISTANTS
         let a = Args::parse(argv, &["slide"]);
         a.apply_env();
         if a.wants_help() {
-            print!("{}", usage());
+            print!("{}", a.help_topic().and_then(command_help).unwrap_or_else(usage));
             return Ok(());
         }
         if a.flag("version") {

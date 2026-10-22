@@ -89,6 +89,8 @@ pub fn handle() -> Color32 { accent() }
 pub fn hover() -> Color32 { pick((0x3a, 0x3a, 0x40), (0xe2, 0xe2, 0xe8)) }
 /// Fill of an informational toast.
 pub fn toast() -> Color32 { pick((0x2a, 0x2a, 0x30), (0xff, 0xff, 0xff)) }
+/// Fill of a banner saying something worked (white text on it).
+pub fn success() -> Color32 { Color32::from_rgb(0x2e, 0x8b, 0x4a) }
 
 /// Sets the palette and the egui visuals; `text_scale` multiplies egui's default text sizes.
 pub fn apply(ctx: &egui::Context, dark: bool, text_scale: f32) {

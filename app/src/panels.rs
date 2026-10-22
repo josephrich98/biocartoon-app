@@ -48,6 +48,38 @@ impl BioCartoon {
         });
     }
 
+    /// With the Icons panel hidden, a drag in from the window's left edge shows it again; with the
+    /// right panel closed, a drag in from the right edge reopens the tab it showed last. Call after
+    /// the panels, before the canvas, so the canvas doesn't take the drag.
+    pub fn edge_swipes(&mut self, ui: &mut egui::Ui) {
+        const STRIP: f32 = 6.0;
+        const DISTANCE: f32 = 30.0;
+        let ctx = ui.ctx().clone();
+        let area = ui.available_rect_before_wrap();
+        let screen = ctx.content_rect();
+        let strip = |side: &str, rect: Rect, inward: f32| -> bool {
+            let mut opened = false;
+            egui::Area::new(egui::Id::new(("edge_swipe", side))).fixed_pos(rect.min).order(egui::Order::Foreground).show(&ctx, |ui| {
+                let r = ui.allocate_rect(rect, Sense::drag());
+                if r.hovered() || r.dragged() {
+                    ui.ctx().set_cursor_icon(if inward > 0.0 { egui::CursorIcon::ResizeEast } else { egui::CursorIcon::ResizeWest });
+                }
+                if r.dragged() {
+                    let moved = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map(|(a, b)| (b.x - a.x) * inward));
+                    opened = moved.is_some_and(|d| d > DISTANCE);
+                }
+            });
+            opened
+        };
+        let rows = area.y_range();
+        if !self.settings.show_icons && strip("left", Rect::from_x_y_ranges(screen.left()..=screen.left() + STRIP, rows), 1.0) {
+            self.settings.show_icons = true;
+        }
+        if self.rail.is_none() && strip("right", Rect::from_x_y_ranges(screen.right() - STRIP..=screen.right(), rows), -1.0) {
+            self.actions.push(Action::SetRail(Some(self.last_rail.unwrap_or(RailTab::Edit))));
+        }
+    }
+
     /// The Icons panel, on the left.
     pub fn left_panel(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 8, right: 0, top: 36, bottom: 8 });

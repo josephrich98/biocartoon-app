@@ -1,7 +1,7 @@
 //! The editing canvas: draws the current slide, handles selection, move / resize / rotate with
 //! grid snapping, marquee selection, pan / zoom, on-canvas cropping and the right-click menu.
 
-use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon};
+use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, UploadTarget};
 use crate::assets::{ImageCache, ImgState, IMAGE_EXTS};
 use crate::doc::{c32, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, ShapeKind, Slide, TextAlign, TextVAlign, Unit, DPI};
 use crate::theme;
@@ -1660,6 +1660,12 @@ impl BioCartoon {
             [it] => self.item_asset_id(it),
             _ => None,
         };
+        // A single image of the user's own (an upload or a generated image, not made from library
+        // artwork) isn't in the library yet, so it can be added to it.
+        let own_file = match items[..] {
+            [Item { kind: ItemKind::Image { source: crate::doc::ImageSource::File { path, from: None }, .. }, .. }] => Some(path.clone()),
+            _ => None,
+        };
         let mut acts: Vec<Action> = Vec::new();
         let mut item = |ui: &mut egui::Ui, enabled: bool, icon: &str, label: &str, shortcut: &str, act: Action| {
             let b = egui::Button::new(format!("{icon}  {label}")).shortcut_text(shortcut);
@@ -1721,6 +1727,14 @@ impl BioCartoon {
         if ui.add_enabled(icon_name.is_some(), egui::Button::new(format!("{}  Copy name", ph::COPY))).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
             ui.ctx().copy_text(icon_name.unwrap_or_default());
             ui.close();
+        }
+        if let Some(path) = own_file {
+            let b = egui::Button::new(format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP));
+            if ui.add(b).on_hover_text("Keep this image in your library, or submit it to the shared one").clicked() {
+                self.actions.push(Action::OpenUploadDialog(UploadTarget::File(path.into())));
+                ui.close();
+            }
+            return;
         }
         let b = egui::Button::new(format!("{}  Show credit", ph::QUOTES));
         let tip = if credited.is_some() { "Who made this artwork, ready to copy" } else { "Only library artwork has a credit" };
