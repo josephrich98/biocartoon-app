@@ -193,13 +193,15 @@ pub enum RailTab {
     Shapes,
     Table,
     Code,
+    /// The slide's comments, and the button that adds one.
+    Comments,
     Slides,
     /// The page's size and colour, and the grid.
     Page,
 }
 
 impl RailTab {
-    pub const ALL: [RailTab; 8] = [RailTab::Edit, RailTab::Text, RailTab::Lines, RailTab::Shapes, RailTab::Table, RailTab::Code, RailTab::Slides, RailTab::Page];
+    pub const ALL: [RailTab; 9] = [RailTab::Edit, RailTab::Text, RailTab::Lines, RailTab::Shapes, RailTab::Table, RailTab::Code, RailTab::Comments, RailTab::Slides, RailTab::Page];
     pub fn label(self) -> &'static str {
         match self {
             RailTab::Text => "Text",
@@ -207,6 +209,7 @@ impl RailTab {
             RailTab::Shapes => "Shapes",
             RailTab::Table => "Table",
             RailTab::Code => "Code",
+            RailTab::Comments => "Comments",
             RailTab::Edit => "Edit",
             RailTab::Slides => "Slides",
             RailTab::Page => "Page",
@@ -219,6 +222,7 @@ impl RailTab {
             RailTab::Shapes => ph::SHAPES,
             RailTab::Table => ph::TABLE,
             RailTab::Code => ph::CODE,
+            RailTab::Comments => ph::CHAT_CIRCLE_TEXT,
             RailTab::Edit => ph::SLIDERS_HORIZONTAL,
             RailTab::Slides => ph::PRESENTATION,
             RailTab::Page => ph::FRAME_CORNERS,
@@ -558,6 +562,16 @@ pub enum ArrangeKind {
     Back,
 }
 
+/// A comment being written: where it goes, its text so far, and the comment it edits, if any.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommentDraft {
+    pub pos: Pos2,
+    pub text: String,
+    pub editing: Option<ItemId>,
+    /// Give the box keyboard focus on its next frame.
+    pub focus: bool,
+}
+
 /// Deferred commands pushed by UI code and applied after the frame's layout.
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -575,6 +589,17 @@ pub enum Action {
     ArmText(bool),
     /// Place an empty text box with its first line at this page point and start typing in it.
     PlaceText(Pos2),
+    /// Arm (or disarm) the comment tool: the next click on the canvas starts a comment there.
+    ArmComment(bool),
+    /// Start writing a comment at this page point.
+    PlaceComment(Pos2),
+    /// Post the comment being written (a new one, or an edit).
+    PostComment,
+    /// Reopen this comment in the writing box.
+    EditComment(ItemId),
+    DeleteComment(ItemId),
+    /// Show this comment's bubble open, centred in the view.
+    ShowComment(ItemId),
     /// Type into this text box on the canvas.
     EditText(ItemId),
     /// Type into a table's cell (row-major index) on the canvas.
@@ -615,6 +640,10 @@ pub enum Action {
     SetCrop(bool),
     Ai(AiOp),
     OpenAiEdit,
+    /// Show the selection's properties in the Edit tab.
+    OpenEdit,
+    /// Save the selection as a PNG cropped to it, wherever the user picks.
+    SaveSelectionImage,
     SendChat(String),
     StartReplace,
     Undo,
@@ -739,6 +768,12 @@ pub struct BioCartoon {
     pub crop_mode: bool,
     /// The Text tool is armed: the next click on the canvas places a text box.
     pub placing_text: bool,
+    /// The comment tool is armed: the next click on the canvas starts a comment.
+    pub placing_comment: bool,
+    /// The comment being written or edited, in a box on the canvas.
+    pub comment_draft: Option<CommentDraft>,
+    /// The comment whose bubble is open on the canvas.
+    pub open_comment: Option<ItemId>,
     /// The Draw tool is armed: drags on the canvas draw freehand lines.
     pub drawing: bool,
     /// The Draw tool's color and thickness.
@@ -932,6 +967,9 @@ impl BioCartoon {
             pending_fit: Vec::new(),
             crop_mode: false,
             placing_text: false,
+            placing_comment: false,
+            comment_draft: None,
+            open_comment: None,
             drawing: false,
             pen_color: [40, 40, 50, 255],
             pen_width: 3.0,
@@ -1215,6 +1253,15 @@ impl BioCartoon {
         } else {
             self.close_edit_tab();
         }
+    }
+
+    /// Select without opening the Edit tab: a click on the canvas shows the handles, a double
+    /// click opens Edit.
+    pub(crate) fn select_quietly(&mut self, ids: Vec<ItemId>) {
+        self.selected_guide = None;
+        self.selection = ids;
+        self.expand_groups();
+        self.crop_mode = false;
     }
 
     /// Show the selection's properties on the right, remembering the tab it replaces.
@@ -2268,7 +2315,8 @@ impl BioCartoon {
 
     /// Slide `i` of the open document, to save as a template.
     pub fn template_target(&self, i: usize) -> UploadTarget {
-        let slide = self.doc.slides.get(i).cloned().unwrap_or_default();
+        let mut slide = self.doc.slides.get(i).cloned().unwrap_or_default();
+        slide.comments.clear();
         UploadTarget::Template(Box::new(TemplateSlide { slide, width: self.doc.width, height: self.doc.height, background: self.doc.background, saved: None }))
     }
 
@@ -2340,7 +2388,8 @@ impl BioCartoon {
         for p in paths {
             match crate::storage::read(p).map_err(|e| e.to_string()).and_then(|b| crate::projects::from_file(&b, &uploads)) {
                 Ok(doc) => {
-                    for slide in doc.slides.into_iter().filter(|s| !s.items.is_empty()) {
+                    for mut slide in doc.slides.into_iter().filter(|s| !s.items.is_empty()) {
+                        slide.comments.clear();
                         self.contribute.templates.push(TemplateSlide { slide, width: doc.width, height: doc.height, background: doc.background, saved: None });
                     }
                 }
@@ -2626,7 +2675,7 @@ impl BioCartoon {
         let s = if s.is_finite() && s > 0.0 { s } else { 1.0 };
         let off = [(self.doc.width - t.width * s) / 2.0, (self.doc.height - t.height * s) / 2.0];
         let mut groups: HashMap<u64, u64> = HashMap::new();
-        let mut slide = Slide { name: t.slide.name, items: Vec::new() };
+        let mut slide = Slide { name: t.slide.name, items: Vec::new(), comments: Vec::new() };
         for mut it in t.slide.items {
             // Shared templates may only reference bucket objects, never files on this computer.
             if !own && matches!(&it.kind, ItemKind::Image { source: ImageSource::File { .. }, .. }) {
@@ -3206,6 +3255,28 @@ impl BioCartoon {
         self.toast("Exporting...");
     }
 
+    /// Save the selection as a picture: a PNG cropped to it, on a transparent background, at the
+    /// export dialog's resolution.
+    fn save_selection_image(&mut self, ctx: &egui::Context) {
+        if self.export_job.is_some() {
+            self.toast("An export is already running");
+            return;
+        }
+        let items: Vec<Item> = self.selected_items().into_iter().cloned().collect();
+        let Some(region) = items.iter().map(crate::export::item_bounds).reduce(|a, b| a.union(b)) else { return };
+        let name = match &items[..] {
+            [it] if !it.name.is_empty() => Self::slugify(&it.name),
+            _ => format!("{}-selection", Self::slugify(&self.doc.title)),
+        };
+        let Some(path) = crate::platform::save_path(ExportFormat::Png.label(), ExportFormat::Png.ext(), &format!("{name}.png")) else { return };
+        let doc = Document { slides: vec![Slide { items, ..self.slide().clone() }], ..self.doc.clone() };
+        let opts = ExportOptions { format: ExportFormat::Png, dpi: self.settings.export.dpi, transparent: true, ..Default::default() };
+        let mut job = self.export_job_for(&doc, &[0], path, opts);
+        job.page = region;
+        self.export_job = Some(crate::export::start(ctx.clone(), job));
+        self.toast("Saving...");
+    }
+
     /// `slides` are 0-based indices into `doc.slides`.
     fn export_job_for(&self, doc: &Document, slides: &[usize], path: PathBuf, opts: ExportOptions) -> crate::export::ExportJob {
         let slides: Vec<(usize, Slide)> = slides.iter().map(|&i| i.min(doc.slides.len() - 1)).map(|i| (i + 1, doc.slides[i].clone())).collect();
@@ -3305,7 +3376,14 @@ impl BioCartoon {
         let opts = &mut self.settings.export;
         let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.heading(heading);
+            ui.horizontal(|ui| {
+                ui.heading(heading);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).on_hover_text("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
             if multi && !all && !project_file && self.export_doc.is_some() {
                 ui.label(egui::RichText::new("Exports the first slide. Open the project to export another slide alone.").color(theme::text_dim()));
             }
@@ -3507,7 +3585,7 @@ impl BioCartoon {
         self.commit();
         let w = self.doc.width;
         let h = self.doc.height;
-        let mut slide = Slide { name: Self::template_names()[idx].0.to_string(), items: Vec::new() };
+        let mut slide = Slide { name: Self::template_names()[idx].0.to_string(), items: Vec::new(), comments: Vec::new() };
         let mut add = |doc: &mut Document, name: &str, kind: ItemKind, r: Rect| {
             let id = doc.alloc_id();
             slide.items.push(Item::new(id, name, kind, r.min, r.size()));
@@ -3625,6 +3703,82 @@ impl BioCartoon {
                 self.placing_text = on;
                 if on {
                     self.drawing = false;
+                    self.placing_comment = false;
+                }
+            }
+            Action::ArmComment(on) => {
+                self.finish_text_edit();
+                self.placing_comment = on;
+                if on {
+                    self.placing_text = false;
+                    self.drawing = false;
+                    self.stroke.clear();
+                    self.comment_draft = None;
+                    self.open_comment = None;
+                }
+            }
+            Action::PlaceComment(p) => {
+                self.placing_comment = false;
+                self.open_comment = None;
+                self.comment_draft = Some(CommentDraft { pos: p, text: String::new(), editing: None, focus: true });
+                // On a phone the panel would cover the box being typed in.
+                if phone_width(ctx) {
+                    self.rail = None;
+                }
+            }
+            Action::PostComment => {
+                let Some(d) = self.comment_draft.take() else { return };
+                let text = d.text.trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                self.commit();
+                let author = self.account.saved.as_ref().map(|s| if s.name.is_empty() { s.email.clone() } else { s.name.clone() }).unwrap_or_default();
+                let modified = crate::projects::now_ms();
+                let edited = d.editing.and_then(|id| self.slide_mut().comments.iter_mut().find(|c| c.id == id));
+                let id = match edited {
+                    Some(c) => {
+                        c.text = text;
+                        c.modified = modified;
+                        c.id
+                    }
+                    None => {
+                        let id = self.doc.alloc_id();
+                        self.slide_mut().comments.push(crate::doc::Comment { id, pos: [d.pos.x, d.pos.y], text, author, modified });
+                        id
+                    }
+                };
+                self.open_comment = Some(id);
+            }
+            Action::EditComment(id) => {
+                if let Some(c) = self.slide().comments.iter().find(|c| c.id == id) {
+                    self.comment_draft = Some(CommentDraft { pos: c.pos(), text: c.text.clone(), editing: Some(id), focus: true });
+                    self.open_comment = None;
+                }
+            }
+            Action::DeleteComment(id) => {
+                if self.slide().comments.iter().any(|c| c.id == id) {
+                    self.commit();
+                    self.slide_mut().comments.retain(|c| c.id != id);
+                    if self.open_comment == Some(id) {
+                        self.open_comment = None;
+                    }
+                    if self.comment_draft.as_ref().is_some_and(|d| d.editing == Some(id)) {
+                        self.comment_draft = None;
+                    }
+                }
+            }
+            Action::ShowComment(id) => {
+                if let Some(c) = self.slide().comments.iter().find(|c| c.id == id) {
+                    // Pan so the comment sits in the middle of the canvas (see `Xform` in canvas_ui).
+                    let page = self.doc.page_rect();
+                    self.view.pan = (page.center() - c.pos()) * self.view.zoom;
+                    self.open_comment = Some(id);
+                    self.comment_draft = None;
+                    self.placing_comment = false;
+                    if phone_width(ctx) {
+                        self.rail = None;
+                    }
                 }
             }
             Action::PlaceText(p) => {
@@ -3741,6 +3895,8 @@ impl BioCartoon {
             Action::FlipV => self.flip(false),
             Action::SetCrop(on) => self.crop_mode = on && self.single_selected().is_some_and(|i| matches!(i.kind, ItemKind::Image { .. })),
             Action::Ai(op) => self.run_ai(op),
+            Action::OpenEdit => self.open_edit_tab(),
+            Action::SaveSelectionImage => self.save_selection_image(ctx),
             Action::OpenAiEdit => {
                 if let Some(it) = self.single_selected() {
                     if matches!(it.kind, ItemKind::Image { .. }) {
@@ -4006,6 +4162,8 @@ impl BioCartoon {
             if i.key_pressed(Key::Escape) {
                 acts.push(if self.placing_text {
                     Action::ArmText(false)
+                } else if self.placing_comment {
+                    Action::ArmComment(false)
                 } else if self.drawing {
                     Action::ArmDraw(false)
                 } else {
@@ -4725,7 +4883,7 @@ impl BioCartoon {
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, about, templates, savetemplate, export=<path>, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
-    /// fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|edit|slides|page|none|icons|noicons|uploads|favorites|library>).
+    /// comments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -4828,6 +4986,19 @@ impl BioCartoon {
                     "placetext" => {
                         self.show_settings = false;
                         self.actions.push(Action::PlaceText(Pos2::new(500.0, 500.0)));
+                    }
+                    "comments" => {
+                        self.show_settings = false;
+                        for (i, (x, y, text)) in [(220.0, 160.0, "Make the receptor bigger?"), (620.0, 420.0, "Label this arrow with the ligand's name.")].into_iter().enumerate() {
+                            let id = self.doc.alloc_id();
+                            self.slide_mut().comments.push(crate::doc::Comment { id, pos: [x, y], text: text.into(), author: if i == 0 { "Ana".into() } else { String::new() }, modified: crate::projects::now_ms() });
+                        }
+                        self.open_comment = self.slide().comments.first().map(|c| c.id);
+                        self.rail = Some(RailTab::Comments);
+                    }
+                    "draftcomment" => {
+                        self.show_settings = false;
+                        self.actions.push(Action::PlaceComment(Pos2::new(400.0, 300.0)));
                     }
                     "select" => {
                         self.show_settings = false;
@@ -4956,7 +5127,7 @@ impl BioCartoon {
                             t => {
                                 self.rail = match t {
                                     "text" => { self.placing_text = true; self.rail }, "lines" => Some(RailTab::Lines), "shapes" => Some(RailTab::Shapes),
-                                    "table" => Some(RailTab::Table), "code" => Some(RailTab::Code), "edit" => Some(RailTab::Edit), "page" => Some(RailTab::Page), "none" => None, _ => Some(RailTab::Slides),
+                                    "table" => Some(RailTab::Table), "code" => Some(RailTab::Code), "comments" => Some(RailTab::Comments), "edit" => Some(RailTab::Edit), "page" => Some(RailTab::Page), "none" => None, _ => Some(RailTab::Slides),
                                 };
                             }
                         }

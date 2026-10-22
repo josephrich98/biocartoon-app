@@ -31,7 +31,7 @@ impl BioCartoon {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
                 for t in RailTab::ALL {
-                    if t == RailTab::Text || t == RailTab::Slides {
+                    if matches!(t, RailTab::Text | RailTab::Comments | RailTab::Slides) {
                         ui.add_space(12.0);
                     }
                     let on = if t == RailTab::Text { self.placing_text } else { self.rail == Some(t) };
@@ -167,6 +167,7 @@ impl BioCartoon {
                     RailTab::Shapes => self.shapes_panel(ui),
                     RailTab::Table => self.table_panel(ui),
                     RailTab::Code => self.code_panel(ui),
+                    RailTab::Comments => self.comments_panel(ui),
                     RailTab::Edit => self.edit_panel(ui),
                     RailTab::Slides => self.slides_content(ui),
                     RailTab::Page => self.page_panel(ui),
@@ -1381,14 +1382,11 @@ impl BioCartoon {
                         ui.label(dim("Edited from a library asset. Credit the original:".into()));
                     }
                     let credit = Some(credit.clone()).filter(|c| !c.is_empty()).or_else(|| self.icons.results.iter().chain(self.variants.iter()).find(|r| &r.id == aid).map(|r| r.credit.clone()));
-                    match credit {
-                        Some(c) => ui.add(egui::Label::new(dim(c)).selectable(true)),
-                        None => ui.label(dim(format!("Asset {aid}"))),
-                    };
-                    let list = crate::credits::list(&crate::credits::collect([self.slide()], self.cur_slide + 1), false);
-                    if ui.add_enabled(!list.is_empty(), egui::Button::new(format!("{}  Copy slide credits", ph::COPY)).small()).on_hover_text(list.as_str()).clicked() {
-                        ui.ctx().copy_text(list);
-                        self.toast("Copied the credits");
+                    let credit = credit.unwrap_or_else(|| format!("Asset {aid}"));
+                    ui.add(egui::Label::new(dim(credit.clone())).selectable(true));
+                    if ui.add(egui::Button::new(format!("{}  Copy credit", ph::COPY)).small()).on_hover_text(credit.as_str()).clicked() {
+                        ui.ctx().copy_text(credit);
+                        self.toast("Copied the credit");
                     }
                 }
             }
@@ -1643,6 +1641,49 @@ impl BioCartoon {
                     for u in Unit::ALL { ui.selectable_value(&mut self.settings.grid_unit, u, u.label()); }
                 });
             });
+        }
+    }
+
+    // ---------- Comments ----------
+
+    /// The button that arms the comment tool, then this slide's comments; a click on one shows it.
+    fn comments_panel(&mut self, ui: &mut egui::Ui) {
+        let (label, tip) = if self.placing_comment {
+            (format!("{}  Click on the page…", ph::CURSOR_CLICK), "Click where the comment goes, or click here again to cancel")
+        } else {
+            (format!("{}  Add a comment", ph::PLUS), "Then click on the page where it goes")
+        };
+        let b = egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 38.0));
+        if ui.add(b).on_hover_text(tip).clicked() {
+            self.actions.push(Action::ArmComment(!self.placing_comment));
+        }
+        ui.add_space(10.0);
+        let comments = &self.slide().comments;
+        if comments.is_empty() {
+            ui.label(egui::RichText::new("No comments on this slide yet.").color(theme::text_dim()));
+            return;
+        }
+        let mut show = None;
+        for (n, c) in comments.iter().enumerate() {
+            let open = self.open_comment == Some(c.id);
+            let fill = if open { theme::accent_dim() } else { theme::panel_raised() };
+            let r = egui::Frame::new().fill(fill).corner_radius(6).inner_margin(8).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{}", n + 1)).strong().color(theme::accent()));
+                    let who = if c.author.is_empty() { "Comment" } else { c.author.as_str() };
+                    ui.label(egui::RichText::new(who).strong());
+                });
+                ui.add(egui::Label::new(c.text.as_str()).wrap().selectable(false));
+            });
+            let r = ui.interact(r.response.rect, egui::Id::new(("comment_row", c.id)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Show it on the page");
+            if r.clicked() {
+                show = Some(c.id);
+            }
+            ui.add_space(4.0);
+        }
+        if let Some(id) = show {
+            self.actions.push(Action::ShowComment(id));
         }
     }
 

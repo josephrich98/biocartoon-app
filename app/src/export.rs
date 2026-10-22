@@ -1266,7 +1266,7 @@ mod tests {
         assert_eq!(image::open(dir.join("transparent.png")).unwrap().width(), 3000);
 
         // All slides: one file per slide; cropping skips the slide without images.
-        let text_only = Slide { name: "Text".into(), items: vec![slide.items[2].clone()] };
+        let text_only = Slide { name: "Text".into(), items: vec![slide.items[2].clone()], comments: Vec::new() };
         let mut all = job(ExportFormat::Png, 72, false, false, "deck.png");
         all.slides = vec![(1, slide.clone()), (2, text_only.clone())];
         let msg = run(&ctx, all).unwrap();

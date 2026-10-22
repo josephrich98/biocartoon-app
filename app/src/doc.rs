@@ -610,11 +610,34 @@ impl Item {
 pub struct Slide {
     pub name: String,
     pub items: Vec<Item>,
+    /// Notes pinned to the page; shown while editing, never drawn or exported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<Comment>,
 }
 
 impl Default for Slide {
     fn default() -> Self {
-        Self { name: "Untitled".into(), items: Vec::new() }
+        Self { name: "Untitled".into(), items: Vec::new(), comments: Vec::new() }
+    }
+}
+
+/// A comment pinned to a point on the page (document px), shown as a speech bubble.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Comment {
+    pub id: ItemId,
+    pub pos: [f32; 2],
+    pub text: String,
+    /// The signed-in name of whoever wrote it, if any.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author: String,
+    /// When it was posted or last edited, in ms since the epoch.
+    #[serde(default)]
+    pub modified: i64,
+}
+
+impl Comment {
+    pub fn pos(&self) -> Pos2 {
+        Pos2::new(self.pos[0], self.pos[1])
     }
 }
 

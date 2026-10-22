@@ -951,7 +951,115 @@ impl BioCartoon {
                 let r = xf.rect(Rect::from_two_pos(*start, *current));
                 painter.rect(r, 0.0, Color32::from_rgba_unmultiplied(47, 128, 237, 30), Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
             }
+            self.comments_ui(ui, rect, &xf);
         });
+    }
+
+    /// The slide's comments as numbered speech bubbles (drag one to move it, click to open it),
+    /// the open one's box, and the box a comment is being written in.
+    fn comments_ui(&mut self, ui: &mut egui::Ui, canvas: Rect, xf: &Xform) {
+        let painter = ui.painter_at(canvas);
+        let ctx = ui.ctx().clone();
+        let mut acts = Vec::new();
+        let mut moved = None;
+        let mut popup_at = None;
+        let mut open = self.open_comment;
+        for (n, c) in self.slide().comments.iter().enumerate() {
+            let tip = xf.to_screen(c.pos());
+            let body = comment_bubble(&painter, tip, &format!("{}", n + 1), 1.0);
+            if !canvas.contains(tip) {
+                continue;
+            }
+            let r = ui.interact(body, egui::Id::new(("comment_bubble", c.id)), Sense::click_and_drag());
+            if r.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if r.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if r.dragged() {
+                moved = Some((c.id, r.drag_delta() / xf.zoom, r.drag_started()));
+            }
+            if r.clicked() {
+                open = if open == Some(c.id) { None } else { Some(c.id) };
+            }
+            if open == Some(c.id) {
+                popup_at = Some((n, c.clone(), body.right_top() + Vec2::new(6.0, 0.0)));
+            }
+        }
+        self.open_comment = open;
+        if let Some((id, d, started)) = moved {
+            // The undo step is taken before the first move.
+            if started {
+                self.commit();
+            }
+            if let Some(c) = self.slide_mut().comments.iter_mut().find(|c| c.id == id) {
+                c.pos = [c.pos[0] + d.x, c.pos[1] + d.y];
+            }
+        }
+        if let Some((n, c, at)) = popup_at {
+            egui::Area::new(egui::Id::new("comment_open")).fixed_pos(at).order(egui::Order::Foreground).show(&ctx, |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(10).show(ui, |ui| {
+                    ui.set_width(240.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{}", n + 1)).strong().color(theme::accent()));
+                        let who = if c.author.is_empty() { "Comment" } else { c.author.as_str() };
+                        ui.label(egui::RichText::new(who).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new(ph::X).frame(false)).on_hover_text("Close").clicked() {
+                                self.open_comment = None;
+                            }
+                            ui.menu_button(ph::DOTS_THREE, |ui| {
+                                if ui.button(format!("{}  Edit", ph::PENCIL_SIMPLE)).clicked() {
+                                    acts.push(Action::EditComment(c.id));
+                                    ui.close();
+                                }
+                                if ui.button(format!("{}  Delete", ph::TRASH)).clicked() {
+                                    acts.push(Action::DeleteComment(c.id));
+                                    ui.close();
+                                }
+                            });
+                        });
+                    });
+                    if c.modified > 0 {
+                        ui.label(egui::RichText::new(crate::projects::format_time(c.modified)).small().color(theme::text_dim()));
+                    }
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(c.text.as_str()).wrap().selectable(true));
+                });
+            });
+        }
+        if let Some(mut draft) = self.comment_draft.take() {
+            let tip = xf.to_screen(draft.pos);
+            // A new comment shows where it will go; an edited one already has its bubble.
+            let body = if draft.editing.is_none() { comment_bubble(&painter, tip, ph::PLUS, 0.7) } else { comment_bubble_rect(tip) };
+            let mut keep = true;
+            egui::Area::new(egui::Id::new("comment_draft")).fixed_pos(body.right_top() + Vec2::new(6.0, 0.0)).order(egui::Order::Foreground).show(&ctx, |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(10).show(ui, |ui| {
+                    ui.set_width(260.0);
+                    let edit = ui.add(egui::TextEdit::multiline(&mut draft.text).hint_text("Add a comment…").desired_rows(3).desired_width(f32::INFINITY));
+                    if std::mem::take(&mut draft.focus) {
+                        edit.request_focus();
+                    }
+                    let (post_key, cancel_key) = ui.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                    ui.add_space(6.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can = !draft.text.trim().is_empty();
+                        let label = if draft.editing.is_some() { "Save" } else { "Post" };
+                        let post = egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent());
+                        if ui.add_enabled(can, post).on_hover_text("⌘/Ctrl+Enter").clicked() || (post_key && can) {
+                            acts.push(Action::PostComment);
+                        }
+                        if ui.button("Cancel").clicked() || cancel_key {
+                            keep = false;
+                        }
+                    });
+                });
+            });
+            if keep {
+                self.comment_draft = Some(draft);
+            }
+        }
+        self.actions.extend(acts);
     }
 
     /// The text box being edited: a `TextEdit` laid over it (upright), laid out exactly as the
@@ -1233,6 +1341,21 @@ impl BioCartoon {
             }
             return;
         }
+        if self.placing_comment {
+            if response.contains_pointer() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            if response.clicked() {
+                if let Some(p) = ptr {
+                    self.actions.push(Action::PlaceComment(xf.to_doc(p)));
+                }
+            }
+            return;
+        }
+        // A press on the canvas closes an open comment.
+        if response.clicked() || response.drag_started() {
+            self.open_comment = None;
+        }
         if self.drawing && !space && !middle {
             if response.contains_pointer() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -1308,13 +1431,8 @@ impl BioCartoon {
                         if shift {
                             self.selection.push(id);
                             self.expand_groups();
-                        } else if touch {
-                            // On a phone the Edit panel would cover the canvas mid-drag; a tap opens it.
-                            self.selection = vec![id];
-                            self.expand_groups();
-                            self.crop_mode = false;
                         } else {
-                            self.select(vec![id]);
+                            self.select_quietly(vec![id]);
                         }
                     }
                     let locked = self.selected_items().iter().any(|i| i.locked);
@@ -1523,18 +1641,19 @@ impl BioCartoon {
                 } else {
                     match self.item_at(d, tol) {
                         Some(id) if shift => self.actions.push(Action::ToggleSelect(id)),
-                        Some(id) => self.select(vec![id]),
+                        Some(id) => self.select_quietly(vec![id]),
                         None => self.select(Vec::new()),
                     }
                 }
             }
         }
+        // A click (or tap) only selects; a double click opens Edit, and long press the menu.
         if response.double_clicked() {
             if let Some(p) = ptr {
                 let d = xf.to_doc(p);
                 if let Some(id) = self.item_at(d, tol) {
-                    self.select(vec![id]);
-                    self.rail = Some(crate::app::RailTab::Edit);
+                    self.select_quietly(vec![id]);
+                    self.open_edit_tab();
                     match self.item(id).and_then(|it| table_cell_at(it, d)) {
                         Some(cell) => self.actions.push(Action::EditCell(id, cell)),
                         None => self.actions.push(Action::EditText(id)),
@@ -1550,7 +1669,7 @@ impl BioCartoon {
                 } else {
                     match self.item_at(xf.to_doc(p), tol) {
                         Some(id) if self.selection.contains(&id) => self.selected_guide = None,
-                        Some(id) => self.select(vec![id]),
+                        Some(id) => self.select_quietly(vec![id]),
                         None => self.select(Vec::new()),
                     }
                 }
@@ -1652,9 +1771,9 @@ impl BioCartoon {
         let grouped = self.is_grouped();
         let multi = items.len() > 1;
         // A single library image (or an edit of one) has a credit to show.
-        let (credited, icon_name) = match items[..] {
-            [it] => self.item_credit(it).map(|(title, _)| (Some(it.id), Some(title))).unwrap_or_default(),
-            _ => (None, None),
+        let (credited, icon_name, credit_text) = match items[..] {
+            [it] => self.item_credit(it).map(|(title, credit)| (Some(it.id), Some(title), Some(credit))).unwrap_or_default(),
+            _ => (None, None, None),
         };
         let asset_id = match items[..] {
             [it] => self.item_asset_id(it),
@@ -1714,6 +1833,9 @@ impl BioCartoon {
         item(ui, has, if locked { ph::LOCK_OPEN } else { ph::LOCK }, if locked { "Unlock" } else { "Lock" }, "⌘L", Action::ToggleLock);
         ui.separator();
         item(ui, single_image, ph::SPARKLE, "AI", "", Action::OpenAiEdit);
+        ui.separator();
+        item(ui, has, ph::DOWNLOAD_SIMPLE, "Save as picture...", "", Action::SaveSelectionImage);
+        item(ui, has, ph::SLIDERS_HORIZONTAL, "Edit", "", Action::OpenEdit);
         self.actions.extend(acts);
         ui.separator();
         let fav = asset_id.as_ref().is_some_and(|id| self.settings.favorites.contains(id));
@@ -1735,6 +1857,12 @@ impl BioCartoon {
                 ui.close();
             }
             return;
+        }
+        let tip = if credit_text.is_some() { "Copy who made this artwork to the clipboard" } else { "Only library artwork has a credit" };
+        if ui.add_enabled(credit_text.is_some(), egui::Button::new(format!("{}  Copy credit", ph::COPY))).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+            ui.ctx().copy_text(credit_text.unwrap_or_default());
+            self.toast("Copied the credit");
+            ui.close();
         }
         let b = egui::Button::new(format!("{}  Show credit", ph::QUOTES));
         let tip = if credited.is_some() { "Who made this artwork, ready to copy" } else { "Only library artwork has a credit" };
@@ -1849,4 +1977,24 @@ pub fn tool_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool) -
 
 pub fn grid_label(g: f32) -> String {
     format!("{:.3} in", g / DPI)
+}
+
+/// Where a comment's bubble sits, its tail at `tip` (screen point).
+fn comment_bubble_rect(tip: Pos2) -> Rect {
+    Rect::from_min_size(tip + Vec2::new(2.0, -30.0), Vec2::new(28.0, 23.0))
+}
+
+/// Paint a comment's speech bubble with `label` inside, its tail at `tip`; returns its body.
+fn comment_bubble(painter: &egui::Painter, tip: Pos2, label: &str, opacity: f32) -> Rect {
+    let body = comment_bubble_rect(tip);
+    let fill = theme::accent().gamma_multiply(opacity);
+    let outline = Stroke::new(1.5, Color32::WHITE.gamma_multiply(opacity));
+    let tail = vec![tip, Pos2::new(tip.x + 4.0, body.bottom() - 1.0), Pos2::new(tip.x + 13.0, body.bottom() - 1.0)];
+    painter.rect_filled(body.translate(Vec2::new(0.0, 2.0)), 8.0, Color32::from_black_alpha(50));
+    painter.add(Shape::convex_polygon(tail.clone(), fill, outline));
+    painter.rect(body, 8.0, fill, outline, StrokeKind::Outside);
+    // Cover the tail's outline where it joins the body.
+    painter.add(Shape::convex_polygon(vec![tail[0], tail[1] - Vec2::new(0.0, 1.5), tail[2] - Vec2::new(0.0, 1.5)], fill, Stroke::NONE));
+    painter.text(body.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(12.0), Color32::WHITE.gamma_multiply(opacity));
+    body
 }

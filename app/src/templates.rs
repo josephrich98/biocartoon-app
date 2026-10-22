@@ -417,7 +417,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let meta = TemplateMeta { id: "t".into(), title: "T".into(), thumb_key: "templates/t/thumb.png".into(), ..Default::default() };
         let kind = ItemKind::Shape { shape: ShapeKind::Ellipse, fill: [0; 4], stroke: [0; 4], stroke_width: 1.0 };
-        let slide = Slide { name: "T".into(), items: vec![Item::new(1, "s", kind, egui::Pos2::ZERO, egui::Vec2::splat(10.0))] };
+        let slide = Slide { name: "T".into(), items: vec![Item::new(1, "s", kind, egui::Pos2::ZERO, egui::Vec2::splat(10.0))], comments: Vec::new() };
         let file = TemplateFile { meta: meta.clone(), width: 100.0, height: 50.0, background: [255; 4], slide };
         let job = SaveJob { meta, file, dir: dir.clone(), thumb: Ok(image::RgbaImage::new(4, 2)), submit: None };
         let (row, submitted) = save(job).unwrap();
@@ -443,7 +443,7 @@ mod tests {
         let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), author: "tester".into(), license: "CC0-1.0".into() };
         let image = ItemKind::Image { source: ImageSource::file(pic.display().to_string()), crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0] };
         let text = ItemKind::text("Step 1", 20.0, [0, 0, 0, 255], crate::doc::TextAlign::Left, true);
-        let slide = Slide { name: "x".into(), items: vec![Item::new(1, "pic", image, egui::Pos2::ZERO, egui::Vec2::splat(50.0)), Item::new(2, "t", text, egui::Pos2::ZERO, egui::Vec2::splat(50.0))] };
+        let slide = Slide { name: "x".into(), items: vec![Item::new(1, "pic", image, egui::Pos2::ZERO, egui::Vec2::splat(50.0)), Item::new(2, "t", text, egui::Pos2::ZERO, egui::Vec2::splat(50.0))], comments: Vec::new() };
         let tmeta = TemplateMeta { id: "local-id".into(), title: meta.title.clone(), thumb_key: "templates/local-id/thumb.png".into(), ..Default::default() };
         let file = TemplateFile { meta: tmeta.clone(), width: 960.0, height: 672.0, background: [255; 4], slide };
         let job = SaveJob { meta: tmeta, file, dir: dir.join("t"), thumb: Ok(image::RgbaImage::new(48, 32)), submit: Some((url.clone(), meta.clone())) };
