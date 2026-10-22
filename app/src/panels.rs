@@ -59,8 +59,11 @@ impl BioCartoon {
         let screen = ctx.content_rect();
         let strip = |side: &str, rect: Rect, inward: f32| -> bool {
             let mut opened = false;
-            egui::Area::new(egui::Id::new(("edge_swipe", side))).fixed_pos(rect.min).order(egui::Order::Foreground).show(&ctx, |ui| {
-                let r = ui.allocate_rect(rect, Sense::drag());
+            // Sized exactly and left where it is: a free-sized Area kept on screen grows across the
+            // window on a phone and takes every tap meant for the panels under it.
+            let area = egui::Area::new(egui::Id::new(("edge_swipe", side))).fixed_pos(rect.min).constrain(false).order(egui::Order::Foreground);
+            area.show(&ctx, |ui| {
+                let (_, r) = ui.allocate_exact_size(rect.size(), Sense::drag());
                 if r.hovered() || r.dragged() {
                     ui.ctx().set_cursor_icon(if inward > 0.0 { egui::CursorIcon::ResizeEast } else { egui::CursorIcon::ResizeWest });
                 }
