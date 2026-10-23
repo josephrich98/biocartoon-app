@@ -97,6 +97,13 @@ jobs:
           sed -i '' 's|^binaries-dir = "target/release"|binaries-dir = "target/universal"|' Cargo.toml
           cargo packager --release -f dmg
           mkdir -p out && cp target/packages/*.dmg out/BioCartoon-macOS.dmg
+          # cargo-packager notarizes the .app but only signs the DMG, so notarize and staple the
+          # DMG too (spctl -a -t install rejects it otherwise).
+          if [ -n "${APPLE_ID:-}" ]; then
+            xcrun notarytool submit out/BioCartoon-macOS.dmg --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+            xcrun stapler staple out/BioCartoon-macOS.dmg
+          fi
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
