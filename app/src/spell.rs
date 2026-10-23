@@ -95,6 +95,8 @@ pub struct SpellState {
     pub ignored: HashSet<String>,
     /// Spelling suggestions by word, filled in a few per frame (suggesting is slow).
     pub suggestions: HashMap<String, Vec<String>>,
+    /// What is typed in the Add to dictionary window.
+    pub dict_input: String,
 }
 
 impl SpellState {
@@ -214,6 +216,15 @@ fn tokens(s: &str) -> Vec<Tok<'_>> {
 
 fn normalize(w: &str) -> String {
     w.replace('\u{2019}', "'")
+}
+
+/// The words in a typed entry or an uploaded list: separated by commas, semicolons, tabs, spaces
+/// or new lines, with quotes and other punctuation around them dropped.
+pub fn parse_words(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(|w| normalize(w.trim_matches(|c: char| !c.is_alphanumeric())))
+        .filter(|w| !w.is_empty())
+        .collect()
 }
 
 /// Words the speller leaves alone: numbers and words with digits, single letters, acronyms,
@@ -507,8 +518,8 @@ impl BioCartoon {
                     if added > 0 {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let r = ui.add(egui::Button::new(egui::RichText::new(format!("{added} added")).small()).frame(false));
-                            if r.on_hover_text(format!("{}\nClick to remove the words you added", self.settings.custom_words.join(", "))).clicked() {
-                                self.settings.custom_words.clear();
+                            if r.on_hover_text("Words you added: click to see, add or remove them").clicked() {
+                                self.show_dict_window = true;
                             }
                         });
                     }
@@ -533,10 +544,7 @@ impl BioCartoon {
                 }
             }
             Some(Cmd::AddWord(w)) => {
-                let w = normalize(&w);
-                if !self.settings.custom_words.contains(&w) {
-                    self.settings.custom_words.push(w);
-                }
+                self.add_words(vec![normalize(&w)]);
             }
             Some(Cmd::Show(place)) => {
                 self.actions.push(Action::GoSlide(place.slide));
@@ -546,6 +554,127 @@ impl BioCartoon {
         }
         if !open {
             self.show_spell_window = false;
+        }
+    }
+}
+
+impl BioCartoon {
+    /// Adds `words` to the user's dictionary, skipping ones already there (ignoring case);
+    /// returns how many were new.
+    pub fn add_words(&mut self, words: Vec<String>) -> usize {
+        let mut have: HashSet<String> = self.settings.custom_words.iter().map(|w| w.to_lowercase()).collect();
+        let before = self.settings.custom_words.len();
+        for w in words {
+            if have.insert(w.to_lowercase()) {
+                self.settings.custom_words.push(w);
+            }
+        }
+        self.settings.custom_words.len() - before
+    }
+
+    /// Adds the words in uploaded text files (comma- or line-separated) to the dictionary.
+    pub fn add_dictionary_files(&mut self, paths: &[std::path::PathBuf]) {
+        let mut words = Vec::new();
+        let mut failed = Vec::new();
+        for p in paths {
+            match crate::storage::read(p) {
+                Ok(b) => words.extend(parse_words(&String::from_utf8_lossy(&b))),
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
+            }
+            // In the browser the picked file was copied into storage (uploads/<stamp>/<name>).
+            #[cfg(target_arch = "wasm32")]
+            if let Some(dir) = p.parent() {
+                let _ = crate::storage::remove_dir_all(dir);
+            }
+        }
+        if !failed.is_empty() {
+            self.toast_err(format!("Couldn't open {}", failed.join("; ")));
+        }
+        if !words.is_empty() {
+            let found = words.len();
+            let added = self.add_words(words);
+            self.toast(match added {
+                0 => format!("All {found} words were already in your dictionary"),
+                1 => "Added 1 word to your dictionary".into(),
+                n => format!("Added {n} words to your dictionary"),
+            });
+        } else if failed.is_empty() {
+            self.toast_err("No words found in that file");
+        }
+    }
+
+    /// The Add to dictionary window (main menu, or "N added" in the Spelling and grammar window):
+    /// type words in or upload a list, and see or remove the words added.
+    pub fn dictionary_window(&mut self, ctx: &egui::Context) {
+        if !self.show_dict_window {
+            return;
+        }
+        let mut open = true;
+        let mut add = false;
+        let mut remove: Option<usize> = None;
+        let mut clear = false;
+        let center = ctx.content_rect().center();
+        egui::Window::new(format!("{}  Add to dictionary", ph::BOOK_OPEN_TEXT))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(360.0)
+            .default_pos(center - Vec2::new(180.0, 200.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("The spelling check accepts these words. They are kept with your settings on this device.").small().color(theme::text_dim()));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.spell.dict_input).hint_text("Word, or several separated by commas").desired_width(ui.available_width() - 56.0));
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        add = true;
+                        r.request_focus();
+                    }
+                    if ui.add_enabled(!self.spell.dict_input.trim().is_empty(), egui::Button::new("Add")).clicked() {
+                        add = true;
+                    }
+                });
+                if ui.button(format!("{}  Upload word list...", ph::UPLOAD_SIMPLE)).on_hover_text("A text file (.txt or .csv) with words separated by commas or new lines").clicked() {
+                    self.actions.push(Action::PickDictionaryFiles);
+                }
+                ui.separator();
+                let words = &self.settings.custom_words;
+                if words.is_empty() {
+                    ui.label(egui::RichText::new("No words added yet").small().italics().color(theme::text_dim()));
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{} {} added", words.len(), if words.len() == 1 { "word" } else { "words" })).small().color(theme::text_dim()));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new(egui::RichText::new("Remove all").small()).frame(false)).clicked() {
+                                clear = true;
+                            }
+                        });
+                    });
+                    egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+                        // Newest first, so a word just added is in view.
+                        for (k, w) in words.iter().enumerate().rev() {
+                            ui.horizontal(|ui| {
+                                ui.label(w);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.add(egui::Button::new(ph::X).frame(false)).on_hover_text("Remove").clicked() {
+                                        remove = Some(k);
+                                    }
+                                });
+                            });
+                        }
+                    });
+                }
+            });
+        if add {
+            let words = parse_words(&std::mem::take(&mut self.spell.dict_input));
+            self.add_words(words);
+        }
+        if let Some(k) = remove {
+            self.settings.custom_words.remove(k);
+        }
+        if clear {
+            self.settings.custom_words.clear();
+        }
+        if !open {
+            self.show_dict_window = false;
         }
     }
 }
@@ -652,6 +781,12 @@ mod tests {
         assert!(run("an RNA and a DNA, a unit and an hour, an mRNA").is_empty());
         let r = run("It is spliced. a mRNA is made");
         assert!(r.contains(&(IssueKind::Grammar, "a".into())) && r.iter().filter(|(k, _)| *k == IssueKind::Grammar).count() == 2, "{r:?}");
+    }
+
+    #[test]
+    fn parses_word_lists() {
+        assert_eq!(parse_words("organoid, nanobody\r\n\"Golgi\";  optogenetic\n\n"), ["organoid", "nanobody", "Golgi", "optogenetic"]);
+        assert!(parse_words(" ,\n, ").is_empty());
     }
 
     #[test]

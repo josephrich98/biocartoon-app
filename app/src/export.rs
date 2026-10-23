@@ -274,7 +274,7 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
         }
     }
 
-    let bg = if opts.format == ExportFormat::Png && opts.transparent { None } else { Some(job.background) };
+    let transparent = opts.format == ExportFormat::Png && opts.transparent;
     let mut written = Vec::new();
     let multi = job.slides.len() > 1;
     let dir = job.path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -283,6 +283,7 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
     let combine = multi && !opts.individual && opts.format == ExportFormat::Pdf && opts.pdf_pages;
     let mut pages = Vec::new();
     for (n, slide) in &job.slides {
+        let bg = if transparent { None } else { Some(slide.background.unwrap_or(job.background)) };
         let stem = if multi { format!("{stem}-slide{n}") } else { stem.clone() };
         if opts.individual {
             let pics: Vec<&Item> = slide.items.iter().filter(|it| matches!(it.kind, ItemKind::Image { .. })).collect();
@@ -1350,7 +1351,7 @@ mod tests {
         assert_eq!(image::open(dir.join("transparent.png")).unwrap().width(), 3000);
 
         // All slides: one file per slide; cropping skips the slide without images.
-        let text_only = Slide { name: "Text".into(), items: vec![slide.items[2].clone()], comments: Vec::new() };
+        let text_only = Slide { name: "Text".into(), items: vec![slide.items[2].clone()], comments: Vec::new(), background: None };
         let mut all = job(ExportFormat::Png, 72, false, false, "deck.png");
         all.slides = vec![(1, slide.clone()), (2, text_only.clone())];
         let msg = run(&ctx, all).unwrap();

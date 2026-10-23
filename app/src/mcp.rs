@@ -136,7 +136,7 @@ fn editor_tools() -> Vec<Value> {
         tool("canvas_slides", "List the document's slides.", json!({}), &[]),
         tool("canvas_go_slide", "Switch to a slide.", json!({"index": int_prop("0-based slide index.")}), &["index"]),
         tool("canvas_add_slide", "Add an empty slide after the current one and switch to it.", json!({}), &[]),
-        tool("canvas_set_page", "Change the page size or background.", json!({"width": num_prop("Page width in `unit`."), "height": num_prop("Page height in `unit`."), "unit": str_prop("inch, cm or px (default: the document's)."), "background": color_prop("Page colour")}), &[]),
+        tool("canvas_set_page", "Change the page size or background.", json!({"width": num_prop("Page width in `unit`."), "height": num_prop("Page height in `unit`."), "unit": str_prop("inch, cm or px (default: the document's)."), "background": color_prop("Page colour of the current slide")}), &[]),
         tool("canvas_undo", "Undo the last edit.", json!({}), &[]),
         tool("canvas_redo", "Redo.", json!({}), &[]),
         tool("canvas_save", "Save the document as a project in the editor.", json!({}), &[]),

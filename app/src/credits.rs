@@ -81,7 +81,7 @@ pub fn collect<'a>(slides: impl IntoIterator<Item = &'a Slide>, first: usize) ->
 
 /// The credits of a set of items, one per line (embedded in exported files, or saved beside them).
 pub fn for_items(items: &[&Item], only_required: bool) -> String {
-    let slide = Slide { name: String::new(), items: items.iter().map(|it| (*it).clone()).collect(), comments: Vec::new() };
+    let slide = Slide { name: String::new(), items: items.iter().map(|it| (*it).clone()).collect(), comments: Vec::new(), background: None };
     list(&collect([&slide], 1), only_required)
 }
 
@@ -347,8 +347,8 @@ mod tests {
     fn collects_dedupes_and_follows_edits() {
         let cell = asset("servier/cell", "\"Cell\", Servier Medical Art, CC-BY-4.0", "CC-BY-4.0");
         let tube = asset("bioart/tube", "\"Tube\", NIAID NIH BioArt Source, public domain", "PD");
-        let s1 = Slide { name: String::new(), items: vec![image(1, cell.clone()), image(2, tube.clone()), image(3, cell.clone())], comments: Vec::new() };
-        let s2 = Slide { name: String::new(), items: vec![image(4, cell.derived("/tmp/edit.png".into())), image(5, ImageSource::file("/tmp/own.png".into()))], comments: Vec::new() };
+        let s1 = Slide { name: String::new(), items: vec![image(1, cell.clone()), image(2, tube.clone()), image(3, cell.clone())], comments: Vec::new(), background: None };
+        let s2 = Slide { name: String::new(), items: vec![image(4, cell.derived("/tmp/edit.png".into())), image(5, ImageSource::file("/tmp/own.png".into()))], comments: Vec::new(), background: None };
         let c = collect([&s1, &s2], 1);
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].slides, vec![1, 2]);

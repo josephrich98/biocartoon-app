@@ -802,11 +802,14 @@ pub struct Slide {
     /// Notes pinned to the page; shown while editing, never drawn or exported.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    /// This slide's page colour; `None` uses the document's (see [`Document::background_of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<[u8; 4]>,
 }
 
 impl Default for Slide {
     fn default() -> Self {
-        Self { name: "Untitled".into(), items: Vec::new(), comments: Vec::new() }
+        Self { name: "Untitled".into(), items: Vec::new(), comments: Vec::new(), background: None }
     }
 }
 
@@ -884,6 +887,7 @@ pub struct Document {
     pub width: f32,
     pub height: f32,
     pub unit: Unit,
+    /// The page colour of slides that don't have their own.
     pub background: [u8; 4],
     pub next_id: ItemId,
     /// Ruler guides, shared by every slide. Shown only while editing.
@@ -926,6 +930,11 @@ impl Document {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// The page colour of `slide`.
+    pub fn background_of(&self, slide: &Slide) -> [u8; 4] {
+        slide.background.unwrap_or(self.background)
     }
 
     pub fn page_rect(&self) -> Rect {

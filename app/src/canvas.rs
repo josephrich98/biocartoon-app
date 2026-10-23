@@ -910,7 +910,7 @@ impl BioCartoon {
             // Page shadow + background
             painter.rect_filled(page_s.translate(Vec2::new(0.0, 3.0)).expand(2.0), 2.0, Color32::from_black_alpha(90));
             let slide_idx = self.cur_slide;
-            let bg = c32(self.doc.background);
+            let bg = c32(self.doc.background_of(&self.doc.slides[slide_idx]));
             {
                 let slide = &self.doc.slides[slide_idx];
                 let local_dir = self.settings.local_data_dir.clone();
@@ -940,7 +940,9 @@ impl BioCartoon {
             }
             self.draw_guides(&painter, rect, &xf);
             painter.text(page_s.left_top() + Vec2::new(0.0, -8.0), egui::Align2::LEFT_BOTTOM, self.doc.size_label(), FontId::proportional(11.0), theme::text_dim());
-            self.draw_rulers(&painter, rect, &xf);
+            if self.settings.show_rulers {
+                self.draw_rulers(&painter, rect, &xf);
+            }
             self.image_drop(ui, rect, page_s, &xf, &painter);
 
             // Interaction
@@ -1246,8 +1248,10 @@ impl BioCartoon {
         }
         let col = theme::border();
         let txt = theme::text_dim();
-        let h = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 16.0));
-        let v = Rect::from_min_size(rect.min, Vec2::new(16.0, rect.height()));
+        let s = theme::text_scale();
+        let (band, tick, font) = (16.0 * s, 10.0 * s, FontId::proportional(9.0 * s));
+        let h = Rect::from_min_size(rect.min, Vec2::new(rect.width(), band));
+        let v = Rect::from_min_size(rect.min, Vec2::new(band, rect.height()));
         painter.rect_filled(h, 0.0, theme::bg());
         painter.rect_filled(v, 0.0, theme::bg());
         let origin = xf.to_screen(Pos2::ZERO);
@@ -1255,15 +1259,15 @@ impl BioCartoon {
         let last = ((rect.max.x - origin.x) / step).ceil() as i32;
         for i in first..=last {
             let x = origin.x + i as f32 * step;
-            painter.line_segment([Pos2::new(x, h.min.y + 10.0), Pos2::new(x, h.max.y)], Stroke::new(1.0, col));
-            painter.text(Pos2::new(x + 2.0, h.min.y + 1.0), egui::Align2::LEFT_TOP, i.to_string(), FontId::proportional(9.0), txt);
+            painter.line_segment([Pos2::new(x, h.min.y + tick), Pos2::new(x, h.max.y)], Stroke::new(1.0, col));
+            painter.text(Pos2::new(x + 2.0, h.min.y + 1.0), egui::Align2::LEFT_TOP, i.to_string(), font.clone(), txt);
         }
         let first = ((rect.min.y - origin.y) / step).floor() as i32;
         let last = ((rect.max.y - origin.y) / step).ceil() as i32;
         for i in first..=last {
             let y = origin.y + i as f32 * step;
-            painter.line_segment([Pos2::new(v.min.x + 10.0, y), Pos2::new(v.max.x, y)], Stroke::new(1.0, col));
-            painter.text(Pos2::new(v.min.x + 2.0, y + 2.0), egui::Align2::LEFT_TOP, i.to_string(), FontId::proportional(9.0), txt);
+            painter.line_segment([Pos2::new(v.min.x + tick, y), Pos2::new(v.max.x, y)], Stroke::new(1.0, col));
+            painter.text(Pos2::new(v.min.x + 2.0, y + 2.0), egui::Align2::LEFT_TOP, i.to_string(), font.clone(), txt);
         }
     }
 
@@ -1727,6 +1731,16 @@ impl BioCartoon {
             self.actions.push(Action::Select(self.slide().items.iter().map(|x| x.id).collect()));
             ui.close();
         }
+        if ui.add(egui::Button::new(format!("{}  Reset view", ph::CORNERS_OUT)).shortcut_text("⌘0")).on_hover_text("Fit the page in the window").clicked() {
+            self.actions.push(Action::ZoomFit);
+            ui.close();
+        }
+        // Buttons rather than ui.checkbox so the box sits on the right, as in the main menu.
+        let check = |on: bool| if on { ph::CHECK_SQUARE } else { ph::SQUARE };
+        ui.separator();
+        if ui.add(egui::Button::new(format!("{}  Show rulers", ph::RULER)).right_text(check(self.settings.show_rulers))).clicked() {
+            self.settings.show_rulers = !self.settings.show_rulers;
+        }
         ui.separator();
         if ui.button(format!("{}  Add vertical guide", ph::LINE_VERTICAL)).clicked() {
             self.actions.push(Action::AddGuide(true));
@@ -1736,8 +1750,6 @@ impl BioCartoon {
             self.actions.push(Action::AddGuide(false));
             ui.close();
         }
-        // Buttons rather than ui.checkbox so the box sits on the right, as in the main menu.
-        let check = |on: bool| if on { ph::CHECK_SQUARE } else { ph::SQUARE };
         if ui.add(egui::Button::new(format!("{}  Snap to guides", ph::MAGNET)).right_text(check(self.settings.guide_snap))).on_hover_text("Hold Alt (Option) while dragging to place freely").clicked() {
             self.settings.guide_snap = !self.settings.guide_snap;
         }
@@ -1982,15 +1994,15 @@ impl BioCartoon {
 
 /// Icon-over-label button used by the rail.
 pub fn tool_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool) -> egui::Response {
-    let size = Vec2::new(50.0, 42.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let s = theme::text_scale();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(50.0, 42.0) * s, Sense::click());
     let painter = ui.painter();
     if selected || resp.hovered() {
         painter.rect_filled(rect, 6.0, if selected { theme::accent_dim() } else { theme::hover() });
     }
     let col = if selected { theme::on_accent_dim() } else { theme::text() };
-    painter.text(Pos2::new(rect.center().x, rect.min.y + 13.0), egui::Align2::CENTER_CENTER, icon, FontId::proportional(17.0), col);
-    painter.text(Pos2::new(rect.center().x, rect.max.y - 9.0), egui::Align2::CENTER_CENTER, label, FontId::proportional(9.5), col);
+    painter.text(Pos2::new(rect.center().x, rect.min.y + 13.0 * s), egui::Align2::CENTER_CENTER, icon, FontId::proportional(17.0 * s), col);
+    painter.text(Pos2::new(rect.center().x, rect.max.y - 9.0 * s), egui::Align2::CENTER_CENTER, label, FontId::proportional(9.5 * s), col);
     resp
 }
 

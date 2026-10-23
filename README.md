@@ -139,7 +139,7 @@ A: Yes. The desktop app always saves your projects on your computer. In the web 
 
 **Q: What user information do you store?**
 
-A: By default, we don't store any user data. You can use the web app or desktop app without an account, and your figures, uploaded icons, and favorites stay on your own device (starring an icon only adds to its public count under a random ID, not anything tied to you). If you would like long-term storage of your figures in the web app, you can sign in with Google or GitHub, and then only your name, email, and an online copy of your figures are stored in a secure database. No passwords are ever stored. Deleting a figure or your account will remove this information from the online database as well.
+A: By default, we don't store any user data. You can use the web app or desktop app without an account, and your figures, uploaded icons, and favorites (and any words you add to the spelling dictionary) stay on your own device (starring an icon only adds to its public count under a random ID, not anything tied to you). If you would like long-term storage of your figures in the web app, you can sign in with Google or GitHub, and then only your name, email, and an online copy of your figures are stored in a secure database. No passwords are ever stored. Deleting a figure or your account will remove this information from the online database as well.
 
 **Q: How do I contribute an illustration or template?**
 

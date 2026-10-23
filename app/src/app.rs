@@ -60,6 +60,8 @@ pub struct Settings {
     /// Moved and resized items snap to guides.
     pub guide_snap: bool,
     pub show_grid: bool,
+    /// Rulers along the canvas's top and left edges.
+    pub show_rulers: bool,
     pub grid_size: f32,
     /// Unit of the custom grid spacing.
     pub grid_unit: Unit,
@@ -127,6 +129,7 @@ impl Default for Settings {
             grid_snap: false,
             guide_snap: true,
             show_grid: false,
+            show_rulers: true,
             grid_size: DPI / 4.0,
             grid_unit: Unit::Inch,
             grid_custom: false,
@@ -152,6 +155,38 @@ impl Default for Settings {
             check_grammar: true,
             show_spelling: false,
             backup_snoozed_until: 0,
+        }
+    }
+}
+
+impl Settings {
+    /// These settings with every preference back to its default. What the user made or entered
+    /// stays: generated images, uploads, favorites, dictionary words, the AI connection, the
+    /// contributor name and email, and the folder and server locations.
+    pub fn restored_defaults(&self) -> Self {
+        let s = self.clone();
+        Self {
+            version: s.version,
+            asset_base_url: s.asset_base_url,
+            catalog_path: s.catalog_path,
+            local_data_dir: s.local_data_dir,
+            offline_dir: s.offline_dir,
+            ai_provider: s.ai_provider,
+            ai_model: s.ai_model,
+            api_key: s.api_key,
+            ai_base_url: s.ai_base_url,
+            generated: s.generated,
+            submitted: s.submitted,
+            uploads: s.uploads,
+            favorites: s.favorites,
+            pending_stars: s.pending_stars,
+            submit_url: s.submit_url,
+            contributor_name: s.contributor_name,
+            contributor_email: s.contributor_email,
+            client_id: s.client_id,
+            custom_words: s.custom_words,
+            backup_snoozed_until: s.backup_snoozed_until,
+            ..Self::default()
         }
     }
 }
@@ -338,9 +373,15 @@ impl SearchFilter {
 /// How many icons a search or browse loads at a time; more load as the list scrolls.
 const RESULTS_PAGE: usize = 120;
 
+/// How long typing pauses before the search runs, in seconds, so typing "mouse" doesn't
+/// flash the results for "m", "mo" and so on.
+const SEARCH_DELAY: f64 = 0.25;
+
 pub struct IconsState {
     pub mode: IconsMode,
     pub query: String,
+    /// When the query was last typed into (`ctx.input(|i| i.time)`); the search waits [`SEARCH_DELAY`] after it.
+    pub typed_at: f64,
     pub last_sent_query: String,
     pub filter: SearchFilter,
     pub last_sent_filter: SearchFilter,
@@ -366,6 +407,8 @@ pub struct IconsState {
     pub error: Option<String>,
     /// Results: icons, templates or both.
     pub include: Include,
+    /// Scroll the Icons panel to its top (`Min`) or bottom (`Max`) next frame.
+    pub scroll_to: Option<egui::Align>,
 }
 
 impl Default for IconsState {
@@ -373,6 +416,7 @@ impl Default for IconsState {
         Self {
             mode: IconsMode::Home,
             query: String::new(),
+            typed_at: f64::NEG_INFINITY,
             last_sent_query: "\u{0}".into(),
             filter: SearchFilter::default(),
             last_sent_filter: SearchFilter::default(),
@@ -391,6 +435,7 @@ impl Default for IconsState {
             loading: false,
             error: None,
             include: Include::Both,
+            scroll_to: None,
         }
     }
 }
@@ -646,7 +691,7 @@ pub struct PageState {
     pub lock_aspect: bool,
     /// Page width, height, unit and colour right after the panel's last edit, so that a burst of
     /// edits makes one undo step.
-    pub last_edit: Option<(f32, f32, Unit, [u8; 4])>,
+    pub last_edit: Option<(f32, f32, Unit, Option<[u8; 4]>)>,
 }
 
 /// Where the "Edit with AI" conversation is: offering the quick edits, asking for a restyle's
@@ -811,6 +856,9 @@ pub enum Action {
     /// Ask for .biocartoon files whose slides to offer under Contribute artwork > Templates.
     PickTemplateFiles,
     AddTemplateFiles(Vec<PathBuf>),
+    /// Pick text files of words for the spelling dictionary.
+    PickDictionaryFiles,
+    AddDictionaryFiles(Vec<PathBuf>),
     /// Open the library dialog for everything picked under Contribute artwork, one at a time.
     ContributeSelected,
     /// Open the Add to your library (`false`) or Add to BioCartoon library (`true`) page.
@@ -876,6 +924,10 @@ pub struct BioCartoon {
     pub ai: AiClient,
     pub settings: Settings,
     pub show_settings: bool,
+    /// "Restore default settings" is waiting for the user to confirm.
+    confirm_restore_settings: bool,
+    /// The settings before the last restore, so it can be undone until the Settings window closes.
+    settings_before_restore: Option<Settings>,
     /// The theme last applied: dark or not, and the text size.
     applied_theme: Option<(bool, theme::TextSize)>,
     pub show_about: bool,
@@ -883,6 +935,8 @@ pub struct BioCartoon {
     pub spell: crate::spell::SpellState,
     /// The Spelling and grammar window is open (it also shows squiggles while open).
     pub show_spell_window: bool,
+    /// The Add to dictionary window is open.
+    pub show_dict_window: bool,
     pub settings_tab: SettingsTab,
     pub ai_setup: Option<AiSetup>,
     pub catalog_sync: Option<CatalogSync>,
@@ -1093,10 +1147,13 @@ impl BioCartoon {
             ai,
             settings,
             show_settings: false,
+            confirm_restore_settings: false,
+            settings_before_restore: None,
             applied_theme: None,
             show_about: false,
             spell: Default::default(),
             show_spell_window: false,
+            show_dict_window: false,
             settings_tab: SettingsTab::General,
             ai_setup: None,
             view: crate::canvas::View::default(),
@@ -1247,6 +1304,13 @@ impl BioCartoon {
 
     pub(crate) fn ui_ctx(&self) -> egui::Context {
         self.ctx.clone()
+    }
+
+    /// Replace the settings, e.g. when restoring the defaults or undoing that.
+    fn replace_settings(&mut self, settings: Settings) {
+        self.settings = settings;
+        let d = &self.settings;
+        self.ai.set_backend(d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts);
     }
 
     pub fn open_settings(&mut self, tab: SettingsTab) {
@@ -2234,6 +2298,8 @@ impl BioCartoon {
 
     pub fn request_search(&mut self) {
         self.icons.browse_offset = 0;
+        // A new search starts from the top of its results.
+        self.icons.scroll_to = Some(egui::Align::Min);
         self.request_search_page();
         self.icons.last_sent_query = self.icons.query.clone();
         self.icons.last_sent_filter = self.icons.filter.clone();
@@ -2505,7 +2571,8 @@ impl BioCartoon {
     pub fn template_target(&self, i: usize) -> UploadTarget {
         let mut slide = self.doc.slides.get(i).cloned().unwrap_or_default();
         slide.comments.clear();
-        UploadTarget::Template(Box::new(TemplateSlide { slide, width: self.doc.width, height: self.doc.height, background: self.doc.background, saved: None }))
+        let background = self.doc.background_of(&slide);
+        UploadTarget::Template(Box::new(TemplateSlide { slide, width: self.doc.width, height: self.doc.height, background, saved: None }))
     }
 
     pub fn open_upload_dialog(&mut self, target: UploadTarget, share: bool) {
@@ -2613,7 +2680,8 @@ impl BioCartoon {
                 Ok(doc) => {
                     for mut slide in doc.slides.into_iter().filter(|s| !s.items.is_empty()) {
                         slide.comments.clear();
-                        self.contribute.templates.push(TemplateSlide { slide, width: doc.width, height: doc.height, background: doc.background, saved: None });
+                        let background = slide.background.unwrap_or(doc.background);
+                        self.contribute.templates.push(TemplateSlide { slide, width: doc.width, height: doc.height, background, saved: None });
                     }
                 }
                 Err(e) => failed.push(format!("{}: {e}", p.display())),
@@ -2996,7 +3064,7 @@ impl BioCartoon {
         let s = if s.is_finite() && s > 0.0 { s } else { 1.0 };
         let off = [(self.doc.width - t.width * s) / 2.0, (self.doc.height - t.height * s) / 2.0];
         let mut groups: HashMap<u64, u64> = HashMap::new();
-        let mut slide = Slide { name: t.slide.name, items: Vec::new(), comments: Vec::new() };
+        let mut slide = Slide { name: t.slide.name, items: Vec::new(), comments: Vec::new(), background: Some(t.background) };
         for mut it in t.slide.items {
             // Shared templates may only reference bucket objects, never files on this computer.
             if !own && matches!(&it.kind, ItemKind::Image { source: ImageSource::File { .. }, .. }) {
@@ -3511,7 +3579,7 @@ impl BioCartoon {
     pub fn start_thumb(&mut self, key: String, save_to: Option<PathBuf>, doc: &Document) {
         let Some(slide) = doc.slides.first().cloned() else { return };
         let (requests, cached) = self.render_inputs(&slide);
-        let (page, bg) = (doc.page_rect(), doc.background);
+        let (page, bg) = (doc.page_rect(), doc.background_of(&slide));
         let tx = self.thumb_tx.clone();
         let ctx = self.ctx.clone();
         self.thumbs_pending.insert(key.clone());
@@ -3656,7 +3724,8 @@ impl BioCartoon {
 
     /// `slides` are 0-based indices into `doc.slides`.
     fn export_job_for(&self, doc: &Document, slides: &[usize], path: PathBuf, opts: ExportOptions) -> crate::export::ExportJob {
-        let slides: Vec<(usize, Slide)> = slides.iter().map(|&i| i.min(doc.slides.len() - 1)).map(|i| (i + 1, doc.slides[i].clone())).collect();
+        // Each slide carries its resolved page colour.
+        let slides: Vec<(usize, Slide)> = slides.iter().map(|&i| i.min(doc.slides.len() - 1)).map(|i| (i + 1, Slide { background: Some(doc.background_of(&doc.slides[i])), ..doc.slides[i].clone() })).collect();
         let mut requests = HashMap::new();
         let mut fallbacks = HashMap::new();
         for it in slides.iter().flat_map(|(_, s)| &s.items) {
@@ -3811,7 +3880,9 @@ impl BioCartoon {
                         ui.horizontal(|ui| {
                             const PRESETS: [u32; 4] = [72, 150, 300, 600];
                             // The custom box stays empty while a preset is chosen, so the value never shows twice.
-                            let id = ui.id().with("custom_dpi");
+                            // A partly typed number ("1" on the way to "1200") only takes effect once it is in range, and an
+                            // emptied box goes back to the default on leaving it, so the box can always be cleared.
+                            let id = egui::Id::new("export_custom_dpi");
                             let mut custom: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| {
                                 if PRESETS.contains(&opts.dpi) { String::new() } else { opts.dpi.to_string() }
                             });
@@ -3824,10 +3895,17 @@ impl BioCartoon {
                             if r.changed() {
                                 custom.retain(|c| c.is_ascii_digit());
                                 if let Ok(v) = custom.parse::<u32>() {
-                                    opts.dpi = v.clamp(crate::export::MIN_DPI, crate::export::MAX_DPI);
+                                    if (crate::export::MIN_DPI..=crate::export::MAX_DPI).contains(&v) {
+                                        opts.dpi = v;
+                                    }
                                 }
                             }
                             if r.lost_focus() {
+                                match custom.parse::<u32>() {
+                                    Ok(v) => opts.dpi = v.clamp(crate::export::MIN_DPI, crate::export::MAX_DPI),
+                                    Err(_) if !PRESETS.contains(&opts.dpi) => opts.dpi = ExportOptions::default().dpi,
+                                    Err(_) => {}
+                                }
                                 custom = if PRESETS.contains(&opts.dpi) { String::new() } else { opts.dpi.to_string() };
                             }
                             ui.data_mut(|d| d.insert_temp(id, custom));
@@ -4011,7 +4089,7 @@ impl BioCartoon {
         self.commit();
         let w = self.doc.width;
         let h = self.doc.height;
-        let mut slide = Slide { name: Self::template_names()[idx].0.to_string(), items: Vec::new(), comments: Vec::new() };
+        let mut slide = Slide { name: Self::template_names()[idx].0.to_string(), items: Vec::new(), comments: Vec::new(), background: self.slide().background };
         let mut add = |doc: &mut Document, name: &str, kind: ItemKind, r: Rect| {
             let id = doc.alloc_id();
             slide.items.push(Item::new(id, name, kind, r.min, r.size()));
@@ -4404,7 +4482,9 @@ impl BioCartoon {
             Action::Export(p) => self.start_export(ctx, p),
             Action::AddSlide => {
                 self.commit();
-                self.doc.slides.insert(self.cur_slide + 1, Slide::default());
+                // A new slide keeps the current one's page colour.
+                let background = self.slide().background;
+                self.doc.slides.insert(self.cur_slide + 1, Slide { background, ..Slide::default() });
                 self.cur_slide += 1;
                 self.selection.clear();
             }
@@ -4481,6 +4561,13 @@ impl BioCartoon {
                 });
             }
             Action::AddTemplateFiles(paths) => self.add_template_files(&paths),
+            Action::PickDictionaryFiles => {
+                let tx = self.action_tx.clone();
+                crate::platform::pick_files("Word list", &["txt", "csv", "dic"], true, move |paths| {
+                    let _ = tx.send(Action::AddDictionaryFiles(paths));
+                });
+            }
+            Action::AddDictionaryFiles(paths) => self.add_dictionary_files(&paths),
             Action::UseSavedTemplate(row) => {
                 self.load_saved_template(row);
                 self.hide_icons_on_phones(ctx);
@@ -4708,12 +4795,27 @@ impl BioCartoon {
         if self.images.loads_in_flight > 0 || self.ai.busy > 0 || self.icons.loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        // Debounced search.
-        if self.settings.show_icons
-            && self.icons.mode == IconsMode::Search
-            && (self.icons.query != self.icons.last_sent_query || self.icons.filter != self.icons.last_sent_filter)
-        {
-            self.request_search();
+        // Debounced search: a filter change runs at once, typing once it pauses.
+        if self.settings.show_icons && self.icons.mode == IconsMode::Search {
+            let wait = self.icons.typed_at + SEARCH_DELAY - ctx.input(|i| i.time);
+            if self.icons.filter != self.icons.last_sent_filter || (self.icons.query != self.icons.last_sent_query && wait <= 0.0) {
+                self.request_search();
+            } else if self.icons.query != self.icons.last_sent_query {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+            }
+        }
+        // Cmd+Up and Cmd+Down jump to the top and bottom of the Icons panel (taken before the
+        // arrow keys can nudge the selection).
+        if self.settings.show_icons {
+            ctx.input_mut(|i| {
+                use egui::{Key, Modifiers};
+                if i.consume_key(Modifiers::COMMAND, Key::ArrowUp) {
+                    self.icons.scroll_to = Some(egui::Align::Min);
+                }
+                if i.consume_key(Modifiers::COMMAND, Key::ArrowDown) {
+                    self.icons.scroll_to = Some(egui::Align::Max);
+                }
+            });
         }
         self.keyboard(&ctx);
 
@@ -4781,6 +4883,7 @@ impl BioCartoon {
                             self.settings.show_spelling = !view;
                         }
                         if ui.button("Check spelling and grammar...").clicked() { self.show_spell_window = true; ui.close(); }
+                        if ui.button("Add to dictionary...").on_hover_text("Words the spelling check should accept: type them in or upload a list").clicked() { self.show_dict_window = true; ui.close(); }
                         ui.separator();
                         if ui.button("Export...").clicked() { self.actions.push(Action::OpenExport); ui.close(); }
                         if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = None; self.attributions_export = None; ui.close(); }
@@ -4803,7 +4906,9 @@ impl BioCartoon {
                         self.actions.push(Action::GoHome);
                     }
                     ui.separator();
-                    let title = ui.add(egui::TextEdit::singleline(&mut self.doc.title).desired_width(140.0).frame(egui::Frame::NONE));
+                    // Narrower on a phone, leaving room for what follows it and the Export button.
+                    let title_w = (ui.ctx().content_rect().right() - ui.cursor().min.x - 160.0).clamp(40.0, 140.0);
+                    let title = ui.add(egui::TextEdit::singleline(&mut self.doc.title).desired_width(title_w).frame(egui::Frame::NONE));
                     if title.changed() { self.dirty = true; }
                     ui.label(egui::RichText::new(if self.dirty { ph::CLOUD_ARROW_UP } else { ph::CHECK }).color(theme::text_dim()))
                         .on_hover_text(if self.dirty { "Saving..." } else { "All changes saved to this computer" });
@@ -4909,6 +5014,7 @@ impl BioCartoon {
                 });
                 ui.separator();
                 // Edits apply (and are saved) right away, so there's no Save button.
+                let mut restore = None;
                 let d = &mut self.settings;
                 let ai_before = (d.ai_provider, d.ai_model.clone(), d.api_key.clone(), d.ai_base_url.clone(), d.ai_prompts.clone());
                 match self.settings_tab {
@@ -4943,6 +5049,18 @@ impl BioCartoon {
                             });
                             ui.end_row();
                         });
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Restore default settings").on_hover_text("Appearance, icons, grid and snapping, export options and AI prompts go back to their defaults").clicked() {
+                                self.confirm_restore_settings = true;
+                            }
+                            if ui.add_enabled(self.settings_before_restore.is_some(), egui::Button::new(format!("{}  Undo", ph::ARROW_COUNTER_CLOCKWISE))).on_hover_text("Bring back the settings you had before restoring the defaults").clicked() {
+                                if let Some(before) = self.settings_before_restore.take() {
+                                    restore = Some(before);
+                                }
+                            }
+                        });
                     }
                     SettingsTab::Ai => {
                         ai_fields(ui, &mut d.ai_provider, &mut d.ai_model, &mut d.api_key, &mut d.ai_base_url);
@@ -4959,8 +5077,42 @@ impl BioCartoon {
                 if (d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts) != (ai_before.0, &ai_before.1, &ai_before.2, &ai_before.3, &ai_before.4) {
                     self.ai.set_backend(d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts);
                 }
+                if let Some(before) = restore {
+                    self.replace_settings(before);
+                }
             });
-            if !open { self.show_settings = false; }
+            if !open {
+                self.show_settings = false;
+                self.settings_before_restore = None;
+            }
+        }
+
+        // Restore default settings?
+        if self.confirm_restore_settings {
+            let mut go = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("restore_settings_modal")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.heading("Restore default settings?");
+                ui.add_space(6.0);
+                ui.label("Appearance, text size, icon tiles, grid and snapping, export options and AI prompts go back to their defaults. Your projects, library, favorites, dictionary words and AI key stay.");
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Restore defaults").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if go {
+                self.settings_before_restore = Some(self.settings.clone());
+                self.replace_settings(self.settings.restored_defaults());
+            }
+            if go || cancel || modal.should_close() {
+                self.confirm_restore_settings = false;
+            }
         }
 
         // About
@@ -5026,6 +5178,7 @@ impl BioCartoon {
 
     fn windows(&mut self, ctx: &egui::Context) {
         self.spell_window(ctx);
+        self.dictionary_window(ctx);
         self.attributions_window(ctx);
         self.credit_window(ctx);
         if self.show_export {
@@ -5394,7 +5547,7 @@ impl BioCartoon {
     /// Headless-ish smoke test: `BIOCARTOON_SCREENSHOT=out.png` captures the window after a
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
-    /// settings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
+    /// settings, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, dictionary, textedit, tableedit, placetext,
     /// comments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
@@ -5430,6 +5583,10 @@ impl BioCartoon {
                     }
                     s if s.starts_with("view=") => {
                         self.settings.home_view = match &s["view=".len()..] { "list" => HomeView::List, "small" => HomeView::SmallTiles, _ => HomeView::LargeTiles };
+                    }
+                    s if s.starts_with("size=") => {
+                        let i = ["xs", "s", "m", "l", "xl", "xxl"].iter().position(|n| *n == &s["size=".len()..]).unwrap_or(2);
+                        self.settings.text_size = theme::TextSize::ALL[i];
                     }
                     "history" => {
                         if let Some(p) = self.home.projects.first().cloned() {
@@ -5471,6 +5628,13 @@ impl BioCartoon {
                         let text = "The the intron is spliced out by the spliceosme. a mRNA is then exported , and transalted by ribosomes.";
                         self.actions.push(Action::InsertText { text: text.into(), size: 28.0, bold: false });
                         self.settings.show_spelling = true;
+                    }
+                    // The Add to dictionary window, with a few words added.
+                    "dictionary" => {
+                        self.show_settings = false;
+                        self.settings.custom_words = ["spliceosome", "Golgi", "optogenetic"].map(String::from).to_vec();
+                        self.spell.dict_input = "nanobody, organoid".into();
+                        self.show_dict_window = true;
                     }
                     // A styled list being typed into on the canvas, with its Text settings open.
                     "textedit" => {
@@ -5597,6 +5761,8 @@ impl BioCartoon {
                         self.show_attributions = true;
                     }
                     "offline" => self.open_settings(SettingsTab::Offline),
+                    "restoresettings" => { self.open_settings(SettingsTab::General); self.confirm_restore_settings = true; }
+                    "restoredsettings" => { self.open_settings(SettingsTab::General); self.settings_before_restore = Some(self.settings.clone()); }
                     "canvasedit" | "page" => { self.show_settings = false; self.rail = Some(RailTab::Page); }
                     "light" => self.settings.theme = theme::ThemeMode::Light,
                     "dark" => self.settings.theme = theme::ThemeMode::Dark,
@@ -5903,6 +6069,26 @@ mod tests {
         let mut out = std::io::Cursor::new(Vec::new());
         img.write_to(&mut out, format).unwrap();
         out.into_inner()
+    }
+
+    /// Restoring the defaults resets preferences but keeps what the user made or entered.
+    #[test]
+    fn restored_defaults_keep_user_data() {
+        let mut s = Settings::default();
+        s.text_size = theme::TextSize::Large;
+        s.grid_snap = true;
+        s.grid_size = 48.0;
+        s.ai_prompts.generate = "mine".into();
+        s.api_key = "key".into();
+        s.favorites = vec!["a".into()];
+        s.custom_words = vec!["scRNA".into()];
+        s.contributor_name = "Ada".into();
+        let r = s.restored_defaults();
+        let d = Settings::default();
+        assert!(r.text_size == d.text_size && !r.grid_snap && r.grid_size == d.grid_size);
+        assert_eq!(r.ai_prompts, d.ai_prompts);
+        assert_eq!((r.api_key.as_str(), r.contributor_name.as_str()), ("key", "Ada"));
+        assert_eq!((r.favorites, r.custom_words), (s.favorites, s.custom_words));
     }
 
     /// A PNG re-encoded into the library keeps its fingerprint; a changed one doesn't.

@@ -620,14 +620,25 @@ impl BioCartoon {
     fn project_list(&mut self, ui: &mut egui::Ui, projects: &[ProjectMeta]) {
         const ROW_H: f32 = 64.0;
         let w = ui.available_width();
-        let cols = [w * 0.40, w * 0.18, w * 0.18, w * 0.18];
+        // Date columns: all three, or on a narrow screen just the one the list is sorted by.
+        let dates: &[usize] = if w >= 560.0 {
+            &[1, 2, 3]
+        } else {
+            match self.settings.home_sort {
+                SortKey::LastModified => &[2],
+                SortKey::Created => &[3],
+                SortKey::LastOpened | SortKey::Name => &[1],
+            }
+        };
+        let cols: Vec<f32> = if dates.len() == 3 { vec![w * 0.40, w * 0.18, w * 0.18, w * 0.18] } else { vec![w - 96.0 - 160.0, 110.0] };
         let x0 = ui.cursor().min.x;
         let x = |i: usize| x0 + 96.0 + cols[..i].iter().sum::<f32>();
         // Header
         let (hdr, _) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::hover());
-        for (i, h) in ["Name", "Last opened", "Last modified", "Created"].iter().enumerate() {
-            let active = matches!((i, self.settings.home_sort), (0, SortKey::Name) | (1, SortKey::LastOpened) | (2, SortKey::LastModified) | (3, SortKey::Created));
-            ui.painter().text(egui::pos2(x(i), hdr.center().y), Align2::LEFT_CENTER, *h, FontId::proportional(13.0), if active { theme::text() } else { theme::text_dim() });
+        let headers = ["Name", "Last opened", "Last modified", "Created"];
+        for (i, &k) in std::iter::once(&0).chain(dates).enumerate() {
+            let active = matches!((k, self.settings.home_sort), (0, SortKey::Name) | (1, SortKey::LastOpened) | (2, SortKey::LastModified) | (3, SortKey::Created));
+            ui.painter().text(egui::pos2(x(i), hdr.center().y), Align2::LEFT_CENTER, headers[k], FontId::proportional(13.0), if active { theme::text() } else { theme::text_dim() });
         }
         ui.painter().hline(hdr.x_range(), hdr.max.y, Stroke::new(1.0, theme::border()));
 
@@ -669,8 +680,9 @@ impl BioCartoon {
             let name = elide(ui, &p.name, FontId::proportional(16.0), cols[0] - 16.0);
             let painter = ui.painter();
             painter.text(egui::pos2(x(0), y), Align2::LEFT_CENTER, name, FontId::proportional(16.0), theme::text());
-            for (i, t) in [p.opened, p.modified, p.created].into_iter().enumerate() {
-                painter.text(egui::pos2(x(i + 1), y), Align2::LEFT_CENTER, format_date(t), FontId::proportional(14.0), theme::text_dim());
+            let times = [p.opened, p.modified, p.created];
+            for (i, &k) in dates.iter().enumerate() {
+                painter.text(egui::pos2(x(i + 1), y), Align2::LEFT_CENTER, format_date(times[k - 1]), FontId::proportional(14.0), theme::text_dim());
             }
             let dots = Rect::from_center_size(egui::pos2(rect.max.x - 28.0, y), Vec2::new(32.0, 24.0));
             self.project_menu(ui, dots, p, &resp);

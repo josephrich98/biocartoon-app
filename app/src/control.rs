@@ -417,7 +417,7 @@ impl BioCartoon {
         json!({
             "width": self.doc.width, "height": self.doc.height, "unit": name_of(u),
             "width_in_unit": u.from_px(self.doc.width), "height_in_unit": u.from_px(self.doc.height),
-            "background": self.doc.background, "dpi": DPI,
+            "background": self.doc.background_of(self.slide()), "dpi": DPI,
         })
     }
 
@@ -497,7 +497,7 @@ impl BioCartoon {
                 let unit = self.doc.unit;
                 if let Some(w) = f(args, "width") { self.doc.width = unit.to_px(w).max(1.0); }
                 if let Some(h) = f(args, "height") { self.doc.height = unit.to_px(h).max(1.0); }
-                if let Some(c) = color(args, "background") { self.doc.background = c; }
+                if let Some(c) = color(args, "background") { self.slide_mut().background = Some(c); }
                 self.view.fit_requested = true;
                 now(self.page_json())
             }
@@ -677,7 +677,7 @@ impl BioCartoon {
                 let max_side = u(args, "max_side").unwrap_or(1024).clamp(64, 4096) as u32;
                 let path = s(args, "path").map(PathBuf::from);
                 let (requests, cached) = self.render_inputs(&slide);
-                let (page, bg, ctx) = (self.doc.page_rect(), self.doc.background, ctx.clone());
+                let (page, bg, ctx) = (self.doc.page_rect(), self.doc.background_of(&slide), ctx.clone());
                 Ok(Outcome::Later(Box::new(move || {
                     let img = crate::export::thumbnail(&ctx, &slide, page, bg, &requests, &cached, max_side)?;
                     let (w, h) = img.dimensions();

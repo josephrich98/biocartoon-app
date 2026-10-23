@@ -181,16 +181,29 @@ fn fetch_one(req: &Request) -> Result<Vec<u8>, String> {
 pub fn fetch_web(req: Request, done: Box<dyn FnOnce(Result<Vec<u8>, String>) + Send>) {
     match req {
         Request::Path(_) => done(fetch(&req)),
-        Request::Url(url) => ehttp::fetch(ehttp::Request::get(&url), move |res| {
-            done(res.map_err(|e| format!("GET {url}: {e}")).and_then(|r| {
-                if r.ok { Ok(r.bytes) } else { Err(format!("GET {url}: {} {}", r.status, r.status_text)) }
-            }))
+        Request::Url(url) => ehttp::fetch(ehttp::Request::get(&url), move |res| match res {
+            // A network error here is usually CORS: the browser reused a copy of the asset that
+            // biocartoon.com's landing page loaded without CORS headers (the two sites share the
+            // HTTP cache, and assets are cached as immutable for a year). The asset bucket
+            // ignores the query, so asking again with one gets a fresh copy past that entry.
+            Err(_) => {
+                let retry = format!("{url}{}cors=1", if url.contains('?') { '&' } else { '?' });
+                ehttp::fetch(ehttp::Request::get(&retry), move |res| done(web_body(&url, res)))
+            }
+            res => done(web_body(&url, res)),
         }),
         Request::Either(a, b) => fetch_web(*a, Box::new(move |res| match res {
             Ok(bytes) => done(Ok(bytes)),
             Err(e) => fetch_web(*b, Box::new(move |res| done(res.map_err(|e2| format!("{e}; {e2}"))))),
         })),
     }
+}
+
+/// Web build: a fetch's body, or why there is none.
+#[cfg(target_arch = "wasm32")]
+fn web_body(url: &str, res: ehttp::Result<ehttp::Response>) -> Result<Vec<u8>, String> {
+    let r = res.map_err(|e| format!("GET {url}: {e}"))?;
+    if r.ok { Ok(r.bytes) } else { Err(format!("GET {url}: {} {}", r.status, r.status_text)) }
 }
 
 /// Web build: [`fetch_decode`] without blocking; `done` gets the decoded image.

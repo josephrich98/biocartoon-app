@@ -2,7 +2,7 @@
 
 use egui::{Color32, CornerRadius, Stroke, Visuals};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Light, dark, or whatever the operating system uses.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,32 +32,46 @@ impl ThemeMode {
     }
 }
 
-/// Size of the interface text.
+/// Size of the interface text. Saved under names of its own: the sizes were renamed when Extra
+/// large was added, and a size saved under its old name keeps its scale (the old default, Medium,
+/// becomes the new default).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TextSize {
+    #[serde(rename = "XS", alias = "Small")]
+    ExtraSmall,
+    #[serde(rename = "S")]
     Small,
     #[default]
+    #[serde(rename = "M", alias = "Medium", alias = "Large")]
     Medium,
+    #[serde(rename = "L", alias = "ExtraLarge")]
     Large,
+    #[serde(rename = "XL")]
     ExtraLarge,
+    #[serde(rename = "XXL")]
+    ExtraExtraLarge,
 }
 
 impl TextSize {
-    pub const ALL: [TextSize; 4] = [TextSize::Small, TextSize::Medium, TextSize::Large, TextSize::ExtraLarge];
+    pub const ALL: [TextSize; 6] = [TextSize::ExtraSmall, TextSize::Small, TextSize::Medium, TextSize::Large, TextSize::ExtraLarge, TextSize::ExtraExtraLarge];
     pub fn label(self) -> &'static str {
         match self {
+            TextSize::ExtraSmall => "Extra small",
             TextSize::Small => "Small",
             TextSize::Medium => "Medium (default)",
             TextSize::Large => "Large",
             TextSize::ExtraLarge => "Extra large",
+            TextSize::ExtraExtraLarge => "Extra extra large",
         }
     }
     pub fn scale(self) -> f32 {
         match self {
-            TextSize::Small => 0.9,
-            TextSize::Medium => 1.0,
-            TextSize::Large => 1.15,
-            TextSize::ExtraLarge => 1.3,
+            TextSize::ExtraSmall => 0.9,
+            TextSize::Small => 1.0,
+            TextSize::Medium => 1.15,
+            TextSize::Large => 1.3,
+            TextSize::ExtraLarge => 1.45,
+            TextSize::ExtraExtraLarge => 1.6,
         }
     }
 }
@@ -66,6 +80,14 @@ static DARK: AtomicBool = AtomicBool::new(true);
 
 pub fn is_dark() -> bool {
     DARK.load(Ordering::Relaxed)
+}
+
+/// The text size's scale, as f32 bits.
+static TEXT_SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000);
+
+/// The text size's scale, for what is drawn at a fixed size (the rulers, the rail).
+pub fn text_scale() -> f32 {
+    f32::from_bits(TEXT_SCALE.load(Ordering::Relaxed))
 }
 
 fn pick(dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color32 {
@@ -97,6 +119,7 @@ pub fn success() -> Color32 { Color32::from_rgb(0x2e, 0x8b, 0x4a) }
 /// Sets the palette and the egui visuals; `text_scale` multiplies egui's default text sizes.
 pub fn apply(ctx: &egui::Context, dark: bool, text_scale: f32) {
     DARK.store(dark, Ordering::Relaxed);
+    TEXT_SCALE.store(text_scale.to_bits(), Ordering::Relaxed);
     let mut v = if dark { Visuals::dark() } else { Visuals::light() };
     v.panel_fill = panel();
     v.window_fill = if dark { panel_raised() } else { panel() };
@@ -167,5 +190,23 @@ pub fn source_badge(source: &str) -> (&'static str, Color32, &'static str) {
     match biocartoon_catalog::catalog::SOURCES.iter().find(|s| s.0 == source) {
         Some((_, code, name, _)) => (code, color, name),
         None => ("??", color, "Unknown"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TextSize;
+
+    /// A text size saved under its old name keeps its scale; the old default becomes the new one.
+    #[test]
+    fn old_text_size_names_load() {
+        let load = |s: &str| serde_json::from_str::<TextSize>(&format!("\"{s}\"")).unwrap();
+        assert_eq!(load("Small"), TextSize::ExtraSmall);
+        assert_eq!(load("Medium"), TextSize::default());
+        assert_eq!(load("Large").scale(), 1.15);
+        assert_eq!(load("ExtraLarge"), TextSize::Large);
+        for t in TextSize::ALL {
+            assert_eq!(load(serde_json::to_string(&t).unwrap().trim_matches('"')), t);
+        }
     }
 }

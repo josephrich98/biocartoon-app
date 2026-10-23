@@ -27,7 +27,7 @@ impl BioCartoon {
     /// The rail at the right edge: one button per [`RailTab`].
     pub fn rail_ui(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::symmetric(4, 8));
-        egui::Panel::right("rail").exact_size(60.0).frame(frame).show_separator_line(false).show(ui, |ui| {
+        egui::Panel::right("rail").exact_size(60.0 * theme::text_scale()).frame(frame).show_separator_line(false).show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
                 for t in RailTab::ALL {
@@ -87,7 +87,9 @@ impl BioCartoon {
     pub fn left_panel(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 8, right: 0, top: 36, bottom: 8 });
         // Resizable by dragging its right edge; egui remembers the width.
-        egui::Panel::left("leftpanel").resizable(true).default_size(PANEL_W + 8.0).size_range(PANEL_MIN_W..=PANEL_MAX_W).frame(frame).show_separator_line(false).show(ui, |ui| {
+        // How far the results are scrolled, and how tall their view is, for the back-to-top button.
+        let (mut scrolled, mut view_h) = (0.0, f32::INFINITY);
+        let panel = egui::Panel::left("leftpanel").resizable(true).default_size(PANEL_W + 8.0).size_range(PANEL_MIN_W..=PANEL_MAX_W).frame(frame).show_separator_line(false).show(ui, |ui| {
             egui::Frame::new().fill(theme::panel()).corner_radius(10).inner_margin(egui::Margin::same(12)).stroke(Stroke::new(1.0, theme::border())).show(ui, |ui| {
                 ui.set_min_height(ui.available_height());
                 ui.set_width(ui.available_width());
@@ -106,7 +108,10 @@ impl BioCartoon {
                     if back && ui.add(egui::Button::new(ph::ARROW_LEFT).frame(false)).clicked() {
                         self.icons_back();
                     }
-                    ui.label(egui::RichText::new(title).strong().size(15.0));
+                    // Tapping the title goes back to the top, as tapping the status bar does on iOS.
+                    if ui.add(egui::Label::new(egui::RichText::new(title).strong().size(15.0 * theme::text_scale())).sense(Sense::click())).clicked() {
+                        self.icons.scroll_to = Some(egui::Align::Min);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(ph::X).frame(false)).on_hover_text("Hide the Icons panel").clicked() {
                             self.settings.show_icons = false;
@@ -129,8 +134,46 @@ impl BioCartoon {
                     self.search_box(ui);
                     ui.add_space(4.0);
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(ui.available_width()).show(ui, |ui| self.icons_panel(ui));
-            });
+                let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(ui.available_width());
+                let to = self.icons.scroll_to.take();
+                if to == Some(egui::Align::Min) {
+                    scroll = scroll.vertical_scroll_offset(0.0);
+                }
+                let out = scroll.show(ui, |ui| {
+                    self.icons_panel(ui);
+                    if to == Some(egui::Align::Max) {
+                        ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                    }
+                });
+                (scrolled, view_h) = (out.state.offset.y, out.inner_rect.height());
+            })
+            .response
+            .rect
+        });
+        self.back_to_top(ui.ctx(), panel.inner, scrolled > view_h);
+    }
+
+    /// A circled up arrow that appears once the Icons panel has scrolled down a screen, and goes
+    /// back to the top. It sits just right of the panel, so it covers no icons, or in the panel's
+    /// bottom right corner when the panel fills the screen (on phones).
+    fn back_to_top(&mut self, ctx: &egui::Context, panel: Rect, show: bool) {
+        let t = ctx.animate_bool(egui::Id::new("icons_back_to_top"), show);
+        if t == 0.0 {
+            return;
+        }
+        const D: f32 = 30.0;
+        let y = panel.bottom() - 10.0 - D;
+        let x = if panel.right() + 8.0 + D + 8.0 <= ctx.content_rect().right() { panel.right() + 8.0 } else { panel.right() - 18.0 - D };
+        egui::Area::new(egui::Id::new("icons_back_to_top")).fixed_pos(Pos2::new(x, y)).order(egui::Order::Foreground).show(ctx, |ui| {
+            let (rect, r) = ui.allocate_exact_size(Vec2::splat(D), Sense::click());
+            let r = r.on_hover_text("Back to the top (⌘↑)");
+            let stroke = if r.hovered() { theme::accent() } else { theme::border() };
+            let p = ui.painter();
+            p.circle(rect.center(), D / 2.0, theme::panel_raised().gamma_multiply(t), Stroke::new(1.0, stroke.gamma_multiply(t)));
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, ph::ARROW_UP, FontId::proportional(16.0), theme::text().gamma_multiply(t));
+            if r.clicked() {
+                self.icons.scroll_to = Some(egui::Align::Min);
+            }
         });
     }
 
@@ -157,7 +200,7 @@ impl BioCartoon {
                     t => t.label().to_string(),
                 };
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(title).strong().size(15.0));
+                    ui.label(egui::RichText::new(title).strong().size(15.0 * theme::text_scale()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(ph::X).frame(false)).clicked() {
                             self.actions.push(Action::SetRail(None));
@@ -165,8 +208,16 @@ impl BioCartoon {
                     });
                 });
                 ui.add_space(6.0);
-                // max_width: a row too wide for the panel is clipped instead of widening it.
-                egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(ui.available_width()).show(ui, |ui| match tab {
+                // The body gets exactly the room left and is clipped to it. A vertical ScrollArea
+                // grows to fit a row wider than it, and the panel keeps whatever width it ends up
+                // with, so a row sized from the panel's width could push it a little wider every
+                // frame: the panel kept widening on its own after a resize.
+                let body = ui.available_rect_before_wrap();
+                ui.advance_cursor_after_rect(body);
+                let mut ui = ui.new_child(egui::UiBuilder::new().id_salt("panel_body").max_rect(body));
+                // A little slack for focus outlines at the edges.
+                ui.shrink_clip_rect(body.expand(4.0));
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(body.width()).show(&mut ui, |ui| match tab {
                     // Text has no panel: its rail button arms placing a text box on the canvas.
                     RailTab::Text => {}
                     RailTab::Lines => self.lines_panel(ui),
@@ -437,6 +488,13 @@ impl BioCartoon {
             .inner
         });
         let r = r.inner;
+        if r.changed() {
+            self.icons.typed_at = ui.input(|i| i.time);
+        }
+        // Enter searches without waiting for the pause.
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.icons.typed_at = f64::NEG_INFINITY;
+        }
         if r.gained_focus() || (r.changed() && self.icons.mode == IconsMode::Home) {
             self.icons.mode = IconsMode::Search;
         }
@@ -1001,9 +1059,8 @@ impl BioCartoon {
         ui.add_space(6.0);
         let cell_w = (ui.available_width() - 6.0) / 2.0;
         let page = self.doc.page_rect();
-        let bg = c32(self.doc.background);
         // This document's slides, then the uploaded ones: (slide, page, background, uploaded index).
-        let mut entries: Vec<(crate::doc::Slide, Rect, Color32, Option<usize>)> = self.doc.slides.iter().map(|s| (s.clone(), page, bg, None)).collect();
+        let mut entries: Vec<(crate::doc::Slide, Rect, Color32, Option<usize>)> = self.doc.slides.iter().map(|s| (s.clone(), page, c32(self.doc.background_of(s)), None)).collect();
         entries.extend(self.contribute.templates.iter().enumerate().map(|(i, t)| (t.slide.clone(), t.page_rect(), c32(t.background), Some(i))));
         let mut col = 0;
         let mut row_start = ui.cursor().min;
@@ -1642,7 +1699,7 @@ impl BioCartoon {
 
     /// The page's size and colour (applied as they are edited), and the grid.
     fn page_panel(&mut self, ui: &mut egui::Ui) {
-        let before = (self.doc.width, self.doc.height, self.doc.unit, self.doc.background);
+        let before = (self.doc.width, self.doc.height, self.doc.unit, self.slide().background);
         let unit = self.doc.unit;
         let (mut w, mut h) = (unit.from_px(self.doc.width), unit.from_px(self.doc.height));
         let near = |a: f32, b: f32| (a - b).abs() < 0.005;
@@ -1685,25 +1742,41 @@ impl BioCartoon {
         });
         ui.add_space(10.0);
         ui.label(egui::RichText::new("Color").strong());
+        let mut apply_all = false;
         ui.horizontal(|ui| {
-            let mut col = c32(self.doc.background);
+            let mut col = c32(self.doc.background_of(self.slide()));
             if ui.color_edit_button_srgba(&mut col).changed() {
-                self.doc.background = col.to_srgba_unmultiplied();
+                self.slide_mut().background = Some(col.to_srgba_unmultiplied());
             }
             ui.label("Page color");
+            let first = self.doc.background_of(&self.doc.slides[0]);
+            let differ = self.doc.slides.iter().any(|s| self.doc.background_of(s) != first);
+            apply_all = ui.add_enabled(differ, egui::Button::new("Apply to all")).on_hover_text("Give every slide this page color").clicked();
         });
+        if toggle_row(ui, ph::RULER, "Show rulers", self.settings.show_rulers).clicked() {
+            self.settings.show_rulers = !self.settings.show_rulers;
+        }
 
-        let after = (self.doc.width, self.doc.height, self.doc.unit, self.doc.background);
+        let after = (self.doc.width, self.doc.height, self.doc.unit, self.slide().background);
         if after != before {
             // One undo step per burst of edits, like the Edit panel: snapshot the state before them.
             if self.page.last_edit != Some(before) {
-                (self.doc.width, self.doc.height, self.doc.unit, self.doc.background) = before;
+                (self.doc.width, self.doc.height, self.doc.unit, self.slide_mut().background) = before;
                 self.commit();
-                (self.doc.width, self.doc.height, self.doc.unit, self.doc.background) = after;
+                (self.doc.width, self.doc.height, self.doc.unit, self.slide_mut().background) = after;
             }
             self.dirty = true;
             self.page.last_edit = Some(after);
             if fit { self.view.fit_requested = true; }
+        }
+        if apply_all {
+            self.commit();
+            self.doc.background = self.doc.background_of(self.slide());
+            for s in &mut self.doc.slides {
+                s.background = None;
+            }
+            self.dirty = true;
+            self.page.last_edit = None;
         }
 
         ui.add_space(14.0);
@@ -1819,7 +1892,6 @@ impl BioCartoon {
         ui.separator();
         let n = self.doc.slides.len();
         let page = self.doc.page_rect();
-        let bg = c32(self.doc.background);
         let cur = self.cur_slide;
         for i in 0..n {
             let name = self.doc.slides[i].name.clone();
@@ -1833,6 +1905,7 @@ impl BioCartoon {
             let painter = ui.painter_at(rect);
             {
                 let slide = self.doc.slides[i].clone();
+                let bg = c32(self.doc.background_of(&slide));
                 draw_slide(&painter, &xf, &slide, page, bg, &mut self.images);
             }
             painter.rect_stroke(rect, 4.0, Stroke::new(if i == cur { 2.0 } else { 1.0 }, if i == cur { theme::accent() } else { theme::border() }), StrokeKind::Inside);
