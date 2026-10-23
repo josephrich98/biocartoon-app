@@ -48,6 +48,10 @@ tiff = "0.11"
 base64 = "0.22"
 spellbook = "0.4.2"
 
+# Embeds the .exe icon on Windows (see build.rs).
+[build-dependencies]
+winresource = "0.1"
+
 # Desktop only: the web build (wasm32) stubs these out, see src/platform.rs and src/storage.rs.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
