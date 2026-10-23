@@ -1,6 +1,8 @@
 //! Rasterizes the app icon (assets/icon.svg) into:
 //!   assets/icon.icns            16-1024 px, the macOS app icon (built with iconutil, so macOS only)
-//!   assets/icon.png             1024 px, the desktop window icon and the Linux package icon
+//!   assets/icon.png             1024 px, the desktop window icon and the AppImage icon
+//!   assets/icon-{128,256,512}.png  the Linux package icons (hicolor has no 1024 px size, so the
+//!                                .deb needs these or GNOME shows a generic icon)
 //!   assets/apple-touch-icon.png  180 px, the web build's bookmark / home-screen icon, on white since
 //!                                Safari puts transparent touch icons on a gray backing (copy it to site/public/ too)
 //!   assets/icon.ico              256 px, the Windows installer icon (see [package.metadata.packager])
@@ -74,6 +76,9 @@ fn main() {
     let tree = usvg::Tree::from_data(&svg, &usvg::Options::default()).expect("parse assets/icon.svg");
     render_icns(&tree, "assets/icon.icns");
     render(&tree, 1024, "assets/icon.png");
+    for px in [128, 256, 512] {
+        render(&tree, px, &format!("assets/icon-{px}.png"));
+    }
     render_on_white(&tree, 180, "assets/apple-touch-icon.png");
     render_ico(&tree, 256, "assets/icon.ico");
 }
