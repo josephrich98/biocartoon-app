@@ -28,7 +28,8 @@ impl BioCartoon {
     pub fn rail_ui(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::symmetric(4, 8));
         egui::Panel::right("rail").exact_size(60.0 * theme::text_scale()).frame(frame).show_separator_line(false).show(ui, |ui| {
-            ui.vertical_centered(|ui| {
+            // Scrolls when the window is too short for every button (a phone, or large text).
+            egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
                 for t in RailTab::ALL {
                     if matches!(t, RailTab::Text | RailTab::Comments | RailTab::Slides) {
@@ -44,7 +45,7 @@ impl BioCartoon {
                     }
                     ui.add_space(4.0);
                 }
-            });
+            }));
         });
     }
 
