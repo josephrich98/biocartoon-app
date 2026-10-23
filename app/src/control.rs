@@ -511,6 +511,7 @@ impl BioCartoon {
                     title: g("title"),
                     variant: g("variant"),
                     category: g("category"),
+                    description: g("description"),
                     license: g("license"),
                     credit: g("credit"),
                     author: g("author"),

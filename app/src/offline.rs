@@ -1030,6 +1030,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A library icon kept as an SVG (an AI drawing) has it by absolute path, read from disk.
+    #[test]
+    fn local_library_svg() {
+        use crate::assets::{fetch, Request};
+        let dir = std::env::temp_dir().join(format!("biocartoon-user-svg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg = dir.join("a.svg");
+        std::fs::write(&svg, b"svg").unwrap();
+        let images = crate::assets::ImageCache::new("https://example.invalid".into(), None);
+        let src = crate::doc::ImageSource::Asset { id: String::new(), key: "user/a.png".into(), svg: Some(svg.display().to_string()), title: String::new(), source: String::new(), credit: String::new(), license: String::new() };
+        let req = images.request_for(&src).unwrap();
+        assert!(matches!(&req, Request::Either(s, _) if matches!(**s, Request::Path(ref p) if *p == svg)));
+        assert_eq!(fetch(&req).unwrap(), b"svg");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn zip_round_trip() {
         let mut z = ZipWriter::default();

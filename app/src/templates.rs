@@ -383,6 +383,14 @@ fn submit_template(url: &str, meta: &SubmitMeta, mut file: TemplateFile, thumb_p
     for (name, png) in &images {
         parts.push(Part::File(name, png.clone(), "image/png"));
     }
+    let total: usize = parts.iter().map(|p| match p { Part::Text(_, t) => t.len(), Part::File(_, b, _) => b.len() }).sum();
+    if total > submit::MAX_REQUEST_BYTES {
+        return Err(format!(
+            "it is {} with its images; templates can be up to {}. Use smaller images on the slide",
+            crate::offline::human_bytes(total as u64),
+            crate::offline::human_bytes(submit::MAX_REQUEST_BYTES as u64)
+        ));
+    }
     submit::submit(url, &parts)
 }
 

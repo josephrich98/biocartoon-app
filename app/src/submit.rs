@@ -9,7 +9,11 @@ use std::time::Duration;
 pub const DEFAULT_SUBMIT_URL: &str = "https://api.biocartoon.com";
 
 /// Limits the Worker enforces (worker/src/limits.ts); checked here first for clearer errors.
-pub const MAX_PNG_BYTES: usize = 8 * 1024 * 1024;
+/// The same limits hold for Your library: one image (an icon, or a template's picture) as
+/// PNG or SVG, and a whole submission (a template with its thumbnail and images).
+pub const MAX_PNG_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_SVG_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_IMAGE_SIDE: u32 = 4096;
 pub const MAX_TEMPLATE_JSON_BYTES: usize = 1024 * 1024;
 pub const MAX_TEMPLATE_ITEMS: usize = 300;

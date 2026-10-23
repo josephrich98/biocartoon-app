@@ -89,6 +89,8 @@ pub fn handle() -> Color32 { accent() }
 pub fn hover() -> Color32 { pick((0x3a, 0x3a, 0x40), (0xe2, 0xe2, 0xe8)) }
 /// Fill of an informational toast.
 pub fn toast() -> Color32 { pick((0x2a, 0x2a, 0x30), (0xff, 0xff, 0xff)) }
+/// Text saying something is wrong (an image too large to submit).
+pub fn danger() -> Color32 { pick((0xff, 0x6b, 0x6b), (0xc6, 0x28, 0x28)) }
 /// Fill of a banner saying something worked (white text on it).
 pub fn success() -> Color32 { Color32::from_rgb(0x2e, 0x8b, 0x4a) }
 
@@ -109,7 +111,9 @@ pub fn apply(ctx: &egui::Context, dark: bool, text_scale: f32) {
     v.hyperlink_color = accent();
     v.widgets.noninteractive.bg_fill = panel();
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border());
-    v.widgets.inactive.bg_fill = panel_raised();
+    // Checkbox and radio boxes, slider rails and scrollbar handles (buttons use `weak_bg_fill`):
+    // lighter than the dialogs' fill in the dark theme, or an unticked box doesn't show.
+    v.widgets.inactive.bg_fill = if dark { Color32::from_rgb(0x4a, 0x4a, 0x50) } else { panel_raised() };
     v.widgets.inactive.weak_bg_fill = panel_raised();
     v.widgets.inactive.bg_stroke = if dark { Stroke::NONE } else { Stroke::new(1.0, border()) };
     v.widgets.inactive.corner_radius = CornerRadius::same(6);

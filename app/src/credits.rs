@@ -377,6 +377,7 @@ mod tests {
             title: "Cell".into(),
             variant: String::new(),
             category: String::new(),
+            description: String::new(),
             license: "CC-BY-4.0".into(),
             credit: "\"Cell\", Servier".into(),
             author: String::new(),

@@ -140,12 +140,26 @@ impl BackendKind {
     }
 }
 
+/// What a Generate or Edit job made: its pixels, and the SVG they were rendered from when the
+/// model drew one, which is saved as is so the image stays a vector on the page and in export.
+#[derive(Debug)]
+pub struct AiImage {
+    pub image: RgbaImage,
+    pub svg: Option<String>,
+}
+
+impl From<RgbaImage> for AiImage {
+    fn from(image: RgbaImage) -> Self {
+        Self { image, svg: None }
+    }
+}
+
 pub trait AiBackend: Send + Sync {
     fn name(&self) -> String;
     /// Text-to-image. Returns an RGBA image with transparent background where possible.
-    fn generate(&self, prompt: &str) -> Result<RgbaImage, String>;
-    /// Image-to-image edit.
-    fn edit(&self, image: &RgbaImage, op: &AiOp) -> Result<RgbaImage, String>;
+    fn generate(&self, prompt: &str) -> Result<AiImage, String>;
+    /// Image-to-image edit. `svg` is the image's source when it is an SVG.
+    fn edit(&self, image: &RgbaImage, svg: Option<&str>, op: &AiOp) -> Result<AiImage, String>;
     /// Chat reply used by the Custom edit dialog.
     fn chat(&self, history: &[(bool, String)], message: &str) -> Result<String, String>;
     /// Runs `job` and hands the result to `done`. The default blocks on the methods above, which
@@ -156,8 +170,8 @@ pub trait AiBackend: Send + Sync {
                 let result = self.generate(&prompt);
                 AiResult::Generated { prompt, result }
             }
-            AiJob::Edit { item, image, op } => {
-                let result = self.edit(&image, &op);
+            AiJob::Edit { item, image, svg, op } => {
+                let result = self.edit(&image, svg.as_deref(), &op);
                 AiResult::Edited { item, op, result }
             }
             AiJob::Chat { item, history, message } => {
@@ -198,7 +212,7 @@ impl AiBackend for PlaceholderBackend {
         "Placeholder (no model connected)".into()
     }
 
-    fn generate(&self, prompt: &str) -> Result<RgbaImage, String> {
+    fn generate(&self, prompt: &str) -> Result<AiImage, String> {
         let n = 512u32;
         let h = hash(prompt);
         let hue = (h % 360) as f32 / 360.0;
@@ -247,10 +261,10 @@ impl AiBackend for PlaceholderBackend {
                 }
             }
         }
-        Ok(img)
+        Ok(img.into())
     }
 
-    fn edit(&self, image: &RgbaImage, op: &AiOp) -> Result<RgbaImage, String> {
+    fn edit(&self, image: &RgbaImage, _svg: Option<&str>, op: &AiOp) -> Result<AiImage, String> {
         let mut out = image.clone();
         match op {
             AiOp::RemoveBackground => {
@@ -295,7 +309,7 @@ impl AiBackend for PlaceholderBackend {
                 ))
             }
         }
-        Ok(out)
+        Ok(out.into())
     }
 
     fn chat(&self, _history: &[(bool, String)], message: &str) -> Result<String, String> {
@@ -434,7 +448,7 @@ impl SvgBackend {
         self.request(&self.prompts.svg_system(), vec![Turn { user: true, text, image: None }])
     }
 
-    fn edit_request(&self, image: &RgbaImage, op: &AiOp) -> Result<Request, String> {
+    fn edit_request(&self, image: &RgbaImage, svg: Option<&str>, op: &AiOp) -> Result<Request, String> {
         let ask = match op {
             AiOp::Restyle(s) => format!("Redraw this image in a {} style, keeping its subject and layout.", s.label().to_lowercase()),
             AiOp::RemoveBackground => "Redraw only the main subject of this image, with a transparent background.".into(),
@@ -442,7 +456,11 @@ impl SvgBackend {
             AiOp::Custom(p) => format!("{}. Redraw the whole image with this change.", self.prompts.custom_edit(p).trim_end_matches('.')),
         };
         let (w, h) = image.dimensions();
-        let text = format!("{ask} Keep the aspect ratio ({w} x {h}).");
+        let mut text = format!("{ask} Keep the aspect ratio ({w} x {h}).");
+        // The model drew it (or it is an SVG upload): it can change the drawing itself.
+        if let Some(svg) = svg {
+            text.push_str(&format!(" Its current SVG source:\n{svg}"));
+        }
         self.request(&self.prompts.svg_system(), vec![Turn { user: true, text, image: Some(png_base64(image)?) }])
     }
 
@@ -595,11 +613,12 @@ fn png_bytes(image: &RgbaImage) -> Result<Vec<u8>, String> {
     Ok(png)
 }
 
-/// Pull the SVG out of a reply and render it so its longer side is `side` pixels.
-fn render_reply(text: &str, side: u32) -> Result<RgbaImage, String> {
+/// Pull the SVG out of a reply and render it so its longer side is `side` pixels, keeping the SVG.
+fn render_reply(text: &str, side: u32) -> Result<AiImage, String> {
     let start = text.find("<svg").ok_or("The model did not return an SVG drawing.")?;
     let end = text.rfind("</svg>").map(|i| i + "</svg>".len()).ok_or("The model's SVG drawing was incomplete.")?;
-    crate::export::render_svg(text[start..end.max(start)].as_bytes(), side)
+    let svg = &text[start..end.max(start)];
+    Ok(AiImage { image: crate::export::render_svg(svg.as_bytes(), side)?, svg: Some(svg.to_string()) })
 }
 
 fn edit_side(image: &RgbaImage) -> u32 {
@@ -616,11 +635,11 @@ impl HttpBackend for SvgBackend {
     fn request(&self, job: &AiJob) -> Result<Request, String> {
         match job {
             AiJob::Generate { prompt } => self.generate_request(prompt),
-            AiJob::Edit { image, op, .. } => self.edit_request(image, op),
+            AiJob::Edit { image, svg, op, .. } => self.edit_request(image, svg.as_deref(), op),
             AiJob::Chat { history, message, .. } => self.chat_request(history, message),
         }
     }
-    fn image(&self, job: &AiJob, status: u16, body: &[u8]) -> Result<RgbaImage, String> {
+    fn image(&self, job: &AiJob, status: u16, body: &[u8]) -> Result<AiImage, String> {
         let text = self.reply_text(status, &String::from_utf8_lossy(body))?;
         match job {
             AiJob::Edit { image, .. } => render_reply(&text, edit_side(image)),
@@ -711,10 +730,10 @@ impl HttpBackend for OpenAiBackend {
         }
     }
 
-    fn image(&self, job: &AiJob, status: u16, body: &[u8]) -> Result<RgbaImage, String> {
+    fn image(&self, job: &AiJob, status: u16, body: &[u8]) -> Result<AiImage, String> {
         let v = json_reply("OpenAI", status, body)?;
         let b64 = v["data"][0]["b64_json"].as_str().ok_or("OpenAI returned no image.")?;
-        finish_image(job, decode_image(b64)?)
+        finish_image(job, decode_image(b64)?).map(Into::into)
     }
 }
 
@@ -771,7 +790,7 @@ impl HttpBackend for GeminiBackend {
         })
     }
 
-    fn image(&self, job: &AiJob, status: u16, body: &[u8]) -> Result<RgbaImage, String> {
+    fn image(&self, job: &AiJob, status: u16, body: &[u8]) -> Result<AiImage, String> {
         let v = json_reply("Gemini", status, body)?;
         if let Some(reason) = v["promptFeedback"]["blockReason"].as_str() {
             return Err(format!("Gemini blocked this request ({reason})."));
@@ -780,7 +799,7 @@ impl HttpBackend for GeminiBackend {
         // The response is camelCase; accept snake_case too.
         let data = parts.iter().find_map(|p| p["inlineData"]["data"].as_str().or(p["inline_data"]["data"].as_str()));
         match data {
-            Some(b64) => finish_image(job, decode_image(b64)?),
+            Some(b64) => finish_image(job, decode_image(b64)?).map(Into::into),
             None => {
                 let said: String = parts.iter().filter_map(|p| p["text"].as_str()).collect();
                 let reason = v["candidates"][0]["finishReason"].as_str().unwrap_or_default();
@@ -936,7 +955,7 @@ trait HttpBackend: Send + Sync + 'static {
     const CHATS: bool = true;
     fn request(&self, job: &AiJob) -> Result<Request, String>;
     /// The image a Generate or Edit job's response holds.
-    fn image(&self, job: &AiJob, status: u16, body: &[u8]) -> Result<RgbaImage, String>;
+    fn image(&self, job: &AiJob, status: u16, body: &[u8]) -> Result<AiImage, String>;
     /// The reply a Chat job's response holds.
     fn text(&self, _status: u16, _body: &[u8]) -> Result<String, String> {
         Err("this model doesn't chat".into())
@@ -974,14 +993,14 @@ impl<B: HttpBackend> AiBackend for Http<B> {
     fn name(&self) -> String {
         self.0.name()
     }
-    fn generate(&self, prompt: &str) -> Result<RgbaImage, String> {
+    fn generate(&self, prompt: &str) -> Result<AiImage, String> {
         match self.block(AiJob::Generate { prompt: prompt.into() }) {
             AiResult::Generated { result, .. } => result,
             _ => unreachable!(),
         }
     }
-    fn edit(&self, image: &RgbaImage, op: &AiOp) -> Result<RgbaImage, String> {
-        match self.block(AiJob::Edit { item: Default::default(), image: image.clone(), op: op.clone() }) {
+    fn edit(&self, image: &RgbaImage, svg: Option<&str>, op: &AiOp) -> Result<AiImage, String> {
+        match self.block(AiJob::Edit { item: Default::default(), image: image.clone(), svg: svg.map(Into::into), op: op.clone() }) {
             AiResult::Edited { result, .. } => result,
             _ => unreachable!(),
         }
@@ -1059,13 +1078,14 @@ pub fn make_backend(kind: BackendKind, model: &str, key: &str, base_url: &str, p
 
 pub enum AiJob {
     Generate { prompt: String },
-    Edit { item: crate::doc::ItemId, image: RgbaImage, op: AiOp },
+    /// `svg` is the image's source when it is an SVG, for the models that draw SVG.
+    Edit { item: crate::doc::ItemId, image: RgbaImage, svg: Option<String>, op: AiOp },
     Chat { item: crate::doc::ItemId, history: Vec<(bool, String)>, message: String },
 }
 
 pub enum AiResult {
-    Generated { prompt: String, result: Result<RgbaImage, String> },
-    Edited { item: crate::doc::ItemId, op: AiOp, result: Result<RgbaImage, String> },
+    Generated { prompt: String, result: Result<AiImage, String> },
+    Edited { item: crate::doc::ItemId, op: AiOp, result: Result<AiImage, String> },
     ChatReply { item: crate::doc::ItemId, result: Result<String, String> },
 }
 
@@ -1143,8 +1163,11 @@ mod tests {
         let ok = r#"{"stop_reason":"end_turn","content":[{"type":"thinking","thinking":""},{"type":"text","text":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 10\" width=\"20\" height=\"10\"><rect width=\"20\" height=\"10\" fill=\"red\"/></svg>"}]}"#;
         let err = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
         let b = SvgBackend::anthropic("claude-opus-5-5", "k");
-        let img = render_reply(&b.reply_text(200, ok).unwrap(), 200).unwrap();
-        assert_eq!(img.dimensions(), (200, 100));
+        let made = render_reply(&b.reply_text(200, ok).unwrap(), 200).unwrap();
+        assert_eq!(made.image.dimensions(), (200, 100));
+        // The drawing is kept, to be saved as an SVG.
+        let svg = made.svg.unwrap();
+        assert!(svg.starts_with("<svg ") && svg.ends_with("</svg>"));
         assert_eq!(b.reply_text(401, err).unwrap_err(), "Anthropic (401): invalid x-api-key");
         let req = b.chat_request(&[(false, "Hi".into()), (true, "make it blue".into())], "make it blue").unwrap();
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
@@ -1155,13 +1178,14 @@ mod tests {
     #[test]
     fn vllm_request_and_reply() {
         let b = SvgBackend::vllm("http://localhost:8000/v1/");
-        let req = b.edit_request(&RgbaImage::new(4, 2), &AiOp::RemoveText).unwrap();
+        let req = b.edit_request(&RgbaImage::new(4, 2), Some("<svg/>"), &AiOp::RemoveText).unwrap();
         assert_eq!(req.url, "http://localhost:8000/v1/chat/completions");
         assert!(req.headers.iter().all(|(k, _)| *k != "authorization"));
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         assert!(body.get("model").is_none());
         assert_eq!(body["messages"][0]["role"], "system");
         assert!(body["messages"][1]["content"][0]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert!(body["messages"][1]["content"][1]["text"].as_str().unwrap().ends_with("Its current SVG source:\n<svg/>"));
         let ok = r#"{"choices":[{"finish_reason":"stop","message":{"content":"<think>maybe <svg></think><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>"}}]}"#;
         assert!(render_reply(&b.reply_text(200, ok).unwrap(), 10).is_ok());
         let err = r#"{"object":"error","message":"The model `x` does not exist.","code":404}"#;
@@ -1188,7 +1212,7 @@ mod tests {
         assert_eq!(body["background"], "transparent");
         let mut icon = RgbaImage::new(4, 4);
         icon.put_pixel(1, 1, Rgba([255, 0, 0, 255]));
-        let job = AiJob::Edit { item: 1, image: icon, op: AiOp::RemoveText };
+        let job = AiJob::Edit { item: 1, image: icon, svg: None, op: AiOp::RemoveText };
         let req = b.request(&job).unwrap();
         let ct = &req.headers.iter().find(|(k, _)| *k == "content-type").unwrap().1;
         let boundary = ct.strip_prefix("multipart/form-data; boundary=").unwrap();
@@ -1201,8 +1225,9 @@ mod tests {
         RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         use base64::Engine;
         let reply = format!(r#"{{"data":[{{"b64_json":"{}"}}]}}"#, base64::engine::general_purpose::STANDARD.encode(png));
-        let img = b.image(&job, 200, reply.as_bytes()).unwrap();
-        assert_eq!(img.get_pixel(4, 4)[3], 0);
+        let made = b.image(&job, 200, reply.as_bytes()).unwrap();
+        assert_eq!(made.image.get_pixel(4, 4)[3], 0);
+        assert!(made.svg.is_none());
         let err = br#"{"error":{"message":"Your organization must be verified","type":"invalid_request_error"}}"#;
         assert_eq!(b.image(&job, 403, err).unwrap_err(), "OpenAI (403): Your organization must be verified");
     }

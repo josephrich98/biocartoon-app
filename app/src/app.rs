@@ -1,6 +1,6 @@
 //! Application state, top-level layout, commands (undo, clipboard, file IO, AI dispatch).
 
-use crate::ai::{AiClient, AiJob, AiOp, AiPrompts, AiResult, BackendKind};
+use crate::ai::{AiClient, AiImage, AiJob, AiOp, AiPrompts, AiResult, BackendKind};
 use crate::assets::{ImageCache, ImgState};
 use crate::catalog::{cached_catalog, AssetRow, CatalogClient, CatalogSync, CategoryInfo, Facets, Filter, IconSort, Req, Resp, SourceInfo, StarUpdate};
 use crate::stars::{StarsClient, StarsMsg};
@@ -46,6 +46,9 @@ pub struct Settings {
     pub generated: Vec<GeneratedImage>,
     /// Generated images go into the user's library as soon as they arrive.
     pub auto_library_generated: bool,
+    /// Fingerprints (see [`image_fingerprint`]) of the images submitted to the BioCartoon
+    /// library, so none is submitted twice.
+    pub submitted: Vec<String>,
     pub uploads: Vec<String>,
     /// Ids of the assets the user starred (their favorites), most recent first. This is what
     /// counts as "mine": the star counts on the Worker follow it (see `pending_stars`).
@@ -75,6 +78,8 @@ pub struct Settings {
     /// Icon tiles show their star count (lower right).
     pub tile_stars: bool,
     pub export: ExportOptions,
+    /// File type of "Save as picture", the one picked last time.
+    pub picture_format: ExportFormat,
     pub home_sort: SortKey,
     pub home_ascending: bool,
     pub home_view: HomeView,
@@ -115,6 +120,7 @@ impl Default for Settings {
             ai_prompts: AiPrompts::default(),
             generated: Vec::new(),
             auto_library_generated: false,
+            submitted: Vec::new(),
             uploads: Vec::new(),
             favorites: Vec::new(),
             pending_stars: Vec::new(),
@@ -132,6 +138,7 @@ impl Default for Settings {
             tile_colors: true,
             tile_stars: true,
             export: ExportOptions::default(),
+            picture_format: ExportFormat::Png,
             home_sort: SortKey::LastOpened,
             home_ascending: false,
             home_view: HomeView::LargeTiles,
@@ -439,6 +446,93 @@ fn phone_width(ctx: &egui::Context) -> bool {
     ctx.content_rect().width() < PHONE_WIDTH
 }
 
+/// The SVG an image holds (one an AI model drew, or an upload), sent along with AI edits so
+/// the models that draw SVG change the drawing rather than trace its pixels.
+fn svg_source(source: &ImageSource) -> Option<String> {
+    match source {
+        ImageSource::File { path, .. } => svg_file(Path::new(path)),
+        // One kept in the user's library.
+        ImageSource::Asset { svg: Some(k), .. } if crate::assets::is_local_path(k) => svg_file(Path::new(k)),
+        ImageSource::Asset { .. } => None,
+    }
+}
+
+/// What identifies an image however it was saved: an SVG's text, or a raster image's pixels
+/// (the library re-encodes PNGs, so their bytes change but their pixels don't).
+pub fn image_fingerprint(bytes: &[u8]) -> Option<String> {
+    // FNV-1a: stable across Rust versions, as the fingerprints are kept in the settings.
+    fn fnv(parts: &[&[u8]]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in parts.iter().flat_map(|p| p.iter()) {
+            h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    if crate::assets::is_svg(bytes) {
+        return Some(format!("svg:{:016x}", fnv(&[bytes])));
+    }
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    Some(format!("px:{:016x}", fnv(&[&img.width().to_le_bytes(), &img.height().to_le_bytes(), img.as_raw()])))
+}
+
+/// Whether the image file at `path` was submitted to the BioCartoon library already. `memo`
+/// keeps each file's fingerprint for the session.
+pub fn file_submitted(memo: &mut HashMap<String, Option<String>>, submitted: &[String], path: &str) -> bool {
+    file_fingerprint(memo, path).is_some_and(|fp| submitted.contains(&fp))
+}
+
+/// The fingerprint of the image file at `path`, worked out once and kept in `memo`.
+pub fn file_fingerprint(memo: &mut HashMap<String, Option<String>>, path: &str) -> Option<String> {
+    memo.entry(path.to_string()).or_insert_with(|| crate::storage::read(Path::new(path)).ok().and_then(|b| image_fingerprint(&b))).clone()
+}
+
+/// Hover text of an "Add to BioCartoon library" greyed out for something submitted already.
+pub const ALREADY_SUBMITTED: &str = "Icon has already been submitted";
+
+/// [`file_submitted`] for one of the user's library icons: its SVG when it has one, else its PNG.
+pub fn row_submitted(memo: &mut HashMap<String, Option<String>>, submitted: &[String], row: &AssetRow) -> bool {
+    // A submitted icon's library copy (by id: it may have been resized on the way).
+    if submitted.contains(&format!("id:{}", row.id)) {
+        return true;
+    }
+    let path = row.svg_key.as_deref().filter(|k| crate::assets::is_local_path(k)).or(row.png_local.as_deref());
+    path.is_some_and(|p| file_submitted(memo, submitted, p))
+}
+
+/// `img` scaled by `scale` (see [`scaled_size`]).
+pub fn scaled(img: &image::RgbaImage, scale: f32) -> image::RgbaImage {
+    let (w, h) = scaled_size(img.dimensions(), scale);
+    if (w, h) == img.dimensions() {
+        return img.clone();
+    }
+    image::imageops::resize(img, w, h, image::imageops::FilterType::Lanczos3)
+}
+
+/// `(w, h)` scaled by `scale` (at most 1: images are only made smaller), at least a pixel.
+pub fn scaled_size((w, h): (u32, u32), scale: f32) -> (u32, u32) {
+    let k = scale.clamp(0.0, 1.0);
+    (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1))
+}
+
+/// The PNG `img` makes scaled by `scale`: its width, height and size in bytes (however large;
+/// the limit is checked where it is shown).
+pub fn png_out(img: &image::RgbaImage, scale: f32) -> Result<(u32, u32, usize), String> {
+    let img = scaled(img, scale);
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    Ok((img.width(), img.height(), out.into_inner().len()))
+}
+
+/// The SVG kept beside one of the user's library icons, if it has one.
+fn library_svg(row: &AssetRow) -> Option<String> {
+    row.svg_key.as_deref().filter(|k| crate::assets::is_local_path(k)).and_then(|k| svg_file(Path::new(k)))
+}
+
+/// The file at `p`, if it is an SVG.
+fn svg_file(p: &Path) -> Option<String> {
+    crate::storage::read(p).ok().filter(|b| crate::assets::is_svg(b)).and_then(|b| String::from_utf8(b).ok())
+}
+
 /// Read and decode an image to add to the library.
 fn read_image(p: &Path) -> Result<image::RgbaImage, String> {
     crate::storage::read(p).map_err(|e| e.to_string()).and_then(|b| crate::assets::load_image(&b, crate::submit::MAX_IMAGE_SIDE)).map_err(|e| format!("{}: {e}", p.display()))
@@ -462,9 +556,11 @@ pub struct SuggestState {
     pub busy: bool,
 }
 
-/// The Icons panel's "Contribute artwork" page: what is picked to submit.
+/// The Icons panel's "Add to your library" / "Add to BioCartoon library" page: what is picked.
 #[derive(Default)]
 pub struct ContributeState {
+    /// Bound for the BioCartoon library (submitted for review), not just Your library.
+    pub share: bool,
     /// Picked uploads, by path.
     pub icons: HashSet<String>,
     /// Picked icons of the user's library, by id.
@@ -488,8 +584,23 @@ pub struct UploadDialog {
     pub category: String,
     pub description: String,
     pub license: &'static str,
-    /// Also submit it to the shared library (reviewed before it is published).
+    /// Submit it to the BioCartoon library (reviewed before it is published), not only keep it
+    /// in Your library. Fixed when the dialog opens.
     pub share: bool,
+    /// What is added is an SVG (kept as one); else it is saved as a PNG.
+    pub svg: bool,
+    /// The user confirmed adding a PNG rather than an SVG.
+    pub png_ok: bool,
+    /// A raster image's pixels as read (`None` for an SVG or a template), to resize.
+    pub image: Option<std::sync::Arc<image::RgbaImage>>,
+    /// How much to scale a raster image down (1: as it is); width and height keep its proportions.
+    pub scale: f32,
+    /// What is added at `out_scale`: width and height in pixels, and bytes (or why not).
+    pub out: Option<Result<(u32, u32, usize), String>>,
+    /// The scale `out` was worked out for; while it differs (a size being dragged) the bytes wait.
+    pub out_scale: f32,
+    /// The resize fields show percent rather than pixels.
+    pub percent: bool,
     /// Public credit name for a submission.
     pub credit: String,
     /// Private contact address for a submission (optional).
@@ -507,7 +618,8 @@ pub struct UploadDialog {
 pub enum LibraryMsg {
     /// A submitted asset: its local row, and the submission id or the error.
     /// A submitted asset, the submission's id or error, and the library icon it replaces.
-    AssetSubmitted { row: AssetRow, result: Result<String, String>, replaces: Option<String> },
+    /// `as_png` is why the SVG was refused, when the PNG went instead.
+    AssetSubmitted { row: AssetRow, result: Result<String, String>, replaces: Option<String>, as_png: Option<String>, fingerprint: Option<String> },
     /// A saved template, and the library template it replaces.
     TemplateSaved(crate::templates::SaveResult, Option<String>),
     TemplateLoaded(Result<TemplateFile, String>, bool),
@@ -623,7 +735,8 @@ pub enum Action {
     /// A saved or shared template (from `templates.sqlite`).
     UseSavedTemplate(TemplateRow),
     RemoveTemplate(String),
-    OpenUploadDialog(UploadTarget),
+    /// The library dialog for one thing: for the BioCartoon library with `share`, else Your library.
+    OpenUploadDialog(UploadTarget, bool),
     PickLibraryFile,
     /// The image picked by `PickLibraryFile`.
     LibraryFilePicked(PathBuf),
@@ -649,7 +762,7 @@ pub enum Action {
     OpenAiEdit,
     /// Show the selection's properties in the Edit tab.
     OpenEdit,
-    /// Save the selection as a PNG cropped to it, wherever the user picks.
+    /// Ask which file type to save the selection as (the "Save as picture" dialog).
     SaveSelectionImage,
     SendChat(String),
     StartReplace,
@@ -687,6 +800,8 @@ pub enum Action {
     AddTemplateFiles(Vec<PathBuf>),
     /// Open the library dialog for everything picked under Contribute artwork, one at a time.
     ContributeSelected,
+    /// Open the Add to your library (`false`) or Add to BioCartoon library (`true`) page.
+    OpenContribute(bool),
     /// Open Submit an idea, with this title when it is not empty.
     OpenSuggest(String),
     SubmitSuggestion,
@@ -820,6 +935,8 @@ pub struct BioCartoon {
     pub dirty: bool,
     pub actions: Vec<Action>,
     pub show_export: bool,
+    /// The "Save as picture" dialog, which picks the file type, is open.
+    pub show_save_picture: bool,
     pub export_job: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// The export dialog's last file size, with the options it was worked out for.
     export_size: Option<(ExportOptions, Result<crate::export::SizeEstimate, String>)>,
@@ -852,6 +969,8 @@ pub struct BioCartoon {
     pub app_dir: PathBuf,
     pub pending_edits: HashMap<ItemId, String>,
     pub upload_dialog: Option<UploadDialog>,
+    /// Image files' fingerprints, by path, worked out once per session (`None`: unreadable).
+    pub fingerprints: HashMap<String, Option<String>>,
     pub contribute: ContributeState,
     pub suggest: SuggestState,
     pub upload_rate: RateLimit,
@@ -1006,6 +1125,7 @@ impl BioCartoon {
             dirty: false,
             actions: Vec::new(),
             show_export: false,
+            show_save_picture: false,
             export_job: None,
             export_size: None,
             export_size_rx: None,
@@ -1026,6 +1146,7 @@ impl BioCartoon {
             app_dir,
             pending_edits: HashMap::new(),
             upload_dialog: None,
+            fingerprints: HashMap::new(),
             contribute: ContributeState::default(),
             suggest: SuggestState::default(),
             upload_rate: RateLimit::default(),
@@ -1797,8 +1918,9 @@ impl BioCartoon {
             self.toast_err("Image is still loading, try again in a moment");
             return;
         };
+        let svg = svg_source(source);
         self.toast(format!("{} ({})", op.label(), self.ai.backend.name()));
-        self.ai.submit(AiJob::Edit { item: it.id, image: (*img).clone(), op });
+        self.ai.submit(AiJob::Edit { item: it.id, image: (*img).clone(), svg, op });
     }
 
     fn handle_ai_results(&mut self, ctx: &egui::Context) {
@@ -1807,12 +1929,13 @@ impl BioCartoon {
                 AiResult::Generated { prompt, result } => {
                     self.generate.busy = false;
                     match result {
-                        Ok(img) => {
-                            let (w, h) = img.dimensions();
-                            let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+                        Ok(made) => {
+                            let (w, h) = made.image.dimensions();
+                            let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], made.image.as_raw());
                             let tex = ctx.load_texture("generated", ci, egui::TextureOptions::LINEAR);
                             self.generate.status = format!("Generated with {}", self.ai.backend.name());
-                            self.generate.result_path = self.keep_generated(ctx, &img, &prompt);
+                            let img = made.image.clone();
+                            self.generate.result_path = self.keep_generated(ctx, made, &prompt);
                             self.generate.result = Some((img, tex));
                         }
                         Err(e) => {
@@ -1822,18 +1945,16 @@ impl BioCartoon {
                     }
                 }
                 AiResult::Edited { item, op, result } => match result {
-                    Ok(img) => {
-                        let path = self
-                            .app_dir
-                            .join("generated")
-                            .join(format!("{}-{}.png", item, chrono::Utc::now().format("%Y%m%d%H%M%S")));
-                        if let Err(e) = img.save(&path) {
-                            self.toast_err(format!("save edited image: {e}"));
-                            continue;
-                        }
+                    Ok(made) => {
+                        let stem = format!("{}-{}", item, chrono::Utc::now().format("%Y%m%d%H%M%S"));
+                        let p = match self.save_ai_image(ctx, &stem, made) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                self.toast_err(format!("save edited image: {e}"));
+                                continue;
+                            }
+                        };
                         self.commit();
-                        let p = path.display().to_string();
-                        self.images.insert_image(ctx, &format!("file:{p}"), img);
                         if let Some(it) = self.item_mut(item) {
                             if let ItemKind::Image { source, .. } = &mut it.kind {
                                 // The edit still owes the original's credit.
@@ -2151,8 +2272,13 @@ impl BioCartoon {
         self.icons.facets_for = Some((query, self.icons.filter.clone()));
     }
 
-    /// The Icons panel's Contribute artwork page, with the library's icons to pick from.
-    pub fn open_contribute(&mut self) {
+    /// The Icons panel's page for adding to Your library, or (`share`) the BioCartoon library,
+    /// with the library's icons to pick from.
+    pub fn open_contribute(&mut self, share: bool) {
+        if self.contribute.share != share {
+            // What was picked for one isn't meant for the other.
+            self.contribute = ContributeState { share, templates: std::mem::take(&mut self.contribute.templates), ..Default::default() };
+        }
         self.icons.mode = IconsMode::Contribute;
         self.icons.results.clear();
         self.icons.total = None;
@@ -2219,18 +2345,39 @@ impl BioCartoon {
         out.trim_matches('-').chars().take(60).collect()
     }
 
-    /// Save a generated image to the history (and, with the setting on, the library); its path.
-    fn keep_generated(&mut self, ctx: &egui::Context, img: &image::RgbaImage, prompt: &str) -> Option<String> {
-        let now = chrono::Utc::now();
-        let path = self.app_dir.join("generated").join(format!("gen-{}{:03}.png", now.format("%Y%m%d%H%M%S"), now.timestamp_subsec_millis()));
-        let mut png = std::io::Cursor::new(Vec::new());
-        if let Err(e) = img.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string()).and_then(|_| crate::storage::write(&path, png.get_ref()).map_err(|e| e.to_string())) {
-            self.toast_err(format!("save generated image: {e}"));
-            return None;
+    /// Save an AI image to `generated/<stem>`: the SVG when the model drew one, so it stays a
+    /// vector on the page and in export, else a PNG. Returns its path.
+    fn save_ai_image(&mut self, ctx: &egui::Context, stem: &str, made: AiImage) -> Result<String, String> {
+        let dir = self.app_dir.join("generated");
+        if let Some(svg) = &made.svg {
+            let path = dir.join(format!("{stem}.svg"));
+            let p = path.display().to_string();
+            // Seed the cache so it shows (and is sized when placed) right away.
+            if self.images.insert_svg(ctx, &format!("file:{p}"), svg.as_bytes()).is_ok() {
+                crate::storage::write(&path, svg.as_bytes()).map_err(|e| e.to_string())?;
+                return Ok(p);
+            }
         }
+        let path = dir.join(format!("{stem}.png"));
+        let mut png = std::io::Cursor::new(Vec::new());
+        made.image.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        crate::storage::write(&path, png.get_ref()).map_err(|e| e.to_string())?;
         let p = path.display().to_string();
-        // Seed the cache so it shows (and is sized when placed) right away.
-        self.images.insert_image(ctx, &format!("file:{p}"), img.clone());
+        self.images.insert_image(ctx, &format!("file:{p}"), made.image);
+        Ok(p)
+    }
+
+    /// Save a generated image to the history (and, with the setting on, the library); its path.
+    fn keep_generated(&mut self, ctx: &egui::Context, made: AiImage, prompt: &str) -> Option<String> {
+        let now = chrono::Utc::now();
+        let stem = format!("gen-{}{:03}", now.format("%Y%m%d%H%M%S"), now.timestamp_subsec_millis());
+        let p = match self.save_ai_image(ctx, &stem, made) {
+            Ok(p) => p,
+            Err(e) => {
+                self.toast_err(format!("save generated image: {e}"));
+                return None;
+            }
+        };
         self.settings.generated.insert(0, GeneratedImage { path: p.clone(), prompt: prompt.into(), library_id: None });
         if self.settings.auto_library_generated {
             self.generated_to_library(&p, false);
@@ -2266,7 +2413,9 @@ impl BioCartoon {
             title: name,
             variant: String::new(),
             category: String::new(),
-            license: UPLOAD_LICENSES[0].0.into(),
+            description: format!("Prompt: {prompt}"),
+            // No license until it is submitted.
+            license: String::new(),
             author,
             png_key: String::new(),
             png_local: None,
@@ -2277,7 +2426,7 @@ impl BioCartoon {
             starred: false,
             taxa: Vec::new(),
         };
-        if let Err(e) = self.save_user_png(img, &mut row) {
+        if let Err(e) = self.save_user_png(img, svg_file(Path::new(path)).as_deref(), &mut row) {
             self.toast_err(e);
             return None;
         }
@@ -2312,8 +2461,11 @@ impl BioCartoon {
 
     /// Open Contribute artwork with a generated image picked (adding it to the library first).
     fn contribute_generated(&mut self, path: &str) {
+        if file_submitted(&mut self.fingerprints, &self.settings.submitted, path) {
+            return self.toast_err("That image was submitted to the BioCartoon library already");
+        }
         let Some((id, _)) = self.generated_library_id(path) else { return };
-        self.open_contribute();
+        self.open_contribute(true);
         self.contribute.library.insert(id);
     }
 
@@ -2331,24 +2483,43 @@ impl BioCartoon {
         UploadTarget::Template(Box::new(TemplateSlide { slide, width: self.doc.width, height: self.doc.height, background: self.doc.background, saved: None }))
     }
 
-    pub fn open_upload_dialog(&mut self, target: UploadTarget) {
-        self.open_upload_queue(vec![target], UPLOAD_LICENSES[0].0, 1);
+    pub fn open_upload_dialog(&mut self, target: UploadTarget, share: bool) {
+        self.open_upload_queue(vec![target], UPLOAD_LICENSES[0].0, 1, share);
     }
 
     /// Open the library dialog for the first of `targets`, item `step` of the batch; the rest
     /// follow as each is submitted.
-    fn open_upload_queue(&mut self, mut targets: Vec<UploadTarget>, license: &'static str, step: usize) {
+    fn open_upload_queue(&mut self, mut targets: Vec<UploadTarget>, license: &'static str, step: usize, share: bool) {
         if targets.is_empty() {
             return;
         }
         let target = targets.remove(0);
         let (name, category, description) = match &target {
             UploadTarget::File(p) => (p.file_stem().map(|s| s.to_string_lossy().replace(['_', '-'], " ")).unwrap_or_default(), String::new(), String::new()),
-            UploadTarget::Library(row) => (row.title.clone(), row.category.clone(), String::new()),
+            // Rows saved before descriptions were kept have their credit there instead.
+            UploadTarget::Library(row) => (row.title.clone(), row.category.clone(), if row.description == row.credit { String::new() } else { row.description.clone() }),
             UploadTarget::Template(t) => match &t.saved {
                 Some(m) => (m.title.clone(), m.category.clone(), m.description.clone()),
                 None => (t.slide.name.clone(), String::new(), String::new()),
             },
+        };
+        let svg_text = match &target {
+            UploadTarget::File(p) => svg_file(p),
+            UploadTarget::Library(row) => library_svg(row),
+            UploadTarget::Template(_) => None,
+        };
+        let svg = svg_text.is_some();
+        // A raster image is read now, so its size can be shown (and changed) before it is added.
+        let image = match (&target, svg) {
+            (UploadTarget::File(p), false) => read_image(p).ok(),
+            (UploadTarget::Library(row), false) => row.png_local.as_deref().and_then(|p| read_image(Path::new(p)).ok()),
+            _ => None,
+        }
+        .map(std::sync::Arc::new);
+        let out = match (&svg_text, &image) {
+            (Some(t), _) => crate::assets::image_size(t.as_bytes()).map(|(w, h)| Ok((w.round() as u32, h.round() as u32, t.len()))),
+            (None, Some(img)) => Some(png_out(img, 1.0)),
+            (None, None) => None,
         };
         self.upload_dialog = Some(UploadDialog {
             target,
@@ -2356,7 +2527,14 @@ impl BioCartoon {
             category,
             description,
             license,
-            share: self.submit_url().is_some(),
+            share,
+            svg,
+            png_ok: false,
+            image,
+            scale: 1.0,
+            out,
+            out_scale: 1.0,
+            percent: false,
             credit: self.settings.contributor_name.clone(),
             email: self.settings.contributor_email.clone(),
             step: (step, step + targets.len()),
@@ -2390,7 +2568,7 @@ impl BioCartoon {
         if targets.is_empty() {
             return self.toast("Pick icons or templates to add first");
         }
-        self.open_upload_queue(targets, UPLOAD_LICENSES[0].0, 1);
+        self.open_upload_queue(targets, UPLOAD_LICENSES[0].0, 1, self.contribute.share);
     }
 
     /// Offer the slides of .biocartoon files under Contribute artwork > Templates.
@@ -2458,7 +2636,42 @@ impl BioCartoon {
         let category: String = d.category.trim().chars().take(60).collect();
         let description: String = d.description.trim().chars().take(500).collect();
         let credit: String = d.credit.trim().chars().take(60).collect();
+        if !d.svg && !d.png_ok && !matches!(d.target, UploadTarget::Template(_)) {
+            self.toast_err("Confirm adding it as a PNG first");
+            self.upload_dialog = Some(d);
+            return;
+        }
+        // The image's fingerprint, to submit it only once.
+        let source = match &d.target {
+            UploadTarget::File(p) => Some(p.display().to_string()),
+            UploadTarget::Library(row) => row.svg_key.clone().filter(|k| crate::assets::is_local_path(k)).or(row.png_local.clone()),
+            UploadTarget::Template(_) => None,
+        };
+        let fingerprint = source.as_deref().and_then(|p| file_fingerprint(&mut self.fingerprints, p));
+        if d.share {
+            let again = match &d.target {
+                UploadTarget::Library(row) => row_submitted(&mut self.fingerprints, &self.settings.submitted, row),
+                _ => fingerprint.as_ref().is_some_and(|f| self.settings.submitted.contains(f)),
+            };
+            if again {
+                self.toast_err(format!("\"{}\" was submitted to the BioCartoon library already", d.name.trim()));
+                return self.open_upload_queue(d.queue, d.license, d.step.0 + 1, d.share);
+            }
+        }
+        if let Some(Ok((_, _, bytes))) = &d.out {
+            let limit = if d.svg { crate::submit::MAX_SVG_BYTES } else { crate::submit::MAX_PNG_BYTES };
+            if !matches!(d.target, UploadTarget::Template(_)) && *bytes > limit {
+                self.toast_err(format!("It is {}; icons can be up to {}", crate::offline::human_bytes(*bytes as u64), crate::offline::human_bytes(limit as u64)));
+                self.upload_dialog = Some(d);
+                return;
+            }
+        }
         let share = match self.submit_url().filter(|_| d.share) {
+            None if d.share => {
+                self.toast_err("No submission server is set up");
+                self.upload_dialog = Some(d);
+                return;
+            }
             None => None,
             Some(url) => {
                 if d.license == "CC-BY-4.0" && credit.is_empty() {
@@ -2501,16 +2714,31 @@ impl BioCartoon {
         match &d.target {
             UploadTarget::Template(t) => self.save_template((**t).clone(), name, category, description, d.license, author, share),
             target => {
-                let img = match target {
-                    UploadTarget::File(p) => read_image(p),
-                    UploadTarget::Library(row) => read_image(Path::new(row.png_local.as_deref().unwrap_or_default())),
-                    UploadTarget::Template(_) => unreachable!(),
+                let img = match (&d.image, target) {
+                    // Read when the dialog opened, at the size picked there.
+                    (Some(img), _) => Ok(scaled(img, d.scale)),
+                    (None, UploadTarget::File(p)) => read_image(p),
+                    (None, UploadTarget::Library(row)) => read_image(Path::new(row.png_local.as_deref().unwrap_or_default())),
+                    (None, UploadTarget::Template(_)) => unreachable!(),
+                };
+                // An SVG stays one in the library.
+                let svg = match target {
+                    UploadTarget::File(p) => svg_file(p),
+                    UploadTarget::Library(row) => library_svg(row),
+                    UploadTarget::Template(_) => None,
                 };
                 let replaces = match target {
                     UploadTarget::Library(row) => Some(row.id.clone()),
                     _ => None,
                 };
-                let credit_line = if author.is_empty() || author == "anonymous" { format!("\"{name}\", {}", d.license) } else { format!("\"{name}\" by {author}, {}", d.license) };
+                // Only a submission gets a license; one kept in Your library has none.
+                let license = if share.is_some() { d.license } else { "" };
+                let credit_line = match (author.is_empty() || author == "anonymous", license.is_empty()) {
+                    (true, true) => format!("\"{name}\""),
+                    (true, false) => format!("\"{name}\", {license}"),
+                    (false, true) => format!("\"{name}\" by {author}"),
+                    (false, false) => format!("\"{name}\" by {author}, {license}"),
+                };
                 let row = AssetRow {
                     id: String::new(),
                     source: "user".into(),
@@ -2518,7 +2746,8 @@ impl BioCartoon {
                     title: name,
                     variant: String::new(),
                     category,
-                    license: d.license.into(),
+                    description,
+                    license: license.into(),
                     credit: credit_line,
                     author,
                     png_key: String::new(),
@@ -2531,13 +2760,13 @@ impl BioCartoon {
                     taxa: Vec::new(),
                 };
                 match img {
-                    Ok(img) => self.upload_asset(img, row, share, replaces),
+                    Ok(img) => self.upload_asset(img, svg, row, share, replaces, fingerprint),
                     Err(e) => self.toast_err(e),
                 }
             }
         }
         // Next in the batch, keeping the license just chosen.
-        self.open_upload_queue(d.queue, d.license, d.step.0 + 1);
+        self.open_upload_queue(d.queue, d.license, d.step.0 + 1, d.share);
     }
 
     /// Send the Submit an idea form to the submissions Worker.
@@ -2585,8 +2814,9 @@ impl BioCartoon {
     /// so the approved copy published later replaces it instead of appearing twice.
     /// Save an image to the library, and submit it if `share` says where. The library icon it
     /// `replaces`, if any, is removed once the new one is in.
-    fn upload_asset(&mut self, img: image::RgbaImage, mut row: AssetRow, share: Option<(String, SubmitMeta)>, replaces: Option<String>) {
-        let png = match self.save_user_png(img, &mut row) {
+    /// `fingerprint` is the image's (see [`image_fingerprint`]), noted when it is submitted.
+    fn upload_asset(&mut self, img: image::RgbaImage, svg: Option<String>, mut row: AssetRow, share: Option<(String, SubmitMeta)>, replaces: Option<String>, fingerprint: Option<String>) {
+        let png = match self.save_user_png(img, svg.as_deref(), &mut row) {
             Ok(png) => png,
             Err(e) => return self.toast_err(e),
         };
@@ -2601,22 +2831,45 @@ impl BioCartoon {
             }
             return;
         };
+        // Noted now, so it can't be submitted again while this one is on its way; dropped if it fails.
+        if let Some(f) = fingerprint.clone() {
+            self.settings.submitted.push(f);
+        }
+        // An SVG is shared as one (publishing renders its PNG); one too large for the Worker goes as the PNG.
+        let svg = svg.filter(|s| s.len() <= crate::submit::MAX_SVG_BYTES);
         let (tx, ctx) = (self.library_tx.clone(), self.ctx.clone());
         self.library_busy += 1;
         crate::platform::spawn("submit", move || {
             use crate::submit::Part;
-            let result = serde_json::to_string(&meta).map_err(|e| e.to_string()).and_then(|m| {
-                crate::submit::submit(&url, &[Part::Text("kind", "asset".into()), Part::Text("meta", m), Part::File("image", png, "image/png")])
-            });
-            let _ = tx.send(LibraryMsg::AssetSubmitted { row, result, replaces });
+            let send = |image: Part| {
+                serde_json::to_string(&meta).map_err(|e| e.to_string()).and_then(|m| crate::submit::submit(&url, &[Part::Text("kind", "asset".into()), Part::Text("meta", m), image]))
+            };
+            let mut as_png = None;
+            let result = match svg {
+                // The Worker refuses SVGs with scripts or links to other files; their PNG is fine.
+                Some(svg) => send(Part::File("svg", svg.into_bytes(), "image/svg+xml")).or_else(|e| {
+                    as_png = Some(e);
+                    send(Part::File("image", png, "image/png"))
+                }),
+                None => send(Part::File("image", png, "image/png")),
+            };
+            // A PNG refused too: report why, not the SVG's reason.
+            let as_png = as_png.filter(|_| result.is_ok());
+            let _ = tx.send(LibraryMsg::AssetSubmitted { row, result, replaces, as_png, fingerprint });
             ctx.request_repaint();
         });
     }
 
     /// Write an image to the user's library folder and fill in `row`'s id and file; the PNG.
-    fn save_user_png(&self, img: image::RgbaImage, row: &mut AssetRow) -> Result<Vec<u8>, String> {
+    /// With `svg` (the image's source), that is kept beside it and drawn and exported instead.
+    fn save_user_png(&self, img: image::RgbaImage, svg: Option<&str>, row: &mut AssetRow) -> Result<Vec<u8>, String> {
         let (png, w, h) = crate::templates::encode_png(img)?;
         let slug = Self::upload_slug(&row.title);
+        if let Some(svg) = svg {
+            let abs = self.app_dir.join("user_generated").join(format!("{slug}.svg"));
+            crate::storage::write(&abs, svg.as_bytes()).map_err(|e| format!("save: {e}"))?;
+            row.svg_key = Some(abs.display().to_string());
+        }
         let abs = self.app_dir.join("user_generated").join(format!("{slug}.png"));
         crate::storage::write(&abs, &png).map_err(|e| format!("save: {e}"))?;
         row.id = format!("user/{slug}");
@@ -2758,15 +3011,24 @@ impl BioCartoon {
         while let Ok(msg) = self.library_rx.try_recv() {
             self.library_busy = self.library_busy.saturating_sub(1);
             match msg {
-                LibraryMsg::AssetSubmitted { mut row, result, replaces } => {
+                LibraryMsg::AssetSubmitted { mut row, result, replaces, as_png, fingerprint } => {
                     let title = row.title.clone();
                     match result {
                         Ok(id) => {
                             row.id = format!("user/{id}");
                             row.png_key = format!("user/{id}.png");
-                            self.toast(format!("Submitted \"{title}\" for review. It is in your library now and shared once approved."));
+                            self.settings.submitted.push(format!("id:{}", row.id));
+                            match as_png {
+                                Some(why) => self.toast(format!("Submitted \"{title}\" for review as a PNG (the SVG was refused: {why}). Your library keeps the SVG.")),
+                                None => self.toast(format!("Submitted \"{title}\" for review. It is in your library now and shared once approved.")),
+                            }
                         }
-                        Err(e) => self.toast_err(format!("\"{title}\" is in your library but was not submitted: {e}")),
+                        Err(e) => {
+                            if let Some(i) = fingerprint.and_then(|f| self.settings.submitted.iter().rposition(|s| *s == f)) {
+                                self.settings.submitted.remove(i);
+                            }
+                            self.toast_err(format!("\"{title}\" is in your library but was not submitted: {e}"));
+                        }
                     }
                     if let Some(id) = &replaces {
                         self.relink_generated(id, Some(row.id.clone()));
@@ -3297,8 +3559,42 @@ impl BioCartoon {
         self.toast("Exporting...");
     }
 
-    /// Save the selection as a picture: a PNG cropped to it, on a transparent background, at the
-    /// export dialog's resolution.
+    /// "Save as picture": pick a file type (the last one picked to start with), then save.
+    fn save_picture_window(&mut self, ctx: &egui::Context) {
+        let mut go = false;
+        let mut cancel = false;
+        let format = &mut self.settings.picture_format;
+        let modal = egui::Modal::new(egui::Id::new("save_picture_modal")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.horizontal(|ui| {
+                ui.heading("Save as picture");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).on_hover_text("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Format");
+                for f in [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg] {
+                    ui.selectable_value(format, f, f.label());
+                }
+            });
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("Save...").color(Color32::WHITE)).fill(theme::accent())).clicked() { go = true; }
+                if ui.button("Cancel").clicked() { cancel = true; }
+            });
+        });
+        self.show_save_picture = !(go || cancel || modal.should_close());
+        if go {
+            self.save_selection_image(ctx);
+        }
+    }
+
+    /// Save the selection as a picture of the type picked in "Save as picture", cropped to it, at
+    /// the export dialog's resolution. A PNG leaves the background out.
     fn save_selection_image(&mut self, ctx: &egui::Context) {
         if self.export_job.is_some() {
             self.toast("An export is already running");
@@ -3310,9 +3606,10 @@ impl BioCartoon {
             [it] if !it.name.is_empty() => Self::slugify(&it.name),
             _ => format!("{}-selection", Self::slugify(&self.doc.title)),
         };
-        let Some(path) = crate::platform::save_path(ExportFormat::Png.label(), ExportFormat::Png.ext(), &format!("{name}.png")) else { return };
+        let format = self.settings.picture_format;
+        let Some(path) = crate::platform::save_path(format.label(), format.ext(), &format!("{name}.{}", format.ext())) else { return };
         let doc = Document { slides: vec![Slide { items, ..self.slide().clone() }], ..self.doc.clone() };
-        let opts = ExportOptions { format: ExportFormat::Png, dpi: self.settings.export.dpi, transparent: true, ..Default::default() };
+        let opts = ExportOptions { format, dpi: self.settings.export.dpi, transparent: true, jpg_quality: self.settings.export.jpg_quality, ..Default::default() };
         let mut job = self.export_job_for(&doc, &[0], path, opts);
         job.page = region;
         self.export_job = Some(crate::export::start(ctx.clone(), job));
@@ -3416,132 +3713,176 @@ impl BioCartoon {
             ui.end_row();
         };
         let opts = &mut self.settings.export;
+        let phone = phone_width(ctx);
+        // Phones: the dialog is wider than the screen, so it scrolls both ways (drag to move) and
+        // pinches to zoom, which zooms the whole app until the dialog closes.
+        let zoom_id = egui::Id::new("export_base_zoom");
+        if phone {
+            let pinch = ctx.input(|i| i.zoom_delta());
+            if pinch != 1.0 {
+                let zoom = ctx.zoom_factor();
+                let base = ctx.data_mut(|d| *d.get_temp_mut_or(zoom_id, zoom));
+                // Never zoomed out so far that the screen gets the desktop layout.
+                let min = zoom * ctx.content_rect().width() / (PHONE_WIDTH - 10.0);
+                ctx.set_zoom_factor((zoom * pinch).clamp(min.min(base), base * 2.0));
+            }
+        }
+        let units_id = egui::Id::new("export_dims_unit");
+        let mut dims_unit: Unit = ctx.data(|d| d.get_temp(units_id)).unwrap_or(Unit::Px);
+        let screen = ctx.content_rect().size();
         let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.horizontal(|ui| {
-                ui.heading(heading);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).on_hover_text("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-            if multi && !all && !project_file && self.export_doc.is_some() {
-                ui.label(egui::RichText::new("Exports the first slide. Open the project to export another slide alone.").color(theme::text_dim()));
-            }
-            ui.add_space(8.0);
-            egui::Grid::new("export_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
-                ui.label("Format");
+            let body = |ui: &mut egui::Ui| {
+                ui.set_width(440.0);
                 ui.horizontal(|ui| {
-                    for f in ExportFormat::ALL {
-                        ui.selectable_value(&mut opts.format, f, f.label());
-                    }
+                    ui.heading(heading);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).on_hover_text("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
                 });
-                ui.end_row();
-
-                // The project file has no rendering options, just a note where the resolution note goes.
-                if project_file {
-                    size_row(ui);
-                    let slides = if multi { format!("all {n_slides} slides") } else { "the slide".into() };
-                    let note = format!(".biocartoon format allows for sharing editable slides: {slides} and their images in one file, which anyone can open with Open file.");
-                    ui.label("");
-                    // Wrap within the dialog's width instead of stretching it.
-                    ui.allocate_ui(egui::vec2(360.0, 0.0), |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(note).color(theme::text_dim())).wrap());
+                if multi && !all && !project_file && self.export_doc.is_some() {
+                    ui.label(egui::RichText::new("Exports the first slide. Open the project to export another slide alone.").color(theme::text_dim()));
+                }
+                ui.add_space(8.0);
+                egui::Grid::new("export_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                    ui.label("Format");
+                    ui.horizontal(|ui| {
+                        for f in ExportFormat::ALL {
+                            ui.selectable_value(&mut opts.format, f, f.label());
+                        }
                     });
                     ui.end_row();
-                    return;
-                }
 
-                ui.label("Resolution (dpi)");
-                ui.add_enabled_ui(opts.format.is_raster(), |ui| {
-                    ui.horizontal(|ui| {
-                        const PRESETS: [u32; 4] = [72, 150, 300, 600];
-                        // The custom box stays empty while a preset is chosen, so the value never shows twice.
-                        let id = ui.id().with("custom_dpi");
-                        let mut custom: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| {
-                            if PRESETS.contains(&opts.dpi) { String::new() } else { opts.dpi.to_string() }
+                    // The project file has no rendering options, just a note where the resolution note goes.
+                    if project_file {
+                        size_row(ui);
+                        let slides = if multi { format!("all {n_slides} slides") } else { "the slide".into() };
+                        let note = format!(".biocartoon format allows for sharing editable slides: {slides} and their images in one file, which anyone can open with Open file.");
+                        ui.label("");
+                        // Wrap within the dialog's width instead of stretching it.
+                        ui.allocate_ui(egui::vec2(360.0, 0.0), |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(note).color(theme::text_dim())).wrap());
                         });
-                        for d in PRESETS {
-                            if ui.selectable_value(&mut opts.dpi, d, d.to_string()).clicked() {
-                                custom.clear();
-                            }
-                        }
-                        let r = ui.add(egui::TextEdit::singleline(&mut custom).desired_width(44.0).hint_text("other"));
-                        if r.changed() {
-                            custom.retain(|c| c.is_ascii_digit());
-                            if let Ok(v) = custom.parse::<u32>() {
-                                opts.dpi = v.clamp(crate::export::MIN_DPI, crate::export::MAX_DPI);
-                            }
-                        }
-                        if r.lost_focus() {
-                            custom = if PRESETS.contains(&opts.dpi) { String::new() } else { opts.dpi.to_string() };
-                        }
-                        ui.data_mut(|d| d.insert_temp(id, custom));
-                    });
-                });
-                ui.end_row();
+                        ui.end_row();
+                        return;
+                    }
 
-                ui.label("");
-                let note = if !opts.format.is_raster() {
-                    "Vector output: scales to any size.".to_string()
-                } else if opts.individual {
-                    format!("Each image at {} dpi.", opts.dpi)
-                } else if all && opts.crop {
-                    format!("Each slide at {} dpi.", opts.dpi)
-                } else {
-                    let region = if opts.crop { image_bounds.unwrap_or(page) } else { page };
-                    let [w, h] = crate::export::pixel_size(region, opts.dpi);
-                    if all { format!("{w} x {h} px each") } else { format!("{w} x {h} px") }
-                };
-                ui.label(egui::RichText::new(note).color(theme::text_dim()));
-                ui.end_row();
-
-                if opts.format == ExportFormat::Jpg {
-                    ui.label("Quality");
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Smaller").color(theme::text_dim()));
-                        ui.add(egui::Slider::new(&mut opts.jpg_quality, 10..=100).suffix("%").trailing_fill(true))
-                            .on_hover_text("JPEG compression: lower quality makes a smaller file, with more visible artifacts.");
-                        ui.label(egui::RichText::new("Sharper").color(theme::text_dim()));
+                    ui.label("Resolution (dpi)");
+                    ui.add_enabled_ui(opts.format.is_raster(), |ui| {
+                        ui.horizontal(|ui| {
+                            const PRESETS: [u32; 4] = [72, 150, 300, 600];
+                            // The custom box stays empty while a preset is chosen, so the value never shows twice.
+                            let id = ui.id().with("custom_dpi");
+                            let mut custom: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| {
+                                if PRESETS.contains(&opts.dpi) { String::new() } else { opts.dpi.to_string() }
+                            });
+                            for d in PRESETS {
+                                if ui.selectable_value(&mut opts.dpi, d, d.to_string()).clicked() {
+                                    custom.clear();
+                                }
+                            }
+                            let r = ui.add(egui::TextEdit::singleline(&mut custom).desired_width(56.0).hint_text("other"));
+                            if r.changed() {
+                                custom.retain(|c| c.is_ascii_digit());
+                                if let Ok(v) = custom.parse::<u32>() {
+                                    opts.dpi = v.clamp(crate::export::MIN_DPI, crate::export::MAX_DPI);
+                                }
+                            }
+                            if r.lost_focus() {
+                                custom = if PRESETS.contains(&opts.dpi) { String::new() } else { opts.dpi.to_string() };
+                            }
+                            ui.data_mut(|d| d.insert_temp(id, custom));
+                        });
                     });
                     ui.end_row();
-                }
 
-                size_row(ui);
-            });
-            ui.add_space(6.0);
-            if opts.format == ExportFormat::Png {
-                ui.checkbox(&mut opts.transparent, "Transparent background");
-            }
-            if !project_file {
-                ui.add_enabled_ui(n_images > 0 && !opts.individual, |ui| {
-                    ui.checkbox(&mut opts.crop, "Crop to images")
-                        .on_hover_text("Crop the sheet to the area covered by the images, instead of exporting the whole slide.");
-                });
-                ui.add_enabled_ui(n_images > 0, |ui| {
-                    let counts = if multi { format!("{slide_images} on this slide, {all_images} on all slides") } else { format!("{slide_images} on this slide") };
-                    ui.checkbox(&mut opts.individual, format!("Export images individually ({counts})"))
-                        .on_hover_text("Save one file per image, cropped tightly to the image, instead of the whole slide. Files are named <name>-01-<image>, <name>-02-<image>, ...");
-                });
-                ui.add_enabled_ui(multi, |ui| {
-                    ui.checkbox(&mut opts.all_slides, format!("Export all slides ({n_slides})"))
-                        .on_hover_text("Save every slide, one file each, named <name>-slide1, <name>-slide2, ... (a PDF can instead hold them all)");
-                });
-                if all && opts.format == ExportFormat::Pdf && !opts.individual {
-                    ui.indent("pdf_pages", |ui| {
-                        ui.checkbox(&mut opts.pdf_pages, "One PDF, a page per slide")
-                            .on_hover_text("Off: one PDF per slide, named <name>-slide1.pdf, <name>-slide2.pdf, ...");
+                    ui.label("File dimensions");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("export_dims_unit").width(52.0).selected_text(dims_unit.label()).show_ui(ui, |ui| {
+                            for u in [Unit::Px, Unit::Inch, Unit::Cm] {
+                                ui.selectable_value(&mut dims_unit, u, u.label());
+                            }
+                        });
+                        let dims = if opts.individual {
+                            "a size per image".to_string()
+                        } else if all && opts.crop {
+                            "a size per slide".to_string()
+                        } else {
+                            let region = if opts.crop { image_bounds.unwrap_or(page) } else { page };
+                            let each = if all { " each" } else { "" };
+                            match dims_unit {
+                                // Vector files have no pixels of their own: their size at the slide's 96 px per inch.
+                                Unit::Px if !opts.format.is_raster() => format!("{} x {} px{each}", region.width().round(), region.height().round()),
+                                Unit::Px => {
+                                    let [w, h] = crate::export::pixel_size(region, opts.dpi);
+                                    format!("{w} x {h} px{each}")
+                                }
+                                u => format!("{:.2} x {:.2} {}{each}", u.from_px(region.width()), u.from_px(region.height()), u.label()),
+                            }
+                        };
+                        ui.label(egui::RichText::new(dims).color(theme::text_dim()));
                     });
+                    ui.end_row();
+
+                    if !opts.format.is_raster() {
+                        ui.label("");
+                        ui.label(egui::RichText::new("Vector output: scales to any size.").color(theme::text_dim()));
+                        ui.end_row();
+                    }
+
+                    if opts.format == ExportFormat::Jpg {
+                        ui.label("Quality");
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Smaller").color(theme::text_dim()));
+                            ui.add(egui::Slider::new(&mut opts.jpg_quality, 10..=100).suffix("%").trailing_fill(true))
+                                .on_hover_text("JPEG compression: lower quality makes a smaller file, with more visible artifacts.");
+                            ui.label(egui::RichText::new("Sharper").color(theme::text_dim()));
+                        });
+                        ui.end_row();
+                    }
+
+                    size_row(ui);
+                });
+                ui.add_space(6.0);
+                if opts.format == ExportFormat::Png {
+                    ui.checkbox(&mut opts.transparent, "Transparent background");
                 }
+                if !project_file {
+                    ui.add_enabled_ui(n_images > 0 && !opts.individual, |ui| {
+                        ui.checkbox(&mut opts.crop, "Crop to images")
+                            .on_hover_text("Crop the sheet to the area covered by the images, instead of exporting the whole slide.");
+                    });
+                    ui.add_enabled_ui(n_images > 0, |ui| {
+                        let counts = if multi { format!("{slide_images} on this slide, {all_images} on all slides") } else { format!("{slide_images} on this slide") };
+                        ui.checkbox(&mut opts.individual, format!("Export images individually ({counts})"))
+                            .on_hover_text("Save one file per image, cropped tightly to the image, instead of the whole slide. Files are named <name>-01-<image>, <name>-02-<image>, ...");
+                    });
+                    ui.add_enabled_ui(multi, |ui| {
+                        ui.checkbox(&mut opts.all_slides, format!("Export all slides ({n_slides})"))
+                            .on_hover_text("Save every slide, one file each, named <name>-slide1, <name>-slide2, ... (a PDF can instead hold them all)");
+                    });
+                    if all && opts.format == ExportFormat::Pdf && !opts.individual {
+                        ui.indent("pdf_pages", |ui| {
+                            ui.checkbox(&mut opts.pdf_pages, "One PDF, a page per slide")
+                                .on_hover_text("Off: one PDF per slide, named <name>-slide1.pdf, <name>-slide2.pdf, ...");
+                        });
+                    }
+                }
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can = project_file || !((opts.individual || opts.crop) && n_images == 0);
+                    if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(Color32::WHITE)).fill(theme::accent())).clicked() { go = true; }
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                });
+            };
+            if phone {
+                egui::ScrollArea::both().max_width(screen.x - 32.0).max_height(screen.y - 48.0).show(ui, body);
+            } else {
+                body(ui);
             }
-            ui.add_space(10.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can = project_file || !((opts.individual || opts.crop) && n_images == 0);
-                if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(Color32::WHITE)).fill(theme::accent())).clicked() { go = true; }
-                if ui.button("Cancel").clicked() { cancel = true; }
-            });
         });
+        ctx.data_mut(|d| d.insert_temp(units_id, dims_unit));
         if modal.should_close() {
             open = false;
         }
@@ -3558,6 +3899,11 @@ impl BioCartoon {
         }
         if !self.show_export && !go {
             self.export_doc = None;
+        }
+        if !self.show_export {
+            if let Some(base) = ctx.data_mut(|d| d.remove_temp::<f32>(zoom_id)) {
+                ctx.set_zoom_factor(base);
+            }
         }
         if go {
             self.pick_export_path();
@@ -3938,7 +4284,7 @@ impl BioCartoon {
             Action::SetCrop(on) => self.crop_mode = on && self.single_selected().is_some_and(|i| matches!(i.kind, ItemKind::Image { .. })),
             Action::Ai(op) => self.run_ai(op),
             Action::OpenEdit => self.open_edit_tab(),
-            Action::SaveSelectionImage => self.save_selection_image(ctx),
+            Action::SaveSelectionImage => self.show_save_picture = !self.selected_items().is_empty(),
             Action::OpenAiEdit => {
                 if let Some(it) = self.single_selected() {
                     if matches!(it.kind, ItemKind::Image { .. }) {
@@ -3966,7 +4312,7 @@ impl BioCartoon {
                     if let Some(it) = self.item(item).cloned() {
                         if let ItemKind::Image { source, .. } = &it.kind {
                             if let Some(img) = self.images.cpu_image(&source.cache_key()) {
-                                self.ai.submit(AiJob::Edit { item, image: (*img).clone(), op: AiOp::Custom(msg) });
+                                self.ai.submit(AiJob::Edit { item, image: (*img).clone(), svg: svg_source(source), op: AiOp::Custom(msg) });
                             }
                         }
                     }
@@ -4060,7 +4406,8 @@ impl BioCartoon {
             Action::Generate(p) => self.start_generate(p),
             Action::GeneratedToLibrary { path, favorite } => self.generated_to_library(&path, favorite),
             Action::ContributeGenerated(path) => self.contribute_generated(&path),
-            Action::OpenUploadDialog(target) => self.open_upload_dialog(target),
+            Action::OpenUploadDialog(target, share) => self.open_upload_dialog(target, share),
+            Action::OpenContribute(share) => self.open_contribute(share),
             Action::PickLibraryFile => {
                 let tx = self.action_tx.clone();
                 crate::platform::pick_files("Images", &crate::assets::IMAGE_EXTS, false, move |mut paths| {
@@ -4072,7 +4419,7 @@ impl BioCartoon {
                 if !self.settings.uploads.contains(&s) {
                     self.settings.uploads.push(s);
                 }
-                self.open_upload_dialog(UploadTarget::File(f));
+                self.open_upload_dialog(UploadTarget::File(f), false);
             }
             Action::SubmitUpload => self.submit_upload(),
             Action::ContributeSelected => self.contribute_selected(),
@@ -4630,6 +4977,9 @@ impl BioCartoon {
         if self.show_export {
             self.export_window(ctx);
         }
+        if self.show_save_picture {
+            self.save_picture_window(ctx);
+        }
         self.settings_windows(ctx);
         // Edit with AI: the image, then a chat that offers the quick edits as clickable prompts.
         if self.ai_edit.is_some() {
@@ -4723,7 +5073,13 @@ impl BioCartoon {
         let mut submit = false;
         let mut cancel = false;
         let template = matches!(d.target, UploadTarget::Template(_));
-        let mut title = if template { "Save slide as template" } else { "Add to icon library" }.to_string();
+        let mut title = match (template, d.share) {
+            (true, false) => "Save slide as template",
+            (true, true) => "Add template to BioCartoon library",
+            (false, false) => "Add to your library",
+            (false, true) => "Add to BioCartoon library",
+        }
+        .to_string();
         if d.step.1 > 1 {
             title = format!("{title} ({} of {})", d.step.0, d.step.1);
         }
@@ -4762,39 +5118,126 @@ impl BioCartoon {
                 });
                 field(ui, "Description");
                 ui.add(egui::TextEdit::multiline(&mut d.description).char_limit(500).hint_text("optional").desired_rows(3).desired_width(w));
-                field(ui, "License");
-                egui::ComboBox::from_id_salt("upload_license").width(w).selected_text(UPLOAD_LICENSES.iter().find(|l| l.0 == d.license).map(|l| l.1).unwrap_or(d.license)).show_ui(ui, |ui| {
-                    for (id, label) in UPLOAD_LICENSES {
-                        ui.selectable_value(&mut d.license, id, label);
-                    }
-                });
-                field(ui, "Credit as");
-                ui.add(egui::TextEdit::singleline(&mut d.credit).char_limit(60).hint_text("your name").desired_width(w));
-                field(ui, "Email");
-                ui.add(egui::TextEdit::singleline(&mut d.email).char_limit(254).hint_text("optional, never published").desired_width(w))
-                    .on_hover_text("Only the BioCartoon team sees it, in case they have a question about your submission");
-                ui.add_space(10.0);
                 let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
-                if can_submit {
-                    ui.checkbox(&mut d.share, "Submit to the shared library");
-                    if d.share {
-                        ui.label(dim("It is reviewed before anyone else sees it. Once approved, the name, credit and details above are public."));
+                // Your library keeps it on this computer: license, credit and contact are for submissions.
+                if d.share {
+                    field(ui, "License");
+                    egui::ComboBox::from_id_salt("upload_license").width(w).selected_text(UPLOAD_LICENSES.iter().find(|l| l.0 == d.license).map(|l| l.1).unwrap_or(d.license)).show_ui(ui, |ui| {
+                        for (id, label) in UPLOAD_LICENSES {
+                            ui.selectable_value(&mut d.license, id, label);
+                        }
+                    });
+                    field(ui, "Credit as");
+                    ui.add(egui::TextEdit::singleline(&mut d.credit).char_limit(60).hint_text("your name").desired_width(w));
+                    field(ui, "Email");
+                    ui.add(egui::TextEdit::singleline(&mut d.email).char_limit(254).hint_text("optional, never published").desired_width(w))
+                        .on_hover_text("Only the BioCartoon team sees it, in case they have a question about your submission");
+                    ui.add_space(10.0);
+                    if can_submit {
+                        ui.label(dim("It is reviewed before anyone else sees it, and kept in Your library meanwhile. Once approved, the name, credit and details above are public."));
                         ui.label(dim("You keep the copyright. BioCartoon and its users only get the license you chose."));
                         ui.label(dim("To submit anonymously, choose the CC0 license and leave \"Credit as\" blank."));
                     } else {
-                        ui.label(dim("Saved on this computer only."));
+                        ui.label(dim("No submission server is set up, so nothing can be submitted."));
                     }
                 } else {
-                    ui.label(dim("Saved on this computer only (no submission server is set up)."));
+                    ui.add_space(10.0);
+                    ui.label(dim("Saved on this computer only."));
                 }
                 ui.add_space(10.0);
+                let png = !template && !d.svg;
+                let mut over = false;
+                if !template {
+                    let limit = if d.svg { crate::submit::MAX_SVG_BYTES } else { crate::submit::MAX_PNG_BYTES };
+                    // A raster image can be made smaller: width and height (or percent), in
+                    // proportion. An SVG has no pixels to change.
+                    let mut dragging = false;
+                    if let Some(img) = d.image.clone() {
+                        let (ow, oh) = img.dimensions();
+                        ui.horizontal(|ui| {
+                            ui.label("Resize");
+                            // Filled like the text fields above, so the numbers read as boxes to type in.
+                            let field_bg = ui.visuals().extreme_bg_color;
+                            ui.visuals_mut().widgets.inactive.weak_bg_fill = field_bg;
+                            let (mut w, mut h) = scaled_size((ow, oh), d.scale);
+                            let mut pct = d.scale * 100.0;
+                            let mut field = |ui: &mut egui::Ui, v: &mut f32, max: f32| {
+                                let r = ui.add(egui::DragValue::new(v).range(1.0..=max).max_decimals(if d.percent { 1 } else { 0 }).speed(if d.percent { 0.5 } else { 2.0 }));
+                                dragging |= r.dragged();
+                                r.changed()
+                            };
+                            if d.percent {
+                                let (mut a, mut b) = (pct, pct);
+                                let ch = field(ui, &mut a, 100.0);
+                                ui.label("×");
+                                let ch2 = field(ui, &mut b, 100.0);
+                                if ch { pct = a } else if ch2 { pct = b }
+                                d.scale = pct / 100.0;
+                            } else {
+                                let (mut wf, mut hf) = (w as f32, h as f32);
+                                if field(ui, &mut wf, ow as f32) {
+                                    w = wf.round() as u32;
+                                    d.scale = w as f32 / ow as f32;
+                                }
+                                ui.label("×");
+                                if field(ui, &mut hf, oh as f32) {
+                                    h = hf.round() as u32;
+                                    d.scale = h as f32 / oh as f32;
+                                }
+                            }
+                            egui::ComboBox::from_id_salt("upload_resize_unit").width(48.0).selected_text(if d.percent { "%" } else { "px" }).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut d.percent, false, "px");
+                                ui.selectable_value(&mut d.percent, true, "%");
+                            });
+                        })
+                        .response
+                        .on_hover_text("Width and height keep the image's proportions");
+                        // The file size is worked out once a size is let go of, not on every step of a drag.
+                        if d.scale != d.out_scale && !dragging {
+                            d.out = Some(png_out(&img, d.scale));
+                            d.out_scale = d.scale;
+                        }
+                    }
+                    match &d.out {
+                        Some(Ok((w, h, bytes))) if d.scale == d.out_scale => {
+                            ui.label(format!("Size: {w} × {h} px ({})", crate::offline::human_bytes(*bytes as u64)));
+                            over = *bytes > limit;
+                        }
+                        Some(Ok(_)) => {
+                            let (w, h) = d.image.as_ref().map(|i| scaled_size(i.dimensions(), d.scale)).unwrap_or_default();
+                            ui.label(format!("Size: {w} × {h} px (…)"));
+                        }
+                        Some(Err(e)) => {
+                            ui.colored_label(theme::danger(), e);
+                        }
+                        None => {}
+                    }
+                    if over {
+                        let fix = if d.image.is_some() { "make it smaller above" } else { "simplify the drawing" };
+                        ui.colored_label(theme::danger(), format!("Icons can be up to {}: {fix}.", crate::offline::human_bytes(limit as u64)));
+                    }
+                    ui.label(if d.svg { "File type: SVG (vector)" } else { "File type: PNG (raster)" });
+                }
+                if png {
+                    ui.checkbox(&mut d.png_ok, "This file is a PNG (raster). SVG (vector) is recommended for upload. Please check here to confirm this choice.");
+                }
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let sharing = can_submit && d.share;
-                    let credited = d.license != "CC-BY-4.0" || !d.credit.trim().is_empty();
-                    let can = !d.name.trim().is_empty() && (!sharing || credited);
-                    let label = if sharing { "Submit" } else { "Save" };
+                    let credited = !d.share || d.license != "CC-BY-4.0" || !d.credit.trim().is_empty();
+                    let can = !d.name.trim().is_empty() && credited && (!d.share || can_submit) && (!png || d.png_ok) && !over;
+                    let label = if d.share { "Submit" } else { "Save" };
                     let b = ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(theme::accent()));
-                    let why = if d.name.trim().is_empty() { "Give it a name first" } else { "CC BY needs a name to credit, or choose CC0" };
+                    let why = if d.name.trim().is_empty() {
+                        "Give it a name first"
+                    } else if !credited {
+                        "CC BY needs a name to credit, or choose CC0"
+                    } else if d.share && !can_submit {
+                        "No submission server is set up"
+                    } else if over {
+                        "Too large: make it smaller first"
+                    } else {
+                        "Confirm adding it as a PNG first"
+                    };
                     if b.on_disabled_hover_text(why).clicked() { *submit = true; }
                     if ui.button(if d.queue.is_empty() { "Cancel" } else { "Cancel all" }).clicked() { *cancel = true; }
                 });
@@ -4930,8 +5373,8 @@ impl BioCartoon {
     /// Headless-ish smoke test: `BIOCARTOON_SCREENSHOT=out.png` captures the window after a
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
-    /// settings, about, templates, savetemplate, export=<path>, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
-    /// comments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library>).
+    /// settings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
+    /// comments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -5109,6 +5552,7 @@ impl BioCartoon {
                         }
                     }
                     "exportdialog" => { self.show_settings = false; self.show_export = true; }
+                    "savepicture" => self.actions.push(Action::SaveSelectionImage),
                     // Export the slide to a path, to see the credits pop up afterwards.
                     s if s.starts_with("export=") => { self.show_attributions = false; self.start_export(ctx, PathBuf::from(&s[7..])); }
                     // Library images saved without their credits (an older document), one of them
@@ -5144,7 +5588,15 @@ impl BioCartoon {
                         self.settings.show_icons = true;
                         self.search_database(theme::BIOCARTOON_SOURCE);
                     }
-                    "savetemplate" => self.open_upload_dialog(self.template_target(self.cur_slide)),
+                    "savetemplate" => self.open_upload_dialog(self.template_target(self.cur_slide), false),
+                    // The library dialogs for the demo PNG or SVG: Your library (add), or BioCartoon's (share).
+                    "addpng" | "addsvg" | "sharepng" | "sharesvg" => {
+                        let (name, bytes): (&str, &[u8]) = if step.ends_with("svg") { ("demo-logo.svg", include_bytes!("../assets/logo.svg")) } else { ("demo-icon.png", crate::ICON_PNG) };
+                        let path = self.app_dir.join("generated").join(name);
+                        if crate::storage::write(&path, bytes).is_ok() {
+                            self.open_upload_dialog(UploadTarget::File(path), step.starts_with("share"));
+                        }
+                    }
                     "aisetup" => self.open_ai_setup(None),
                     "nosettings" => self.show_settings = false,
                     s if s.starts_with("search=") => {
@@ -5168,7 +5620,8 @@ impl BioCartoon {
                             "icons" => self.settings.show_icons = true,
                             "noicons" => self.settings.show_icons = false,
                             "uploads" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Uploads; }
-                            "contribute" => { self.settings.show_icons = true; self.open_contribute(); }
+                            "contribute" => { self.settings.show_icons = true; self.open_contribute(true); }
+                            "addlibrary" => { self.settings.show_icons = true; self.open_contribute(false); }
                             "suggest" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Suggest; }
                             "favorites" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Favorites; self.request_browse(); }
                             "library" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Library; self.request_browse(); }
@@ -5409,5 +5862,81 @@ fn open_mail(subject: &str, files: &[PathBuf]) {
     let _ = std::process::Command::new(opener).arg(&url).status();
     if let Some(d) = folder {
         let _ = std::process::Command::new(opener).arg(d).status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(img: &image::RgbaImage, format: image::ImageFormat) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, format).unwrap();
+        out.into_inner()
+    }
+
+    /// A PNG re-encoded into the library keeps its fingerprint; a changed one doesn't.
+    #[test]
+    fn fingerprints_follow_the_pixels() {
+        let mut img = image::RgbaImage::from_pixel(8, 4, image::Rgba([10, 20, 30, 255]));
+        let a = image_fingerprint(&png(&img, image::ImageFormat::Png)).unwrap();
+        let (again, _, _) = crate::templates::encode_png(img.clone()).unwrap();
+        assert_eq!(image_fingerprint(&again).unwrap(), a);
+        img.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+        assert_ne!(image_fingerprint(&png(&img, image::ImageFormat::Png)).unwrap(), a);
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>"#;
+        assert!(image_fingerprint(svg).unwrap().starts_with("svg:"));
+        assert!(image_fingerprint(b"not an image").is_none());
+    }
+
+    #[test]
+    fn resizing_for_the_library() {
+        let img = image::RgbaImage::from_pixel(400, 100, image::Rgba([200, 0, 0, 255]));
+        assert_eq!(scaled(&img, 1.0).dimensions(), (400, 100));
+        // Only ever smaller.
+        assert_eq!(scaled(&img, 2.0).dimensions(), (400, 100));
+        assert_eq!(scaled(&img, 0.32).dimensions(), (128, 32));
+        assert_eq!(scaled_size((400, 100), 0.001), (1, 1));
+        let (w, h, bytes) = png_out(&img, 0.32).unwrap();
+        assert_eq!((w, h), (128, 32));
+        assert!(bytes > 0 && bytes <= png_out(&img, 1.0).unwrap().2);
+    }
+
+    /// Submitted files, and library icons by fingerprint or by id, are recognized.
+    #[test]
+    fn submitted_once() {
+        let dir = std::env::temp_dir().join(format!("biocartoon-submitted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.png");
+        std::fs::write(&file, png(&image::RgbaImage::from_pixel(3, 3, image::Rgba([1, 2, 3, 255])), image::ImageFormat::Png)).unwrap();
+        let path = file.display().to_string();
+        let mut memo = HashMap::new();
+        let fp = file_fingerprint(&mut memo, &path).unwrap();
+        assert!(!file_submitted(&mut memo, &[], &path));
+        assert!(file_submitted(&mut memo, std::slice::from_ref(&fp), &path));
+        let row = AssetRow {
+            id: "user/x".into(),
+            source: "user".into(),
+            source_name: String::new(),
+            title: String::new(),
+            variant: String::new(),
+            category: String::new(),
+            description: String::new(),
+            license: String::new(),
+            credit: String::new(),
+            author: String::new(),
+            png_key: String::new(),
+            png_local: Some(path.clone()),
+            png_width: 3,
+            png_height: 3,
+            svg_key: None,
+            stars: 0,
+            starred: false,
+            taxa: Vec::new(),
+        };
+        assert!(row_submitted(&mut memo, &[fp], &row));
+        assert!(row_submitted(&mut memo, &["id:user/x".into()], &row));
+        assert!(!row_submitted(&mut memo, &["id:user/y".into()], &row));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

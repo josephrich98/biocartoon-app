@@ -96,7 +96,8 @@ impl BioCartoon {
                     IconsMode::Search => ("Search".into(), true),
                     IconsMode::Generate => ("Generate with AI".into(), true),
                     IconsMode::Uploads => ("Uploads".into(), true),
-                    IconsMode::Contribute => ("Contribute artwork".into(), true),
+                    IconsMode::Contribute if self.contribute.share => ("Add to BioCartoon library".into(), true),
+                    IconsMode::Contribute => ("Add to your library".into(), true),
                     IconsMode::Suggest => ("Submit an idea".into(), true),
                     IconsMode::Favorites => ("Favorites".into(), true),
                     IconsMode::Library => ("Your library".into(), true),
@@ -482,8 +483,11 @@ impl BioCartoon {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
-                if row_button(ui, ph::CLOUD_ARROW_UP, "Contribute artwork").on_hover_text("Share your icons and templates with everyone").clicked() {
-                    self.open_contribute();
+                if row_button(ui, ph::BOOKS, "Add to your library").on_hover_text("Keep your images and slides in Your library, on this computer").clicked() {
+                    self.open_contribute(false);
+                }
+                if row_button(ui, ph::CLOUD_ARROW_UP, "Add to BioCartoon library").on_hover_text("Share your icons and templates with everyone").clicked() {
+                    self.open_contribute(true);
                 }
                 if row_button_with(ui, paint_thought_bubble, "Submit an idea").on_hover_text("Ask the BioCartoon team for an icon, a template or anything else").clicked() {
                     self.actions.push(Action::OpenSuggest(String::new()));
@@ -647,9 +651,12 @@ impl BioCartoon {
                     stars: self.settings.tile_stars,
                     fav: self.settings.favorites.contains(&row.id),
                 };
-                let (r, act) = asset_tile(ui, size, row, row.png_local.as_deref(), &mut self.images, hold, colors, marks);
+                let (fingerprints, submitted) = (&mut self.fingerprints, &self.settings.submitted);
+                let mut unsent = || !crate::app::row_submitted(fingerprints, submitted, row);
+                let (r, act) = asset_tile(ui, size, row, row.png_local.as_deref(), &mut self.images, hold, colors, marks, &mut unsent);
                 match act {
                     Some(TileAct::Remove) => self.actions.push(Action::RemoveUserAsset(row.clone())),
+                    Some(TileAct::Share) => self.actions.push(Action::OpenUploadDialog(UploadTarget::Library(Box::new(row.clone())), true)),
                     Some(TileAct::Favorite) => self.actions.push(Action::ToggleFavorite(row.id.clone())),
                     None if r.clicked() => picked = Some(row.clone()),
                     None => {}
@@ -782,7 +789,9 @@ impl BioCartoon {
                     if ui.button(format!("{}  Add to your library", ph::BOOKS)).on_hover_text("Keep it in Your library, on this computer").clicked() {
                         self.actions.push(Action::GeneratedToLibrary { path: path.clone(), favorite: false });
                     }
-                    if ui.button(format!("{}  Contribute", ph::CLOUD_ARROW_UP)).on_hover_text("Share it with everyone through Contribute artwork").clicked() {
+                    let sent = crate::app::file_submitted(&mut self.fingerprints, &self.settings.submitted, &path);
+                    let b = ui.add_enabled(!sent, egui::Button::new(format!("{}  Add to BioCartoon library", ph::CLOUD_ARROW_UP)));
+                    if b.on_hover_text("Share it with everyone").on_disabled_hover_text(crate::app::ALREADY_SUBMITTED).clicked() {
                         self.actions.push(Action::ContributeGenerated(path));
                     }
                 });
@@ -820,7 +829,9 @@ impl BioCartoon {
                         self.actions.push(Action::GeneratedToLibrary { path: g.path.clone(), favorite: true });
                         ui.close();
                     }
-                    if ui.button(format!("{}  Contribute", ph::CLOUD_ARROW_UP)).clicked() {
+                    let sent = crate::app::file_submitted(&mut self.fingerprints, &self.settings.submitted, &g.path);
+                    let b = ui.add_enabled(!sent, egui::Button::new(format!("{}  Add to BioCartoon library", ph::CLOUD_ARROW_UP)));
+                    if b.on_disabled_hover_text(crate::app::ALREADY_SUBMITTED).clicked() {
                         self.actions.push(Action::ContributeGenerated(g.path.clone()));
                         ui.close();
                     }
@@ -926,37 +937,53 @@ impl BioCartoon {
                 let name = std::path::Path::new(p).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 let state = self.images.file(p);
                 let r = tile(ui, size, &name, state, None);
-                let on = self.contribute.icons.contains(p);
-                check_corner(ui, r.rect, on, true);
-                if r.on_hover_text(&name).clicked() && !self.contribute.icons.remove(p) {
-                    self.contribute.icons.insert(p.clone());
+                // What went to the BioCartoon library already can't go again.
+                let sent = self.contribute.share && crate::app::file_submitted(&mut self.fingerprints, &self.settings.submitted, p);
+                if sent {
+                    dim_tile(ui, r.rect);
+                    r.on_hover_text(crate::app::ALREADY_SUBMITTED);
+                } else {
+                    let on = self.contribute.icons.contains(p);
+                    check_corner(ui, r.rect, on, true);
+                    if r.on_hover_text(&name).clicked() && !self.contribute.icons.remove(p) {
+                        self.contribute.icons.insert(p.clone());
+                    }
                 }
                 if (i + 1) % per_row == 0 {
                     ui.end_row();
                 }
             }
         });
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Your library").strong());
-        let library: Vec<AssetRow> = self.icons.results.iter().filter(|r| r.png_local.is_some()).cloned().collect();
-        if library.is_empty() {
-            let text = if self.icons.loading { "Loading..." } else { "No icons in your library yet." };
-            ui.label(egui::RichText::new(text).color(theme::text_dim()));
+        // Your library's own icons and templates are already there: only offered for sharing.
+        let share = self.contribute.share;
+        if share {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Your library").strong());
+            let library: Vec<AssetRow> = self.icons.results.iter().filter(|r| r.png_local.is_some()).cloned().collect();
+            if library.is_empty() {
+                let text = if self.icons.loading { "Loading..." } else { "No icons in your library yet." };
+                ui.label(egui::RichText::new(text).color(theme::text_dim()));
+            }
+            egui::Grid::new("contribute_library").spacing([6.0, 6.0]).show(ui, |ui| {
+                for (i, row) in library.iter().enumerate() {
+                    let state = self.images.file(row.png_local.as_deref().unwrap_or_default());
+                    let r = tile(ui, size, &row.title, state, None);
+                    if crate::app::row_submitted(&mut self.fingerprints, &self.settings.submitted, row) {
+                        dim_tile(ui, r.rect);
+                        r.on_hover_text(crate::app::ALREADY_SUBMITTED);
+                    } else {
+                        let on = self.contribute.library.contains(&row.id);
+                        check_corner(ui, r.rect, on, true);
+                        if r.on_hover_text(&row.title).clicked() && !self.contribute.library.remove(&row.id) {
+                            self.contribute.library.insert(row.id.clone());
+                        }
+                    }
+                    if (i + 1) % per_row == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
         }
-        egui::Grid::new("contribute_library").spacing([6.0, 6.0]).show(ui, |ui| {
-            for (i, row) in library.iter().enumerate() {
-                let state = self.images.file(row.png_local.as_deref().unwrap_or_default());
-                let r = tile(ui, size, &row.title, state, None);
-                let on = self.contribute.library.contains(&row.id);
-                check_corner(ui, r.rect, on, true);
-                if r.on_hover_text(&row.title).clicked() && !self.contribute.library.remove(&row.id) {
-                    self.contribute.library.insert(row.id.clone());
-                }
-                if (i + 1) % per_row == 0 {
-                    ui.end_row();
-                }
-            }
-        });
 
         ui.add_space(14.0);
         ui.label(egui::RichText::new("Templates").strong().size(14.0));
@@ -1030,37 +1057,42 @@ impl BioCartoon {
         }
         let used = row_start.y + row_h - ui.cursor().min.y;
         ui.allocate_space(Vec2::new(ui.available_width(), used.max(0.0)));
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Your library").strong());
-        let saved: Vec<TemplateRow> = self.template_rows.iter().filter(|r| r.json_local.is_some()).cloned().collect();
-        if saved.is_empty() {
-            ui.label(egui::RichText::new("No templates in your library yet.").color(theme::text_dim()));
-        }
-        let (per_row, size) = self.icon_grid(ui);
-        egui::Grid::new("contribute_templates").spacing([6.0, 6.0]).show(ui, |ui| {
-            for (i, row) in saved.iter().enumerate() {
-                let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
-                let r = tile(ui, size, &row.meta.title, state, None);
-                let on = self.contribute.library_templates.contains(&row.meta.id);
-                check_corner(ui, r.rect, on, true);
-                if r.on_hover_text(&row.meta.title).clicked() && !self.contribute.library_templates.remove(&row.meta.id) {
-                    self.contribute.library_templates.insert(row.meta.id.clone());
-                }
-                if (i + 1) % per_row == 0 {
-                    ui.end_row();
-                }
+        if share {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Your library").strong());
+            let saved: Vec<TemplateRow> = self.template_rows.iter().filter(|r| r.json_local.is_some()).cloned().collect();
+            if saved.is_empty() {
+                ui.label(egui::RichText::new("No templates in your library yet.").color(theme::text_dim()));
             }
-        });
+            let (per_row, size) = self.icon_grid(ui);
+            egui::Grid::new("contribute_templates").spacing([6.0, 6.0]).show(ui, |ui| {
+                for (i, row) in saved.iter().enumerate() {
+                    let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
+                    let r = tile(ui, size, &row.meta.title, state, None);
+                    let on = self.contribute.library_templates.contains(&row.meta.id);
+                    check_corner(ui, r.rect, on, true);
+                    if r.on_hover_text(&row.meta.title).clicked() && !self.contribute.library_templates.remove(&row.meta.id) {
+                        self.contribute.library_templates.insert(row.meta.id.clone());
+                    }
+                    if (i + 1) % per_row == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+
+        }
 
         ui.add_space(16.0);
         let c = &self.contribute;
         let n = c.icons.len() + c.library.len() + c.slides.len() + c.picked_templates.len() + c.library_templates.len();
-        let label = if n == 0 { format!("{}  Add to BioCartoon library", ph::CLOUD_ARROW_UP) } else { format!("{}  Add to BioCartoon library ({n})", ph::CLOUD_ARROW_UP) };
+        let (icon, what) = if share { (ph::CLOUD_ARROW_UP, "Add to BioCartoon library") } else { (ph::BOOKS, "Add to your library") };
+        let label = if n == 0 { format!("{icon}  {what}") } else { format!("{icon}  {what} ({n})") };
         let b = ui.add_enabled(n > 0, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 38.0)));
         if b.on_disabled_hover_text("Pick icons or templates above first").clicked() {
             self.actions.push(Action::ContributeSelected);
         }
-        ui.label(egui::RichText::new("Each one is reviewed before anyone else sees it.").small().color(theme::text_dim()));
+        let note = if share { "Each one is reviewed before anyone else sees it." } else { "Saved on this computer only." };
+        ui.label(egui::RichText::new(note).small().color(theme::text_dim()));
     }
 
     fn uploads_panel(&mut self, ui: &mut egui::Ui) {
@@ -1083,10 +1115,16 @@ impl BioCartoon {
                 if r.clicked() {
                     self.actions.push(Action::InsertFile(p.into()));
                 }
-                let r = r.on_hover_text("Click to place; right-click to add to the icon library");
+                let r = r.on_hover_text("Click to place; right-click to add to a library");
                 r.context_menu(|ui| {
-                    if ui.button(format!("{}  Add to icon library...", ph::CLOUD_ARROW_UP)).clicked() {
-                        self.actions.push(Action::OpenUploadDialog(UploadTarget::File(p.into())));
+                    if ui.button(format!("{}  Add to your library...", ph::BOOKS)).clicked() {
+                        self.actions.push(Action::OpenUploadDialog(UploadTarget::File(p.into()), false));
+                        ui.close();
+                    }
+                    let sent = crate::app::file_submitted(&mut self.fingerprints, &self.settings.submitted, p);
+                    let b = ui.add_enabled(!sent, egui::Button::new(format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP)));
+                    if b.on_disabled_hover_text(crate::app::ALREADY_SUBMITTED).clicked() {
+                        self.actions.push(Action::OpenUploadDialog(UploadTarget::File(p.into()), true));
                         ui.close();
                     }
                     if ui.button("Remove from uploads").clicked() {
@@ -1260,6 +1298,67 @@ impl BioCartoon {
         seg_captions(ui, w, &["Bring to front", "Bring forward", "Send backward", "Send to back"]);
     }
 
+    /// What an image is, above Transform: its name, database and license, then its file type
+    /// and size. The user's own images say just User-generated until they are given a license.
+    fn image_info(&mut self, ui: &mut egui::Ui, source: &ImageSource) {
+        let user = "User-generated".to_string();
+        let first = match source {
+            ImageSource::Asset { source: db, license, .. } if db == "user" && license.is_empty() => user,
+            ImageSource::Asset { title, source: db, license, .. } => {
+                let db = if db == "user" { "User-generated" } else { theme::source_badge(db).2 };
+                [title.as_str(), db, license.as_str()].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  ")
+            }
+            ImageSource::File { .. } => user,
+        };
+        let key = source.cache_key();
+        let vector = self.images.vector(&key);
+        let kind = match (&vector, source) {
+            (Some(_), _) => "SVG".to_string(),
+            (None, ImageSource::Asset { .. }) => "PNG".to_string(),
+            (None, ImageSource::File { path, .. }) => match std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref() {
+                Some("jpg" | "jpeg") => "JPEG".to_string(),
+                Some(e) => e.to_uppercase(),
+                None => "Image".to_string(),
+            },
+        };
+        let file = self.image_file(ui.ctx(), source, &key);
+        let dims = match &vector {
+            Some(v) => Some((v.size().x, v.size().y)),
+            None => file.and_then(|f| f.0),
+        };
+        let mut second = kind;
+        if let Some((w, h)) = dims {
+            second += &format!("  ·  {} × {} px", w.round(), h.round());
+        }
+        if let Some((_, bytes)) = file {
+            second += &format!("  ·  {}", crate::offline::human_bytes(bytes as u64));
+        }
+        ui.label(egui::RichText::new(first).strong());
+        ui.label(egui::RichText::new(second).small().color(theme::text_dim()));
+    }
+
+    /// An image file's size in pixels (from its header, as the canvas holds a scaled-down copy)
+    /// and in bytes, read once; `None` while it is only on the network.
+    #[allow(clippy::type_complexity)]
+    fn image_file(&self, ctx: &egui::Context, source: &ImageSource, key: &str) -> Option<(Option<(f32, f32)>, usize)> {
+        let id = egui::Id::new(("image_file", key));
+        if let Some(info) = ctx.data(|d| d.get_temp::<(Option<(f32, f32)>, usize)>(id)) {
+            return Some(info);
+        }
+        fn path(r: &crate::assets::Request) -> Option<&std::path::Path> {
+            match r {
+                crate::assets::Request::Path(p) => Some(p),
+                crate::assets::Request::Either(a, b) => path(a).or_else(|| path(b)),
+                crate::assets::Request::Url(_) => None,
+            }
+        }
+        let req = self.images.request_for(source).ok()?;
+        let bytes = crate::storage::read(path(&req)?).ok()?;
+        let info = (crate::assets::image_size(&bytes), bytes.len());
+        ctx.data_mut(|d| d.insert_temp(id, info));
+        Some(info)
+    }
+
     fn edit_panel(&mut self, ui: &mut egui::Ui) {
         if self.selection.is_empty() {
             ui.label(egui::RichText::new("Select something on the canvas to edit it.").small().color(theme::text_dim()));
@@ -1283,6 +1382,11 @@ impl BioCartoon {
         let Some(it) = self.item(id).cloned() else { return };
         let mut edited = it.clone();
         let mut changed = false;
+
+        if let ItemKind::Image { source, .. } = &it.kind {
+            self.image_info(ui, source);
+            ui.add_space(6.0);
+        }
 
         // Transform
         ui.label(egui::RichText::new("Transform").strong());
@@ -1737,10 +1841,12 @@ impl BioCartoon {
                 if ui.add_enabled(i + 1 < n, egui::Button::new("Move down")).clicked() { self.actions.push(Action::MoveSlide(i, 1)); ui.close(); }
                 if ui.add_enabled(n > 1, egui::Button::new("Delete")).clicked() { self.actions.push(Action::DeleteSlide(i)); ui.close(); }
                 let empty = self.doc.slides[i].items.is_empty();
-                let add = ui.add_enabled(!empty, egui::Button::new(format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP)));
-                if add.on_disabled_hover_text("Add something to the slide first").clicked() {
-                    self.actions.push(Action::OpenUploadDialog(self.template_target(i)));
-                    ui.close();
+                for (share, label) in [(false, format!("{}  Add to your library...", ph::BOOKS)), (true, format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP))] {
+                    let add = ui.add_enabled(!empty, egui::Button::new(label));
+                    if add.on_disabled_hover_text("Add something to the slide first").clicked() {
+                        self.actions.push(Action::OpenUploadDialog(self.template_target(i), share));
+                        ui.close();
+                    }
                 }
                 ui.separator();
                 ui.label("Rename");
@@ -1938,6 +2044,12 @@ fn tile(ui: &mut egui::Ui, size: f32, title: &str, state: &ImgState, badge: Opti
 }
 
 /// A selection checkbox in the lower-right corner of a tile; faded when it can't be picked.
+/// Greys out a tile that can't be picked.
+fn dim_tile(ui: &egui::Ui, rect: Rect) {
+    let bg = if theme::is_dark() { Color32::from_black_alpha(150) } else { Color32::from_white_alpha(170) };
+    ui.painter().rect_filled(rect, 6.0, bg);
+}
+
 fn check_corner(ui: &egui::Ui, rect: Rect, on: bool, enabled: bool) {
     let b = Rect::from_min_size(rect.right_bottom() - Vec2::splat(23.0), Vec2::splat(18.0));
     let p = ui.painter();
@@ -2044,6 +2156,8 @@ enum TileAct {
     Favorite,
     /// Remove from library, on one of the user's own uploads.
     Remove,
+    /// Add to BioCartoon library, on one of the user's own uploads.
+    Share,
 }
 
 /// What an asset tile shows besides its image (the Settings > General choices, and whether it is
@@ -2063,7 +2177,10 @@ struct TileMarks {
 /// is how many colours it comes in (the colours are picked in Edit once it is placed); `marks`
 /// what to show on it. Clicking the star stars it, which makes it a favorite. Right-click
 /// (or a long press) opens its info with Favorite, Copy name and Copy credit.
-fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>, images: &mut crate::assets::ImageCache, hold: bool, colors: usize, marks: TileMarks) -> (egui::Response, Option<TileAct>) {
+/// `unsent` says whether one of the user's own icons can still go to the BioCartoon library
+/// (asked only when its menu is open).
+#[allow(clippy::too_many_arguments)]
+fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>, images: &mut crate::assets::ImageCache, hold: bool, colors: usize, marks: TileMarks, unsent: &mut dyn FnMut() -> bool) -> (egui::Response, Option<TileAct>) {
     let fav = marks.fav;
     let state = images.asset(&row.png_key, local);
     let loading = ImgState::Loading;
@@ -2119,6 +2236,11 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
         // The user's own uploads (published ones have no local copy) can be taken out again.
         if row.source == "user" && row.png_local.is_some() {
             ui.separator();
+            let b = ui.add_enabled(unsent(), egui::Button::new(format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP)));
+            if b.on_disabled_hover_text(crate::app::ALREADY_SUBMITTED).clicked() {
+                act = Some(TileAct::Share);
+                ui.close();
+            }
             if ui.button(format!("{}  Remove from library", ph::TRASH)).clicked() {
                 act = Some(TileAct::Remove);
                 ui.close();

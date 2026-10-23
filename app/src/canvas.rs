@@ -1864,9 +1864,15 @@ impl BioCartoon {
             ui.close();
         }
         if let Some(path) = own_file {
-            let b = egui::Button::new(format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP));
-            if ui.add(b).on_hover_text("Keep this image in your library, or submit it to the shared one").clicked() {
-                self.actions.push(Action::OpenUploadDialog(UploadTarget::File(path.into())));
+            if ui.button(format!("{}  Add to your library...", ph::BOOKS)).on_hover_text("Keep this image in Your library, on this computer").clicked() {
+                self.actions.push(Action::OpenUploadDialog(UploadTarget::File(path.clone().into()), false));
+                ui.close();
+            }
+            // An image goes to the BioCartoon library once.
+            let sent = crate::app::file_submitted(&mut self.fingerprints, &self.settings.submitted, &path);
+            let b = ui.add_enabled(!sent, egui::Button::new(format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP)));
+            if b.on_hover_text("Submit this image to the shared library").on_disabled_hover_text(crate::app::ALREADY_SUBMITTED).clicked() {
+                self.actions.push(Action::OpenUploadDialog(UploadTarget::File(path.into()), true));
                 ui.close();
             }
             return;

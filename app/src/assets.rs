@@ -220,6 +220,12 @@ pub fn is_svg(bytes: &[u8]) -> bool {
     })
 }
 
+/// True for a file path on this computer rather than an R2 key: user uploads store those.
+/// (wasm32's `is_absolute` is false even for "/..."; app data there lives under "/biocartoon".)
+pub fn is_local_path(p: &str) -> bool {
+    std::path::Path::new(p).is_absolute() || (cfg!(target_arch = "wasm32") && p.starts_with('/'))
+}
+
 /// Decode an image file. SVGs are rasterised to fit `svg_side` pixels, since everything
 /// downstream (canvas textures, exports, AI edits) works on pixels.
 pub fn load_image(bytes: &[u8], svg_side: u32) -> Result<RgbaImage, String> {
@@ -395,8 +401,7 @@ impl ImageCache {
         if let Some(rel) = local_rel {
             // User uploads store an absolute path; catalog assets are relative to the data dir.
             let p = match &self.local_dir {
-                // (wasm32's `is_absolute` is false even for "/..."; app data there lives under "/biocartoon".)
-                _ if std::path::Path::new(rel).is_absolute() || (cfg!(target_arch = "wasm32") && rel.starts_with('/')) => Some(std::path::PathBuf::from(rel)),
+                _ if is_local_path(rel) => Some(std::path::PathBuf::from(rel)),
                 Some(dir) => Some(dir.join(rel)),
                 None => None,
             };
@@ -417,7 +422,8 @@ impl ImageCache {
     /// when offline with only the PNGs downloaded) its PNG.
     fn request_for_image(&self, key: &str, svg: Option<&str>, local_rel: Option<&str>) -> Result<Request, String> {
         let png = self.request_for_asset(key, local_rel);
-        match (svg.map(|k| self.request_for_asset(k, None)), png) {
+        // The user's own SVGs (drawings an AI model made) are on this computer, by absolute path.
+        match (svg.map(|k| self.request_for_asset(k, is_local_path(k).then_some(k))), png) {
             (Some(Ok(svg)), Ok(png)) => Ok(Request::Either(Box::new(svg), Box::new(png))),
             (Some(Ok(svg)), Err(_)) => Ok(svg),
             (_, png) => png,
@@ -491,6 +497,18 @@ impl ImageCache {
         self.map.insert(cache_key.to_string(), ImgState::Ready { tex, size: [w as usize, h as usize] });
         self.forget_svg(cache_key);
         self.touch(cache_key);
+    }
+
+    /// [`insert_image`](Self::insert_image) for an SVG file's bytes, keeping its vector form so
+    /// it is drawn sharp at any zoom.
+    pub fn insert_svg(&mut self, ctx: &egui::Context, cache_key: &str, bytes: &[u8]) -> Result<(), String> {
+        let Loaded { width, height, rgba, svg } = decode(bytes)?;
+        let img = RgbaImage::from_raw(width, height, rgba).ok_or("svg: bad rendering size")?;
+        self.insert_image(ctx, cache_key, img);
+        if let Some(vector) = svg {
+            self.svg.insert(cache_key.to_string(), vector);
+        }
+        Ok(())
     }
 
     pub fn forget(&mut self, cache_key: &str) {
