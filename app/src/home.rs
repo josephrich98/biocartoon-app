@@ -169,9 +169,9 @@ impl BioCartoon {
         self.home_top_bar(ui);
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 16, right: 16, top: 8, bottom: 16 });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            self.backup_banner(ui);
             let projects = self.visible_projects();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                self.backup_banner(ui);
                 match self.settings.home_view {
                     HomeView::List => self.project_list(ui, &projects),
                     v => self.project_grid(ui, &projects, if v == HomeView::LargeTiles { 300.0 } else { 190.0 }),
@@ -189,76 +189,131 @@ impl BioCartoon {
 
     fn home_top_bar(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 16, right: 16, top: 14, bottom: 8 });
-        egui::Panel::top("home_top").exact_size(66.0).frame(frame).show_separator_line(false).show(ui, |ui| {
+        let web = cfg!(target_arch = "wasm32");
+        let right_w = 470.0 + if web { 130.0 } else { 0.0 };
+        // Narrow (a phone): two rows, the logo, search and account on top, the sort, view and other
+        // buttons below. In one row the search would shrink to nothing and the rest run off screen.
+        let narrow = ui.available_width() < 32.0 + 150.0 + right_w + 200.0;
+        let panel = egui::Panel::top("home_top").frame(frame).show_separator_line(false);
+        // Narrow, the panel takes the height of its rows, which wrap onto a third on a phone.
+        let panel = if narrow { panel } else { panel.exact_size(66.0) };
+        panel.show(ui, |ui| {
+            if narrow {
+                ui.horizontal(|ui| {
+                    ui.add(crate::logo(ui.ctx(), 30.0));
+                    ui.add_space(4.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if web {
+                            self.account_button(ui);
+                            ui.add_space(8.0);
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let w = ui.available_width() - ui.spacing().item_spacing.x;
+                            self.home_search(ui, w);
+                        });
+                    });
+                });
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    self.home_sort(ui);
+                    ui.add_space(8.0);
+                    self.home_view_toggle(ui);
+                    ui.add_space(8.0);
+                    self.home_icon_buttons(ui);
+                });
+                return;
+            }
             ui.horizontal_centered(|ui| {
                 ui.add(crate::logo(ui.ctx(), 30.0));
                 ui.label(egui::RichText::new("BioCartoon").size(16.0).strong());
                 ui.add_space(12.0);
-                let right_w = 470.0 + if cfg!(target_arch = "wasm32") { 130.0 } else { 0.0 };
                 let search_w = (ui.available_width() - right_w).max(160.0);
-                egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::border())).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
-                    ui.set_width(search_w - 22.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).size(16.0).color(theme::text_dim()));
-                        ui.add(egui::TextEdit::singleline(&mut self.home.query).hint_text("Search all projects").frame(egui::Frame::NONE).desired_width(f32::INFINITY));
-                    });
-                });
+                self.home_search(ui, search_w);
                 ui.add_space(8.0);
-                // Sort key + direction.
-                egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::border())).corner_radius(8).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let cur = self.settings.home_sort;
-                        ui.menu_button(format!("{}  {}", cur.label(), ph::CARET_DOWN), |ui| {
-                            for k in SortKey::ALL {
-                                if ui.selectable_label(k == cur, k.label()).clicked() {
-                                    if k != cur {
-                                        self.settings.home_sort = k;
-                                        self.settings.home_ascending = k.default_ascending();
-                                    }
-                                    ui.close();
-                                }
-                            }
-                        });
-                        ui.separator();
-                        let asc = self.settings.home_ascending;
-                        let tip = match (self.settings.home_sort, asc) {
-                            (SortKey::Name, true) => "A to Z",
-                            (SortKey::Name, false) => "Z to A",
-                            (_, true) => "Oldest first",
-                            (_, false) => "Newest first",
-                        };
-                        if ui.add(egui::Button::new(egui::RichText::new(if asc { ph::ARROW_UP } else { ph::ARROW_DOWN }).size(16.0)).frame(false)).on_hover_text(tip).clicked() {
-                            self.settings.home_ascending = !asc;
-                        }
-                    });
-                });
+                self.home_sort(ui);
                 ui.add_space(8.0);
-                egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::border())).corner_radius(8).inner_margin(egui::Margin::symmetric(4, 3)).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for v in HomeView::ALL {
-                            let sel = self.settings.home_view == v;
-                            let text = egui::RichText::new(v.icon()).size(18.0).color(if sel { theme::accent() } else { theme::text() });
-                            if ui.add(egui::Button::new(text).frame(false).selected(sel)).on_hover_text(v.label()).clicked() {
-                                self.settings.home_view = v;
-                            }
-                        }
-                    });
-                });
+                self.home_view_toggle(ui);
                 ui.add_space(8.0);
-                if ui.add(egui::Button::new(egui::RichText::new(ph::FOLDER_OPEN).size(18.0)).frame(false)).on_hover_text("Open .biocartoon files, or a backup .zip, as new projects").clicked() {
-                    self.actions.push(Action::Open);
-                }
-                if ui.add(egui::Button::new(egui::RichText::new(ph::GEAR).size(18.0)).frame(false)).on_hover_text("Settings").clicked() {
-                    self.open_settings(crate::app::SettingsTab::General);
-                }
-                if ui.add(egui::Button::new(egui::RichText::new(ph::INFO).size(18.0)).frame(false)).on_hover_text("About BioCartoon").clicked() {
-                    self.show_about = true;
-                }
-                if cfg!(target_arch = "wasm32") {
+                self.home_icon_buttons(ui);
+                if web {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.account_button(ui));
                 }
             });
         });
+    }
+
+    fn home_search(&mut self, ui: &mut egui::Ui, width: f32) {
+        egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::border())).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+            ui.set_width(width - 22.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).size(16.0).color(theme::text_dim()));
+                ui.add(egui::TextEdit::singleline(&mut self.home.query).hint_text("Search all projects").frame(egui::Frame::NONE).desired_width(f32::INFINITY));
+            });
+        });
+    }
+
+    /// Sort key + direction.
+    fn home_sort(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::border())).corner_radius(8).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let cur = self.settings.home_sort;
+                ui.menu_button(format!("{}  {}", cur.label(), ph::CARET_DOWN), |ui| {
+                    for k in SortKey::ALL {
+                        if ui.selectable_label(k == cur, k.label()).clicked() {
+                            if k != cur {
+                                self.settings.home_sort = k;
+                                self.settings.home_ascending = k.default_ascending();
+                            }
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                let asc = self.settings.home_ascending;
+                let tip = match (self.settings.home_sort, asc) {
+                    (SortKey::Name, true) => "A to Z",
+                    (SortKey::Name, false) => "Z to A",
+                    (_, true) => "Oldest first",
+                    (_, false) => "Newest first",
+                };
+                if ui.add(egui::Button::new(egui::RichText::new(if asc { ph::ARROW_UP } else { ph::ARROW_DOWN }).size(16.0)).frame(false)).on_hover_text(tip).clicked() {
+                    self.settings.home_ascending = !asc;
+                }
+            });
+        });
+    }
+
+    fn home_view_toggle(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::border())).corner_radius(8).inner_margin(egui::Margin::symmetric(4, 3)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for v in HomeView::ALL {
+                    let sel = self.settings.home_view == v;
+                    let text = egui::RichText::new(v.icon()).size(18.0).color(if sel { theme::accent() } else { theme::text() });
+                    if ui.add(egui::Button::new(text).frame(false).selected(sel)).on_hover_text(v.label()).clicked() {
+                        self.settings.home_view = v;
+                    }
+                }
+            });
+        });
+    }
+
+    /// Open, Settings and About.
+    fn home_icon_buttons(&mut self, ui: &mut egui::Ui) {
+        for b in 0..3 {
+            let (icon, tip) = match b {
+                0 => (ph::FOLDER_OPEN, "Open .biocartoon files, or a backup .zip, as new projects"),
+                1 => (ph::GEAR, "Settings"),
+                _ => (ph::INFO, "About BioCartoon"),
+            };
+            if ui.add(egui::Button::new(egui::RichText::new(icon).size(18.0)).frame(false)).on_hover_text(tip).clicked() {
+                match b {
+                    0 => self.actions.push(Action::Open),
+                    1 => self.open_settings(crate::app::SettingsTab::General),
+                    _ => self.show_about = true,
+                }
+            }
+        }
     }
 
     /// Web: a reminder to download a backup while any project has changed since the last one.
@@ -281,32 +336,66 @@ impl BioCartoon {
         } else {
             "Projects live only in this browser, which may clear them if the device runs low on space."
         };
-        egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::accent())).corner_radius(8).inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
+        let message = format!("{what} changed since your last backup. {risk}");
+        // Narrow (a phone): the message on top, the buttons wrapping below it. Side by side, the
+        // buttons would leave the message no room and it would wrap a few letters to a line.
+        let narrow = ui.available_width() < 640.0;
+        let margin = if narrow { egui::Margin::symmetric(10, 10) } else { egui::Margin::symmetric(14, 10) };
+        egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::accent())).corner_radius(8).inner_margin(margin).show(ui, |ui| {
             ui.set_width(ui.available_width());
+            if narrow {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(ph::WARNING_CIRCLE).size(18.0).color(theme::accent()));
+                    ui.add(egui::Label::new(&message).wrap());
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    self.backup_banner_buttons(ui, now, false);
+                });
+                return;
+            }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(ph::WARNING_CIRCLE).size(18.0).color(theme::accent()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Remind me in a week").clicked() {
-                        self.settings.backup_snoozed_until = now + 7 * 24 * 3600 * 1000;
-                    }
-                    if ui.button(format!("{}  Keep them online", ph::CLOUD)).on_hover_text("Optional: sign in, and a copy of every project is kept on the BioCartoon server").clicked() {
-                        if let Some(id) = self.home.account_popup {
-                            egui::Popup::open_id(ui.ctx(), id);
-                        }
-                    }
+                    self.backup_banner_buttons(ui, now, true);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
+                        ui.label(message);
+                    });
+                });
+            });
+        });
+        ui.add_space(12.0);
+    }
+
+    /// The backup banner's buttons, in reading order ("Download a backup" first) or, for a
+    /// right-to-left row, reversed so that it still reads that way.
+    fn backup_banner_buttons(&mut self, ui: &mut egui::Ui, now: i64, rtl: bool) {
+        let order: [u8; 3] = if rtl { [2, 1, 0] } else { [0, 1, 2] };
+        for b in order {
+            match b {
+                0 => {
                     if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Download a backup", ph::DOWNLOAD_SIMPLE)).color(Color32::WHITE)).fill(theme::accent()))
                         .on_hover_text("Every project as a .biocartoon file, in one .zip. Open the .zip here to restore them.")
                         .clicked()
                     {
                         self.actions.push(Action::BackupAll);
                     }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
-                        ui.label(format!("{what} changed since your last backup. {risk}"));
-                    });
-                });
-            });
-        });
-        ui.add_space(12.0);
+                }
+                1 => {
+                    if ui.button(format!("{}  Keep them online", ph::CLOUD)).on_hover_text("Optional: sign in, and a copy of every project is kept on the BioCartoon server").clicked() {
+                        if let Some(id) = self.home.account_popup {
+                            egui::Popup::open_id(ui.ctx(), id);
+                        }
+                    }
+                }
+                _ => {
+                    if ui.button("Remind me in a week").clicked() {
+                        self.settings.backup_snoozed_until = now + 7 * 24 * 3600 * 1000;
+                    }
+                }
+            }
+        }
     }
 
     /// Web: the account button in the top right corner ("Sign in", or the sync status and name once

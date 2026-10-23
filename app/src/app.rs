@@ -2310,6 +2310,18 @@ impl BioCartoon {
         self.request_search();
     }
 
+    /// The Icons panel's search with nothing typed and no filters: from the logo in the top bar.
+    pub fn search_all(&mut self) {
+        self.settings.show_icons = true;
+        self.icons.mode = IconsMode::Search;
+        self.icons.query.clear();
+        self.icons.filter = SearchFilter::default();
+        self.icons.show_filters = false;
+        self.icons.results.clear();
+        self.icons.total = None;
+        self.request_search();
+    }
+
     /// Re-run whatever produced the current results (after the sort order changed).
     pub fn reload_results(&mut self) {
         if self.icons.mode == IconsMode::Search {
@@ -4782,9 +4794,12 @@ impl BioCartoon {
                     });
                     if ui.add(crate::logo(ui.ctx(), 22.0).sense(egui::Sense::click()))
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("All projects")
+                        .on_hover_text("Search icons")
                         .clicked()
                     {
+                        self.search_all();
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new(ph::HOUSE).size(16.0)).frame(false)).on_hover_text("All projects").clicked() {
                         self.actions.push(Action::GoHome);
                     }
                     ui.separator();
@@ -4821,10 +4836,12 @@ impl BioCartoon {
                 }
             });
             let right = ui.scope_builder(row(egui::Layout::right_to_left(egui::Align::Center), full), |ui| {
-                if ui.add(egui::Button::new(ph::CARET_RIGHT).frame(false)).clicked() && self.cur_slide + 1 < n { self.actions.push(Action::GoSlide(self.cur_slide + 1)); }
-                ui.label(format!("{}/{}", self.cur_slide + 1, n));
-                if ui.add(egui::Button::new(ph::CARET_LEFT).frame(false)).clicked() && self.cur_slide > 0 { self.actions.push(Action::GoSlide(self.cur_slide - 1)); }
-                if ui.add(egui::Button::new(format!("{}  Slides", ph::PRESENTATION)).selected(self.rail == Some(RailTab::Slides))).clicked() { self.actions.push(Action::SetRail(Some(RailTab::Slides))); }
+                // The pager is only worth its space once there is more than one slide.
+                if n > 1 {
+                    if ui.add(egui::Button::new(ph::CARET_RIGHT).frame(false)).clicked() && self.cur_slide + 1 < n { self.actions.push(Action::GoSlide(self.cur_slide + 1)); }
+                    ui.label(format!("{}/{}", self.cur_slide + 1, n));
+                    if ui.add(egui::Button::new(ph::CARET_LEFT).frame(false)).clicked() && self.cur_slide > 0 { self.actions.push(Action::GoSlide(self.cur_slide - 1)); }
+                }
             });
             // Zoom controls, centred in the window using their width from the previous frame, but
             // kept in the gap between the buttons on either side: on a narrow screen the slider

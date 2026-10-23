@@ -15,6 +15,8 @@
   <!-- The desktop download page (linked from the top bar) and the logo it shows. -->
   <link data-trunk rel="copy-file" href="download.html" />
   <link data-trunk rel="copy-file" href="assets/logo.svg" />
+  <!-- The text box fonts, which the web build fetches at startup (doc::load_fonts). -->
+  <link data-trunk rel="copy-dir" href="assets/fonts" />
   <link data-trunk rel="rust" data-bin="biocartoon-app" data-wasm-opt="z" />
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #f4f5f7; }

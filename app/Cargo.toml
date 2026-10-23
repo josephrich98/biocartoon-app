@@ -38,6 +38,8 @@ dirs = "6"
 chrono = "0.4"
 flate2 = "1"
 resvg = "0.45"
+# Which characters a font has, for the SVG export (the version resvg already uses).
+ttf-parser = "0.25"
 svg2pdf = "0.13"
 pdf-writer = "0.12"
 tiff = "0.11"
@@ -62,6 +64,8 @@ js-sys = "0.3"
 rusqlite = { version = "0.40", features = ["serialize"] }
 ehttp = "0.5"
 wasm-bindgen-futures = "0.4"
+# join_all, for fetching the fonts (doc::load_fonts).
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = ["Document", "Window", "Element", "HtmlCanvasElement", "HtmlInputElement", "HtmlAnchorElement", "FileList", "File", "Blob", "Url", "Crypto", "Navigator", "StorageManager", "Location", "History", "Event", "EventTarget", "BeforeUnloadEvent"] }
 

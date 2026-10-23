@@ -22,6 +22,7 @@ fn main() {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
     wasm_bindgen_futures::spawn_local(async {
         biocartoon::storage::init().await;
+        biocartoon::doc::load_fonts().await;
         let canvas = web_sys::window()
             .and_then(|w| w.document())
             .and_then(|d| d.get_element_by_id("biocartoon_canvas"))

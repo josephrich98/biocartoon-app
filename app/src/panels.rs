@@ -124,6 +124,11 @@ impl BioCartoon {
                         });
                     });
                 }
+                // The search box stays put above the results, so a new search is always at hand.
+                if self.icons.mode == IconsMode::Search {
+                    self.search_box(ui);
+                    ui.add_space(4.0);
+                }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(ui.available_width()).show(ui, |ui| self.icons_panel(ui));
             });
         });
@@ -522,8 +527,7 @@ impl BioCartoon {
                 });
             }
             IconsMode::Search => {
-                self.search_box(ui);
-                ui.add_space(4.0);
+                // The search box is above the scroll area, in `left_panel`.
                 if self.icons.show_filters {
                     self.filters_panel(ui);
                 } else if self.icons.filter.active() > 0 {
@@ -2356,12 +2360,23 @@ fn text_style_ui(
 ) -> bool {
     let mut changed = false;
     ui.label(egui::RichText::new("Text").strong());
-    let w = (ui.available_width() * 0.58).max(160.0);
+    // Each font's name is written in that font.
+    let px = egui::TextStyle::Body.resolve(ui.style()).size;
+    let in_font = |f: TextFont| egui::RichText::new(f.label()).font(f.font_id(px));
+    let text_w = |ui: &egui::Ui, t: egui::WidgetText| t.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x;
+    // The fields fill the column beside the labels, and are never narrower than the font
+    // dropdown needs for its longest name, so every row lines up with it.
+    let labels = ["Font", "Size", "Color", "Line spacing", "Horizontal align", "Vertical align", "List style", "Decoration"];
+    let label_w = labels.iter().map(|l| text_w(ui, (*l).into())).fold(0.0, f32::max);
+    let sp = ui.spacing();
+    let combo_extra = sp.icon_spacing + sp.icon_width + 2.0 * sp.button_padding.x;
+    let font_w = TextFont::ALL.iter().map(|f| text_w(ui, in_font(*f).into())).fold(0.0, f32::max) + combo_extra;
+    let w = (ui.available_width() - label_w - 8.0).max(font_w).max(160.0);
     egui::Grid::new("text_style").num_columns(2).spacing([8.0, 8.0]).show(ui, |ui| {
         ui.label("Font");
-        egui::ComboBox::from_id_salt("text_font").selected_text(font.label()).width(w - 8.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("text_font").selected_text(in_font(*font)).width(w).show_ui(ui, |ui| {
             for f in TextFont::ALL {
-                changed |= ui.selectable_value(font, f, f.label()).changed();
+                changed |= ui.selectable_value(font, f, in_font(f)).changed();
             }
         });
         ui.end_row();
@@ -2411,7 +2426,7 @@ fn text_style_ui(
 
         ui.label("Line spacing");
         let label = |v: f32| if v.fract() == 0.0 { format!("{v:.1}") } else { format!("{v}") };
-        egui::ComboBox::from_id_salt("text_spacing").selected_text(label(*line_spacing)).width(w - 8.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("text_spacing").selected_text(label(*line_spacing)).width(w).show_ui(ui, |ui| {
             for v in [1.0, 1.15, 1.5, 2.0] {
                 changed |= ui.selectable_value(line_spacing, v, label(v)).changed();
             }

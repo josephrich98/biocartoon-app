@@ -336,7 +336,8 @@ impl TextVAlign {
 }
 
 /// The typefaces a text box can use: the ones bundled with egui, plus free fonts embedded from
-/// `assets/fonts` (see [`TextFont::EMBEDDED`]).
+/// `assets/fonts` (see [`TextFont::EMBEDDED`]). New variants go at the end, so saved documents and
+/// scripts keep their meaning; the menu order is [`TextFont::ALL`].
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TextFont {
     #[default]
@@ -352,37 +353,158 @@ pub enum TextFont {
     SourceSerif,
     EbGaramond,
     ComicNeue,
+    Carlito,
+    Caladea,
+    Gelasio,
+    Inter,
+    SourceSans,
+    Poppins,
+    Nunito,
+    Raleway,
+    WorkSans,
+    IbmPlexSans,
+    DmSans,
+    Barlow,
+    Atkinson,
+    Lexend,
+    Quicksand,
+    Cabin,
+    JosefinSans,
+    Oswald,
+    RobotoCondensed,
+    BebasNeue,
+    Lora,
+    Playfair,
+    LibreBaskerville,
+    CrimsonText,
+    IbmPlexSerif,
+    RobotoSlab,
+    Arvo,
+    JetBrainsMono,
+    SourceCodePro,
+    IbmPlexMono,
+    RobotoMono,
+    CourierPrime,
+    PermanentMarker,
+    IndieFlower,
+    PatrickHand,
+    ShadowsIntoLight,
+    ArchitectsDaughter,
+}
+
+/// The broad kind of a typeface, for the fallbacks an exported SVG names after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontKind {
+    Sans,
+    Serif,
+    Mono,
+    Handwriting,
 }
 
 impl TextFont {
-    pub const ALL: [TextFont; 12] = [
-        TextFont::Sans,
+    /// Every font, in the menu's (alphabetical) order.
+    pub const ALL: [TextFont; 49] = [
+        TextFont::ArchitectsDaughter,
         TextFont::Arimo,
-        TextFont::Roboto,
-        TextFont::OpenSans,
-        TextFont::Lato,
-        TextFont::Montserrat,
-        TextFont::Tinos,
-        TextFont::SourceSerif,
-        TextFont::EbGaramond,
+        TextFont::Arvo,
+        TextFont::Atkinson,
+        TextFont::Barlow,
+        TextFont::BebasNeue,
+        TextFont::Cabin,
+        TextFont::Caladea,
+        TextFont::Carlito,
         TextFont::ComicNeue,
-        TextFont::Mono,
+        TextFont::CourierPrime,
         TextFont::Cousine,
+        TextFont::CrimsonText,
+        TextFont::DmSans,
+        TextFont::EbGaramond,
+        TextFont::Gelasio,
+        TextFont::Mono,
+        TextFont::IbmPlexMono,
+        TextFont::IbmPlexSans,
+        TextFont::IbmPlexSerif,
+        TextFont::IndieFlower,
+        TextFont::Inter,
+        TextFont::JetBrainsMono,
+        TextFont::JosefinSans,
+        TextFont::Lato,
+        TextFont::Lexend,
+        TextFont::LibreBaskerville,
+        TextFont::Lora,
+        TextFont::Montserrat,
+        TextFont::Nunito,
+        TextFont::OpenSans,
+        TextFont::Oswald,
+        TextFont::PatrickHand,
+        TextFont::PermanentMarker,
+        TextFont::Playfair,
+        TextFont::Poppins,
+        TextFont::Quicksand,
+        TextFont::Raleway,
+        TextFont::Roboto,
+        TextFont::RobotoCondensed,
+        TextFont::RobotoMono,
+        TextFont::RobotoSlab,
+        TextFont::ShadowsIntoLight,
+        TextFont::SourceCodePro,
+        TextFont::SourceSans,
+        TextFont::SourceSerif,
+        TextFont::Tinos,
+        TextFont::Sans,
+        TextFont::WorkSans,
     ];
 
-    /// The embedded fonts: (variant, family name, TTF bytes). The family name is both the egui
-    /// `FontFamily::Name` and the name in the font file, which the SVG export refers to.
-    pub const EMBEDDED: [(TextFont, &'static str, &'static [u8]); 10] = [
-        (TextFont::Arimo, "Arimo", include_bytes!("../assets/fonts/Arimo-Regular.ttf")),
-        (TextFont::Tinos, "Tinos", include_bytes!("../assets/fonts/Tinos-Regular.ttf")),
-        (TextFont::Cousine, "Cousine", include_bytes!("../assets/fonts/Cousine-Regular.ttf")),
-        (TextFont::Roboto, "Roboto", include_bytes!("../assets/fonts/Roboto-Regular.ttf")),
-        (TextFont::OpenSans, "Open Sans", include_bytes!("../assets/fonts/OpenSans-Regular.ttf")),
-        (TextFont::Lato, "Lato", include_bytes!("../assets/fonts/Lato-Regular.ttf")),
-        (TextFont::Montserrat, "Montserrat", include_bytes!("../assets/fonts/Montserrat-Regular.ttf")),
-        (TextFont::SourceSerif, "Source Serif 4", include_bytes!("../assets/fonts/SourceSerif4-Regular.ttf")),
-        (TextFont::EbGaramond, "EB Garamond", include_bytes!("../assets/fonts/EBGaramond-Regular.ttf")),
-        (TextFont::ComicNeue, "Comic Neue", include_bytes!("../assets/fonts/ComicNeue-Regular.ttf")),
+    /// The embedded fonts: (variant, family name, kind, file). The family name is both the
+    /// egui `FontFamily::Name` and the name in the font file, which the SVG export refers to.
+    pub const EMBEDDED: [(TextFont, &'static str, FontKind, FontFile); 47] = [
+        (TextFont::Arimo, "Arimo", FontKind::Sans, ttf!("Arimo-Regular.ttf")),
+        (TextFont::Tinos, "Tinos", FontKind::Serif, ttf!("Tinos-Regular.ttf")),
+        (TextFont::Cousine, "Cousine", FontKind::Mono, ttf!("Cousine-Regular.ttf")),
+        (TextFont::Roboto, "Roboto", FontKind::Sans, ttf!("Roboto-Regular.ttf")),
+        (TextFont::OpenSans, "Open Sans", FontKind::Sans, ttf!("OpenSans-Regular.ttf")),
+        (TextFont::Lato, "Lato", FontKind::Sans, ttf!("Lato-Regular.ttf")),
+        (TextFont::Montserrat, "Montserrat", FontKind::Sans, ttf!("Montserrat-Regular.ttf")),
+        (TextFont::SourceSerif, "Source Serif 4", FontKind::Serif, ttf!("SourceSerif4-Regular.ttf")),
+        (TextFont::EbGaramond, "EB Garamond", FontKind::Serif, ttf!("EBGaramond-Regular.ttf")),
+        (TextFont::ComicNeue, "Comic Neue", FontKind::Handwriting, ttf!("ComicNeue-Regular.ttf")),
+        (TextFont::Carlito, "Carlito", FontKind::Sans, ttf!("Carlito-Regular.ttf")),
+        (TextFont::Caladea, "Caladea", FontKind::Serif, ttf!("Caladea-Regular.ttf")),
+        (TextFont::Gelasio, "Gelasio", FontKind::Serif, ttf!("Gelasio-Regular.ttf")),
+        (TextFont::Inter, "Inter", FontKind::Sans, ttf!("Inter-Regular.ttf")),
+        (TextFont::SourceSans, "Source Sans 3", FontKind::Sans, ttf!("SourceSans3-Regular.ttf")),
+        (TextFont::Poppins, "Poppins", FontKind::Sans, ttf!("Poppins-Regular.ttf")),
+        (TextFont::Nunito, "Nunito", FontKind::Sans, ttf!("Nunito-Regular.ttf")),
+        (TextFont::Raleway, "Raleway", FontKind::Sans, ttf!("Raleway-Regular.ttf")),
+        (TextFont::WorkSans, "Work Sans", FontKind::Sans, ttf!("WorkSans-Regular.ttf")),
+        (TextFont::IbmPlexSans, "IBM Plex Sans", FontKind::Sans, ttf!("IBMPlexSans-Regular.ttf")),
+        (TextFont::DmSans, "DM Sans", FontKind::Sans, ttf!("DMSans-Regular.ttf")),
+        (TextFont::Barlow, "Barlow", FontKind::Sans, ttf!("Barlow-Regular.ttf")),
+        (TextFont::Atkinson, "Atkinson Hyperlegible", FontKind::Sans, ttf!("AtkinsonHyperlegible-Regular.ttf")),
+        (TextFont::Lexend, "Lexend", FontKind::Sans, ttf!("Lexend-Regular.ttf")),
+        (TextFont::Quicksand, "Quicksand", FontKind::Sans, ttf!("Quicksand-Regular.ttf")),
+        (TextFont::Cabin, "Cabin", FontKind::Sans, ttf!("Cabin-Regular.ttf")),
+        (TextFont::JosefinSans, "Josefin Sans", FontKind::Sans, ttf!("JosefinSans-Regular.ttf")),
+        (TextFont::Oswald, "Oswald", FontKind::Sans, ttf!("Oswald-Regular.ttf")),
+        (TextFont::RobotoCondensed, "Roboto Condensed", FontKind::Sans, ttf!("RobotoCondensed-Regular.ttf")),
+        (TextFont::BebasNeue, "Bebas Neue", FontKind::Sans, ttf!("BebasNeue-Regular.ttf")),
+        (TextFont::Lora, "Lora", FontKind::Serif, ttf!("Lora-Regular.ttf")),
+        (TextFont::Playfair, "Playfair Display", FontKind::Serif, ttf!("PlayfairDisplay-Regular.ttf")),
+        (TextFont::LibreBaskerville, "Libre Baskerville", FontKind::Serif, ttf!("LibreBaskerville-Regular.ttf")),
+        (TextFont::CrimsonText, "Crimson Text", FontKind::Serif, ttf!("CrimsonText-Regular.ttf")),
+        (TextFont::IbmPlexSerif, "IBM Plex Serif", FontKind::Serif, ttf!("IBMPlexSerif-Regular.ttf")),
+        (TextFont::RobotoSlab, "Roboto Slab", FontKind::Serif, ttf!("RobotoSlab-Regular.ttf")),
+        (TextFont::Arvo, "Arvo", FontKind::Serif, ttf!("Arvo-Regular.ttf")),
+        (TextFont::JetBrainsMono, "JetBrains Mono", FontKind::Mono, ttf!("JetBrainsMono-Regular.ttf")),
+        (TextFont::SourceCodePro, "Source Code Pro", FontKind::Mono, ttf!("SourceCodePro-Regular.ttf")),
+        (TextFont::IbmPlexMono, "IBM Plex Mono", FontKind::Mono, ttf!("IBMPlexMono-Regular.ttf")),
+        (TextFont::RobotoMono, "Roboto Mono", FontKind::Mono, ttf!("RobotoMono-Regular.ttf")),
+        (TextFont::CourierPrime, "Courier Prime", FontKind::Mono, ttf!("CourierPrime-Regular.ttf")),
+        (TextFont::PermanentMarker, "Permanent Marker", FontKind::Handwriting, ttf!("PermanentMarker-Regular.ttf")),
+        (TextFont::IndieFlower, "Indie Flower", FontKind::Handwriting, ttf!("IndieFlower-Regular.ttf")),
+        (TextFont::PatrickHand, "Patrick Hand", FontKind::Handwriting, ttf!("PatrickHand-Regular.ttf")),
+        (TextFont::ShadowsIntoLight, "Shadows Into Light", FontKind::Handwriting, ttf!("ShadowsIntoLight-Regular.ttf")),
+        (TextFont::ArchitectsDaughter, "Architects Daughter", FontKind::Handwriting, ttf!("ArchitectsDaughter-Regular.ttf")),
     ];
 
     pub fn label(self) -> &'static str {
@@ -392,19 +514,26 @@ impl TextFont {
             TextFont::Arimo => "Arimo (Arial / Helvetica)",
             TextFont::Tinos => "Tinos (Times New Roman)",
             TextFont::Cousine => "Cousine (Courier New)",
-            TextFont::Roboto => "Roboto",
-            TextFont::OpenSans => "Open Sans",
-            TextFont::Lato => "Lato",
-            TextFont::Montserrat => "Montserrat",
             TextFont::SourceSerif => "Source Serif",
-            TextFont::EbGaramond => "EB Garamond",
-            TextFont::ComicNeue => "Comic Neue",
+            TextFont::Carlito => "Carlito (Calibri)",
+            TextFont::Caladea => "Caladea (Cambria)",
+            TextFont::Gelasio => "Gelasio (Georgia)",
+            TextFont::SourceSans => "Source Sans",
+            f => f.embedded_name().unwrap_or_default(),
+        }
+    }
+
+    pub fn kind(self) -> FontKind {
+        match self {
+            TextFont::Sans => FontKind::Sans,
+            TextFont::Mono => FontKind::Mono,
+            f => Self::EMBEDDED.iter().find(|(e, ..)| *e == f).map_or(FontKind::Sans, |(_, _, k, _)| *k),
         }
     }
 
     /// The embedded font's family name, or `None` for egui's own two.
     pub fn embedded_name(self) -> Option<&'static str> {
-        Self::EMBEDDED.iter().find(|(f, ..)| *f == self).map(|(_, name, _)| *name)
+        Self::EMBEDDED.iter().find(|(f, ..)| *f == self).map(|(_, name, ..)| *name)
     }
 
     pub fn font_id(self, px: f32) -> egui::FontId {
@@ -415,17 +544,77 @@ impl TextFont {
         }
     }
 
+    /// The embedded font's TTF bytes; `None` for egui's own two, and on the web for a font
+    /// [`load_fonts`] couldn't fetch.
+    pub fn bytes(self) -> Option<&'static [u8]> {
+        let i = Self::EMBEDDED.iter().position(|(f, ..)| *f == self)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let bytes = Some(Self::EMBEDDED[i].3.bytes);
+        #[cfg(target_arch = "wasm32")]
+        let bytes = LOADED.get().and_then(|l| l.get(i)).map(|b| b.as_slice());
+        bytes.filter(|b| !b.is_empty())
+    }
+
     /// Adds the embedded fonts to `defs`, each falling back to egui's proportional fonts for
-    /// glyphs it lacks. Every context that lays out text items needs this.
+    /// glyphs it lacks. Every context that lays out text items needs this. A font that is
+    /// missing (on the web, one that failed to load) still gets its family, of the fallbacks
+    /// alone, since egui panics on an unknown family.
     pub fn install(defs: &mut egui::FontDefinitions) {
         let fallback = defs.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
-        for (_, name, bytes) in Self::EMBEDDED {
-            defs.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
-            let mut chain = vec![name.to_string()];
+        for (f, name, ..) in Self::EMBEDDED {
+            let mut chain = Vec::new();
+            if let Some(bytes) = f.bytes() {
+                defs.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
+                chain.push(name.to_string());
+            }
             chain.extend(fallback.iter().cloned());
             defs.families.insert(egui::FontFamily::Name(name.into()), chain);
         }
     }
+}
+
+/// A font file in `assets/fonts`. The desktop build compiles it in; the web build fetches it at
+/// startup ([`load_fonts`]) from the copy index.html puts in `dist/fonts`, which keeps the .wasm
+/// under the 25 MiB Cloudflare serves.
+pub struct FontFile {
+    pub file: &'static str,
+    #[cfg(not(target_arch = "wasm32"))]
+    bytes: &'static [u8],
+}
+
+macro_rules! ttf {
+    ($file:literal) => {
+        FontFile {
+            file: $file,
+            #[cfg(not(target_arch = "wasm32"))]
+            bytes: include_bytes!(concat!("../assets/fonts/", $file)),
+        }
+    };
+}
+use ttf;
+
+/// The fetched font files, in [`TextFont::EMBEDDED`]'s order; empty for one that failed.
+#[cfg(target_arch = "wasm32")]
+static LOADED: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// Fetches the embedded fonts (all at once). The web build awaits this before starting the app,
+/// so the canvas and the exporter see them from the first frame.
+#[cfg(target_arch = "wasm32")]
+pub async fn load_fonts() {
+    let fetches = TextFont::EMBEDDED.iter().map(|(.., file)| async move {
+        match ehttp::fetch_async(ehttp::Request::get(format!("fonts/{}", file.file))).await {
+            Ok(r) if r.ok => r.bytes,
+            Ok(r) => {
+                log::warn!("font {}: HTTP {}", file.file, r.status);
+                Vec::new()
+            }
+            Err(e) => {
+                log::warn!("font {}: {e}", file.file);
+                Vec::new()
+            }
+        }
+    });
+    let _ = LOADED.set(futures_util::future::join_all(fetches).await);
 }
 
 fn one() -> f32 {
@@ -813,6 +1002,15 @@ fn fit_axis(min: f32, len: f32, c0: f32, c1: f32, flip: bool, art: f32, d0: f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Font menu is alphabetical and offers every font once.
+    #[test]
+    fn font_menu_is_alphabetical_and_complete() {
+        let labels: Vec<String> = TextFont::ALL.iter().map(|f| f.label().to_lowercase()).collect();
+        assert!(labels.windows(2).all(|w| w[0] < w[1]), "{labels:?}");
+        assert_eq!(TextFont::ALL.len(), TextFont::EMBEDDED.len() + 2);
+        assert!(TextFont::EMBEDDED.iter().all(|(f, ..)| TextFont::ALL.contains(f)));
+    }
 
     fn image_item(pos: Pos2, size: Vec2, crop: [f32; 4]) -> Item {
         Item::new(1, "i", ItemKind::Image { source: ImageSource::file("a.svg".into()), crop, overlay: [0; 4] }, pos, size)

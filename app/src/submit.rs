@@ -62,7 +62,7 @@ pub fn submit(url: &str, parts: &[Part]) -> Result<String, String> {
 }
 
 /// Kinds of idea the "Submit an idea" form offers: (value sent, label).
-pub const IDEA_KINDS: [(&str, &str); 3] = [("icon", "Icon"), ("template", "Template"), ("other", "Something else")];
+pub const IDEA_KINDS: [(&str, &str); 3] = [("icon", "Icon"), ("template", "Template"), ("other", "Other")];
 
 /// An idea for the BioCartoon team (an icon or template the library lacks, or anything else),
 /// sent to `<url>/suggest`.

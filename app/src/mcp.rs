@@ -18,6 +18,24 @@ top-left corner. canvas_state gives the page size and every item on the current 
 fn ids_prop() -> Value {
     json!({"type": "array", "items": {"type": "integer"}, "description": "Item ids (from canvas_state)."})
 }
+/// The `font` property's help: each font's snake_case name and its menu label.
+fn font_help() -> String {
+    let names: Vec<String> = crate::doc::TextFont::ALL
+        .iter()
+        .map(|f| {
+            let mut snake = String::new();
+            for (i, c) in format!("{f:?}").chars().enumerate() {
+                if c.is_uppercase() && i > 0 {
+                    snake.push('_');
+                }
+                snake.push(c.to_ascii_lowercase());
+            }
+            format!("{snake} ({})", f.label())
+        })
+        .collect();
+    format!("Text: one of {}.", names.join(", "))
+}
+
 fn color_prop(desc: &str) -> Value {
     json!({"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 3, "maxItems": 4, "description": format!("{desc} as [r, g, b] or [r, g, b, a], 0-255.")})
 }
@@ -57,7 +75,7 @@ fn style_props() -> Map<String, Value> {
         "bold": bool_prop("Text: bold."),
         "italic": bool_prop("Text: italic."),
         "underline": bool_prop("Text: underlined."),
-        "font": str_prop("Text: sans (Ubuntu), mono (Hack), arimo (Arial-like), tinos (Times-like), cousine (Courier-like), roboto, open_sans, lato, montserrat, source_serif, eb_garamond or comic_neue."),
+        "font": str_prop(&font_help()),
         "line_spacing": num_prop("Text: multiple of the natural line height (1, 1.15, 1.5, 2...)."),
         "align": str_prop("Text: left, center, right or justify."),
         "valign": str_prop("Text: where the text sits in its box: top, middle or bottom."),

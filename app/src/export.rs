@@ -6,7 +6,7 @@
 
 use crate::assets::{fetch, Request};
 use crate::canvas::{corners, head_geom, line_paths, shape_polygons, HeadGeom};
-use crate::doc::{Item, ItemKind, Slide, TextAlign, TextFont, DPI};
+use crate::doc::{FontKind, Item, ItemKind, Slide, TextAlign, TextFont, DPI};
 use base64::Engine;
 use egui::{Color32, FontId, Pos2, Rect, Vec2};
 use image::RgbaImage;
@@ -445,9 +445,64 @@ fn text_rows(out: &mut String, ctx: &egui::Context, text: &str, size: f32, wrap:
     }
 }
 
+/// Whether `font`'s face has a glyph for each of `s`'s characters. Always true for Ubuntu, whose
+/// fallbacks are the renderer's own.
+fn covered(font: TextFont, s: &str) -> Vec<bool> {
+    let all = vec![true; s.chars().count()];
+    let family = match font {
+        TextFont::Sans => return all,
+        TextFont::Mono => "Hack",
+        f => f.embedded_name().unwrap_or_default(),
+    };
+    let db = &fonts().db;
+    let Some(id) = db.query(&fontdb::Query { families: &[fontdb::Family::Name(family)], ..Default::default() }) else { return all };
+    db.with_face_data(id, |data, index| {
+        let face = ttf_parser::Face::parse(data, index).ok()?;
+        Some(s.chars().map(|c| face.glyph_index(c).is_some()).collect())
+    })
+    .flatten()
+    .unwrap_or(all)
+}
+
+/// A row's text for its `<text>`, with runs of characters the item's font lacks (Greek in
+/// many of the bundled fonts, say) in a `<tspan>` of Ubuntu. resvg shapes a whole text chunk
+/// with one font and, when that font lacks a character, redraws the chunk in a fallback that has
+/// them all, unlike the canvas, which falls back glyph by glyph; so every run after the first
+/// starts a chunk of its own, at the x (`xs`, one per character) where egui put it.
+fn row_markup(font: TextFont, s: &str, xs: &[f32]) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    let mut run_x = None;
+    let mut run_missing = false;
+    let mut flush = |run: &mut String, x: Option<f32>, missing: bool| {
+        if run.is_empty() {
+            return;
+        }
+        let x = x.map(|x| format!(r#" x="{}""#, n(x))).unwrap_or_default();
+        let family = if missing { format!(r#" font-family="{}""#, esc(&font_family())) } else { String::new() };
+        if x.is_empty() && family.is_empty() {
+            out.push_str(&esc(run));
+        } else {
+            let _ = write!(out, "<tspan{x}{family}>{}</tspan>", esc(run));
+        }
+        run.clear();
+    };
+    for (i, (c, ok)) in s.chars().zip(covered(font, s)).enumerate() {
+        let missing = !ok && !c.is_whitespace();
+        if missing != run_missing && !run.is_empty() {
+            flush(&mut run, run_x, run_missing);
+            run_x = xs.get(i).copied();
+        }
+        run_missing = missing;
+        run.push(c);
+    }
+    flush(&mut run, run_x, run_missing);
+    out
+}
+
 /// A text item's rows, laid out as the canvas lays them out, one `<text>` each.
 fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item) {
-    let ItemKind::Text { text, italic, align, .. } = &it.kind else { return };
+    let ItemKind::Text { text, italic, align, font, .. } = &it.kind else { return };
     let r = it.rect();
     let job = crate::canvas::text_job(ctx, text, &it.kind, 1.0, r.width(), Color32::WHITE);
     let galley = ctx.fonts_mut(|f| f.layout_job(job));
@@ -457,6 +512,7 @@ fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item) {
         let row = &prow.row;
         let (Some(g0), Some(g1)) = (row.glyphs.first(), row.glyphs.last()) else { continue };
         let s: String = row.glyphs.iter().map(|g| g.chr).collect();
+        let xs: Vec<f32> = row.glyphs.iter().map(|g| o.x + prow.pos.x + g.pos.x).collect();
         let x = o.x + prow.pos.x + g0.pos.x;
         let y = o.y + prow.pos.y + g0.pos.y;
         // Justified rows are stretched to the box, as egui stretches them.
@@ -467,7 +523,7 @@ fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item) {
         };
         // Slant rather than font-style="italic": the bundled font has no italic face.
         let slant = if *italic { format!(r#" transform="translate({} {}) skewX(-12) translate({} {})""#, n(x), n(y), n(-x), n(-y)) } else { String::new() };
-        let _ = writeln!(out, r#"<text x="{}" y="{}"{fit}{slant}>{}</text>"#, n(x), n(y), esc(&s));
+        let _ = writeln!(out, r#"<text x="{}" y="{}"{fit}{slant}>{}</text>"#, n(x), n(y), row_markup(*font, &s, &xs));
     }
 }
 
@@ -632,8 +688,18 @@ pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<
                     TextFont::Mono => "Hack, Menlo, Consolas, monospace".into(),
                     TextFont::Tinos => "Tinos, 'Times New Roman', Times, serif".into(),
                     TextFont::Cousine => "Cousine, 'Courier New', Courier, monospace".into(),
-                    TextFont::SourceSerif | TextFont::EbGaramond => format!("'{}', Georgia, serif", font.embedded_name().unwrap_or_default()),
-                    f => format!("'{}', {family}", f.embedded_name().unwrap_or_default()),
+                    TextFont::Carlito => format!("Carlito, Calibri, {family}"),
+                    TextFont::Caladea => "Caladea, Cambria, Georgia, serif".into(),
+                    TextFont::Gelasio => "Gelasio, Georgia, serif".into(),
+                    f => {
+                        let name = f.embedded_name().unwrap_or_default();
+                        match f.kind() {
+                            FontKind::Sans => format!("'{name}', {family}"),
+                            FontKind::Serif => format!("'{name}', Georgia, serif"),
+                            FontKind::Mono => format!("'{name}', Menlo, Consolas, monospace"),
+                            FontKind::Handwriting => format!("'{name}', cursive"),
+                        }
+                    }
                 };
                 let _ = writeln!(
                     s,
@@ -792,7 +858,7 @@ fn fonts() -> &'static Fonts {
                 }
             }
         }
-        for (_, _, bytes) in TextFont::EMBEDDED {
+        for bytes in TextFont::EMBEDDED.iter().filter_map(|(f, ..)| f.bytes()) {
             db.load_font_source(fontdb::Source::Binary(Arc::new(bytes.to_vec())));
         }
         alias_core_fonts(&mut db);
@@ -806,7 +872,15 @@ fn fonts() -> &'static Fonts {
 /// build has no system fonts, so without this such text matches no face and is dropped.
 fn alias_core_fonts(db: &mut fontdb::Database) {
     let has = |db: &fontdb::Database, name: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
-    for (bundled, aliases) in [("Arimo", ["Arial", "Helvetica"]), ("Tinos", ["Times New Roman", "Times"]), ("Cousine", ["Courier New", "Courier"])] {
+    let pairs: [(&str, &[&str]); 6] = [
+        ("Arimo", &["Arial", "Helvetica"]),
+        ("Tinos", &["Times New Roman", "Times"]),
+        ("Cousine", &["Courier New", "Courier"]),
+        ("Carlito", &["Calibri"]),
+        ("Caladea", &["Cambria"]),
+        ("Gelasio", &["Georgia"]),
+    ];
+    for (bundled, aliases) in pairs {
         let Some(face) = db.faces().find(|f| f.families.iter().any(|(n, _)| n == bundled)).cloned() else { continue };
         for alias in aliases {
             if !has(db, alias) {
@@ -1087,11 +1161,21 @@ mod tests {
     use super::*;
     use crate::doc::{ImageSource, ShapeKind};
 
+    /// Characters a text item's font lacks get a fallback `<tspan>` of their own, so the rest of
+    /// the row keeps its font.
+    #[test]
+    fn missing_glyphs_fall_back_alone() {
+        let xs: Vec<f32> = (0..7).map(|i| i as f32 * 10.0).collect();
+        assert_eq!(row_markup(TextFont::Lato, "β-sheet", &xs), format!(r#"<tspan font-family="{}">β</tspan><tspan x="10">-sheet</tspan>"#, esc(&font_family())));
+        assert_eq!(row_markup(TextFont::Lato, "a < b", &xs), "a &lt; b");
+        assert_eq!(row_markup(TextFont::Sans, "β-sheet", &xs), "β-sheet");
+    }
+
     /// With only the bundled fonts (as on the web), text naming Arial still renders, via Arimo.
     #[test]
     fn core_font_names_resolve_without_system_fonts() {
         let mut db = fontdb::Database::new();
-        for (_, _, bytes) in TextFont::EMBEDDED {
+        for bytes in TextFont::EMBEDDED.iter().filter_map(|(f, ..)| f.bytes()) {
             db.load_font_source(fontdb::Source::Binary(Arc::new(bytes.to_vec())));
         }
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><text font-family="Arial" font-size="12" font-weight="bold" x="8" y="16">THF</text></svg>"#;
