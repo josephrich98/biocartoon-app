@@ -479,7 +479,7 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
     let z = xf.zoom;
     let op = it.opacity.clamp(0.0, 1.0);
     match &it.kind {
-        ItemKind::Image { source, crop, overlay } => {
+        ItemKind::Image { source, crop, overlay, layers } => {
             let rs = xf.rect(it.rect());
             let key = source.cache_key();
             let state = match source {
@@ -494,6 +494,8 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
             };
             match state {
                 Ok(base) => {
+                    // Restyled layers are a drawing of their own, with its own renderings.
+                    let (key, base) = images.restyled(&key, layers).unwrap_or((key, base));
                     let (mut u0, mut u1) = (crop[0], crop[2]);
                     let (mut v0, mut v1) = (crop[1], crop[3]);
                     if it.flip_h {

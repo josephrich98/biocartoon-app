@@ -6,7 +6,7 @@
 
 use crate::assets::{fetch, Request};
 use crate::canvas::{corners, head_geom, line_paths, shape_polygons, HeadGeom};
-use crate::doc::{FontKind, Item, ItemKind, Slide, TextAlign, TextFont, DPI};
+use crate::doc::{FontKind, Item, ItemKind, LayerStyle, Slide, TextAlign, TextFont, DPI};
 use base64::Engine;
 use egui::{Color32, FontId, Pos2, Rect, Vec2};
 use image::RgbaImage;
@@ -658,11 +658,12 @@ pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<
         let r = it.rect();
         let c = r.center();
         match &it.kind {
-            ItemKind::Image { source, crop, overlay } => {
+            ItemKind::Image { source, crop, overlay, layers } => {
                 let png = match images.get(&source.cache_key()) {
                     Some(Picture::Vector(vector)) => {
                         clip_id += 1;
-                        vector_image(&mut s, vector, it, *crop, *overlay, &format!("svg{clip_id}"));
+                        let restyled = vector.restyled(layers);
+                        vector_image(&mut s, restyled.as_ref().unwrap_or(vector), it, *crop, *overlay, &format!("svg{clip_id}"));
                         continue;
                     }
                     Some(Picture::Pixels(img)) => prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v),
@@ -928,6 +929,8 @@ pub struct Vector {
     tree: usvg::Tree,
     /// The drawing's box on the artboard, in the file's user units.
     content: Rect,
+    /// The colours it paints with, most used first (see [`Vector::colors`]).
+    colors: Vec<[u8; 3]>,
 }
 
 impl Vector {
@@ -935,7 +938,33 @@ impl Vector {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let tree = usvg::Tree::from_data(bytes, &svg_options()).map_err(|e| format!("svg: {e}"))?;
         let content = content_rect(&tree);
-        Ok(Self { tree, content })
+        let colors = paint_colors(&tree);
+        Ok(Self { tree, content, colors })
+    }
+
+    /// The flat colours its shapes are filled and stroked with (gradient stops included), most
+    /// used first by the area of the shapes painted with them: the layers an image offers when
+    /// the catalog names none.
+    pub fn colors(&self) -> &[[u8; 3]] {
+        &self.colors
+    }
+
+    /// The drawing with `layers` restyled: every fill, stroke and gradient stop in one of a
+    /// layer's colours painted in its colour and opacity instead. `None` when no layer changes
+    /// anything (or the restyled file fails to parse). Keeps the drawing's box, so a layer faded
+    /// out does not resize the image.
+    pub fn restyled(&self, layers: &[LayerStyle]) -> Option<Vector> {
+        if layers.iter().all(LayerStyle::is_plain) {
+            return None;
+        }
+        let xml = restyle_xml(&self.tree.to_string(&usvg::WriteOptions::default()), layers);
+        match parse(&xml) {
+            Ok(tree) => Some(Self { tree, content: self.content, colors: self.colors.clone() }),
+            Err(e) => {
+                log::warn!("restyled {e}");
+                None
+            }
+        }
     }
 
     /// The file's own size (its artboard), in user units.
@@ -965,6 +994,113 @@ impl Vector {
         resvg::render(&self.tree, resvg::tiny_skia::Transform::from_scale(s, s).pre_translate(-c.min.x, -c.min.y), &mut pixmap.as_mut());
         pixmap_rgba(&pixmap)
     }
+}
+
+/// See [`Vector::colors`].
+fn paint_colors(tree: &usvg::Tree) -> Vec<[u8; 3]> {
+    fn rgb(c: usvg::Color) -> [u8; 3] {
+        [c.red, c.green, c.blue]
+    }
+    fn add(paint: &usvg::Paint, area: f32, out: &mut Vec<([u8; 3], f32)>) {
+        let mut one = |c: [u8; 3], a: f32| match out.iter_mut().find(|(o, _)| *o == c) {
+            Some((_, w)) => *w += a,
+            None => out.push((c, a)),
+        };
+        match paint {
+            usvg::Paint::Color(c) => one(rgb(*c), area),
+            usvg::Paint::LinearGradient(g) => g.stops().iter().for_each(|s| one(rgb(s.color()), area / g.stops().len() as f32)),
+            usvg::Paint::RadialGradient(g) => g.stops().iter().for_each(|s| one(rgb(s.color()), area / g.stops().len() as f32)),
+            usvg::Paint::Pattern(_) => {}
+        }
+    }
+    fn walk(g: &usvg::Group, out: &mut Vec<([u8; 3], f32)>) {
+        for node in g.children() {
+            match node {
+                usvg::Node::Group(g) => walk(g, out),
+                usvg::Node::Text(t) => walk(t.flattened(), out),
+                usvg::Node::Path(p) if p.is_visible() => {
+                    let b = p.abs_bounding_box();
+                    let area = b.width() * b.height();
+                    if let Some(f) = p.fill() {
+                        add(f.paint(), area, out);
+                    }
+                    // A stroke covers a band along the outline, not the box: count it lightly.
+                    if let Some(s) = p.stroke() {
+                        add(s.paint(), area * 0.1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree.root(), &mut out);
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    out.into_iter().map(|(c, _)| c).collect()
+}
+
+/// [`Vector::restyled`]'s rewrite of a file as usvg writes it, which states every paint as an
+/// attribute (`fill="#rrggbb"`, `fill-opacity`, and so on) on each element that uses it.
+fn restyle_xml(xml: &str, layers: &[LayerStyle]) -> String {
+    const PAINTS: [(&str, &str); 3] = [("fill", "fill-opacity"), ("stroke", "stroke-opacity"), ("stop-color", "stop-opacity")];
+    let hex = |v: &str| -> Option<[u8; 3]> {
+        let h = v.strip_prefix('#').filter(|h| h.len() == 6)?;
+        let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+        Some([b(0)?, b(2)?, b(4)?])
+    };
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        rest = &rest[lt..];
+        let Some(gt) = rest.find('>') else { break };
+        let (tag, after) = (&rest[..=gt], &rest[gt + 1..]);
+        rest = after;
+        if tag.starts_with("</") || tag.starts_with("<?") || tag.starts_with("<!") {
+            out.push_str(tag);
+            continue;
+        }
+        // `<name a="v" ...>` or `.../>`: usvg quotes every value with `"` and escapes any inside.
+        let body = tag[1..tag.len() - 1].trim_end_matches('/');
+        let close = &tag[1 + body.len()..];
+        let name_end = body.find(char::is_whitespace).unwrap_or(body.len());
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        let mut a = &body[name_end..];
+        while let Some(eq) = a.find("=\"") {
+            let key = a[..eq].trim().to_string();
+            let Some(end) = a[eq + 2..].find('"') else { break };
+            attrs.push((key, a[eq + 2..eq + 2 + end].to_string()));
+            a = &a[eq + 2 + end + 1..];
+        }
+        let mut changed = false;
+        for (paint, opacity) in PAINTS {
+            let Some(i) = attrs.iter().position(|(k, _)| k == paint) else { continue };
+            let Some(layer) = hex(&attrs[i].1).and_then(|c| layers.iter().find(|l| l.colors.contains(&c))) else { continue };
+            if let Some([r, g, b]) = layer.color {
+                attrs[i].1 = format!("#{r:02x}{g:02x}{b:02x}");
+            }
+            if layer.opacity < 1.0 {
+                let o = layer.opacity.clamp(0.0, 1.0);
+                match attrs.iter_mut().find(|(k, _)| k == opacity) {
+                    Some((_, v)) => *v = n(v.parse::<f32>().unwrap_or(1.0) * o),
+                    None => attrs.push((opacity.to_string(), n(o))),
+                }
+            }
+            changed = true;
+        }
+        if !changed {
+            out.push_str(tag);
+            continue;
+        }
+        out.push('<');
+        out.push_str(&body[..name_end]);
+        for (k, v) in &attrs {
+            let _ = write!(out, r#" {k}="{v}""#);
+        }
+        out.push_str(close);
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The box of everything visible on an SVG's artboard, from a rendering of it `TRIM_SIDE` pixels
@@ -1221,7 +1357,7 @@ mod tests {
 
         let source = ImageSource::file("padded.svg".into());
         let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
-        let kind = ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4] };
+        let kind = ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() };
         let old = Item::new(1, "old", kind.clone(), Pos2::ZERO, Vec2::splat(200.0));
         let mut new = Item::new(2, "new", kind, Pos2::new(300.0, 0.0), Vec2::new(200.0, 100.0));
         new.fitted = true;
@@ -1238,7 +1374,7 @@ mod tests {
         let file = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><defs><linearGradient id="g"><stop stop-color="#00f"/><stop offset="1" stop-color="#00f" stop-opacity="0.999"/></linearGradient></defs><rect width="100" height="100" fill="#fff"/><rect x="100" width="100" height="100" fill="url(#g)"/></svg>"##;
         let source = ImageSource::file("upload.svg".into());
         let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
-        let image = |id, crop, overlay, pos: Pos2, size: Vec2| Item::new(id, "Upload", ItemKind::Image { source: source.clone(), crop, overlay }, pos, size);
+        let image = |id, crop, overlay, pos: Pos2, size: Vec2| Item::new(id, "Upload", ItemKind::Image { source: source.clone(), crop, overlay, layers: Vec::new() }, pos, size);
         let cropped = image(1, [0.5, 0.0, 1.0, 1.0], [0; 4], Pos2::new(0.0, 0.0), Vec2::splat(100.0));
         let mut flipped = image(2, [0.0, 0.0, 1.0, 1.0], [0; 4], Pos2::new(200.0, 0.0), Vec2::new(200.0, 100.0));
         flipped.flip_h = true;
@@ -1265,6 +1401,37 @@ mod tests {
         assert!(!pdf.windows(13).any(|w| w == b"/Subtype /Ima" || w == b"/Subtype/Imag"), "PDF should be vector only");
     }
 
+    /// A drawing's colours are its layers: found through CSS classes as BioArt paints, most used
+    /// first, and restyled one at a time on the canvas's vector form and in exports.
+    #[test]
+    fn layers_recolor_and_fade() {
+        // A flask: pink liquid filling most of it, a white glass band and a dark outline.
+        let file = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><style>.liquid{fill:#f49dc0}.glass{fill:#fff;stroke:#303030;stroke-width:2}</style>
+            <rect class="glass" x="0" y="0" width="100" height="20"/><rect class="liquid" x="0" y="20" width="100" height="80"/></svg>"##;
+        let v = Vector::parse(file).unwrap();
+        assert_eq!(v.colors(), [[0xf4, 0x9d, 0xc0], [255, 255, 255], [0x30, 0x30, 0x30]]);
+        let liquid = |color, opacity| LayerStyle { colors: vec![[0xf4, 0x9d, 0xc0]], color, opacity };
+        assert!(v.restyled(&[liquid(None, 1.0)]).is_none(), "nothing to restyle");
+
+        let px = |v: &Vector, y: u32| v.render(100).unwrap().get_pixel(50, y).0;
+        let blue = v.restyled(&[liquid(Some([0, 0, 255]), 1.0)]).unwrap();
+        assert_eq!(px(&blue, 60), [0, 0, 255, 255]);
+        assert_eq!(px(&blue, 10), [255, 255, 255, 255], "the glass keeps its colour");
+        let faded = v.restyled(&[liquid(None, 0.0)]).unwrap();
+        assert_eq!(px(&faded, 60)[3], 0);
+        assert_eq!(faded.content(), v.content(), "a faded layer keeps the image's box");
+        // A stroke keeps its opacity's share: half of an already half-opaque outline.
+        let half = restyle_xml(r##"<path fill="#303030" stroke="#303030" stroke-opacity="0.5" d="M0 0L1 1"/>"##, &[LayerStyle { colors: vec![[0x30, 0x30, 0x30]], color: Some([1, 2, 3]), opacity: 0.5 }]);
+        assert_eq!(half, r##"<path fill="#010203" stroke="#010203" stroke-opacity="0.25" d="M0 0L1 1" fill-opacity="0.5"/>"##);
+
+        let source = ImageSource::file("flask.svg".into());
+        let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
+        let it = Item::new(1, "Flask", ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: vec![liquid(Some([0, 0, 255]), 1.0)] }, Pos2::ZERO, Vec2::splat(100.0));
+        let region = Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0));
+        let svg = build_svg(&egui::Context::default(), &[&it], region, None, &pics);
+        assert!(svg.contains("#0000ff") && !svg.contains("#f49dc0"), "the export has the layer's new colour");
+    }
+
     /// Exports a slide with every item kind in every format. Set BIOCARTOON_EXPORT_TEST_DIR to
     /// keep the files for inspection.
     #[test]
@@ -1284,10 +1451,10 @@ mod tests {
         // An AI edit of a catalog asset: exports still credit the original.
         let catalog = ImageSource::Asset { id: "servier/cell".into(), key: "x".into(), svg: None, title: "Cell".into(), source: "servier".into(), credit: "\"Cell\", Servier Medical Art, CC-BY-4.0 & co".into(), license: "CC-BY-4.0".into() };
         let edited = catalog.derived(icon.display().to_string());
-        let mut img = Item::new(1, "Cell icon", ItemKind::Image { source: edited, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4] }, Pos2::new(40.0, 40.0), Vec2::splat(200.0));
+        let mut img = Item::new(1, "Cell icon", ItemKind::Image { source: edited, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() }, Pos2::new(40.0, 40.0), Vec2::splat(200.0));
         img.rotation = 0.3;
         slide.items.push(img);
-        slide.items.push(Item::new(2, "Tinted", ItemKind::Image { source: src.clone(), crop: [0.25, 0.25, 0.75, 0.75], overlay: [255, 0, 0, 128] }, Pos2::new(300.0, 40.0), Vec2::splat(120.0)));
+        slide.items.push(Item::new(2, "Tinted", ItemKind::Image { source: src.clone(), crop: [0.25, 0.25, 0.75, 0.75], overlay: [255, 0, 0, 128], layers: Vec::new() }, Pos2::new(300.0, 40.0), Vec2::splat(120.0)));
         slide.items.push(Item::new(3, "Title", ItemKind::text("Hello BioCartoon, a fairly long title that wraps", 28.0, [20, 20, 20, 255], TextAlign::Center, true), Pos2::new(450.0, 40.0), Vec2::new(400.0, 80.0)));
         slide.items.push(Item::new(4, "Star", ItemKind::Shape { shape: ShapeKind::Star, fill: [47, 128, 237, 255], stroke: [0, 0, 0, 255], stroke_width: 2.0 }, Pos2::new(450.0, 200.0), Vec2::splat(150.0)));
         slide.items.push(Item::new(5, "Arrow", ItemKind::Line { kind: crate::doc::LineKind::BentArrow, color: [200, 50, 50, 255], width: 3.0, style: Default::default(), points: Vec::new() }, Pos2::new(100.0, 400.0), Vec2::new(300.0, 150.0)));

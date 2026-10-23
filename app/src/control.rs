@@ -241,7 +241,7 @@ pub fn item_json(it: &Item) -> Value {
     });
     let o = v.as_object_mut().unwrap();
     match &it.kind {
-        ItemKind::Image { source, crop, overlay } => {
+        ItemKind::Image { source, crop, overlay, layers } => {
             match source {
                 ImageSource::Asset { id, key, svg, title, source, credit, license } => {
                     o.insert("asset_id".into(), json!(id));
@@ -264,6 +264,9 @@ pub fn item_json(it: &Item) -> Value {
             }
             o.insert("crop".into(), json!(crop));
             o.insert("overlay".into(), json!(overlay));
+            if !layers.is_empty() {
+                o.insert("layers".into(), json!(layers));
+            }
         }
         ItemKind::Text { text, size, color, align, bold, italic, underline, font, line_spacing, valign } => {
             o.insert("text".into(), json!(text));
@@ -512,6 +515,7 @@ impl BioCartoon {
                     variant: g("variant"),
                     category: g("category"),
                     description: g("description"),
+                    tags: a.get("tags").and_then(Value::as_array).map(|t| t.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
                     license: g("license"),
                     credit: g("credit"),
                     author: g("author"),
@@ -523,6 +527,7 @@ impl BioCartoon {
                     stars: 0,
                     starred: false,
                     taxa: Vec::new(),
+                    layers: Vec::new(),
                 };
                 if row.id.is_empty() || row.png_key.is_empty() {
                     return Err("asset needs at least id and png_key".into());

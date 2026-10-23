@@ -10,6 +10,7 @@
 //! renderings are cached per power-of-two size and evicted by a byte budget, so an SVG asset is
 //! sharp at any zoom while a PNG-only asset is drawn as the pixels it has.
 
+use crate::doc::LayerStyle;
 use crate::export::Vector;
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use image::RgbaImage;
@@ -57,6 +58,9 @@ enum Work {
     Fetch(Request),
     /// Rasterise an SVG that is already loaded, `side` pixels on its longer side.
     Render(Arc<Vector>, u32),
+    /// Restyle the layers of an SVG that is already loaded (see [`Vector::restyled`]), keeping
+    /// its vector form as a loaded file's.
+    Restyle(Arc<Vector>, Vec<LayerStyle>),
 }
 
 /// A decoded image, and its vector form when the file was an SVG.
@@ -118,6 +122,8 @@ pub struct ImageCache {
     cpu: HashMap<String, Arc<RgbaImage>>,
     /// Parsed SVGs, by the cache key of their base texture, for re-rendering at any size.
     svg: HashMap<String, Arc<Vector>>,
+    /// The last restyling of each SVG that was ready (see [`ImageCache::restyled`]), by its cache key.
+    last_restyled: HashMap<String, String>,
     /// Bytes of GPU memory held by the `lod:` renderings in `map`.
     lod_bytes: usize,
     lru: VecDeque<String>,
@@ -292,6 +298,10 @@ fn run(work: &Work) -> Result<(Loaded, Option<Vec<u8>>), String> {
     match work {
         Work::Fetch(req) => fetch_decode(req),
         Work::Render(vector, side) => Ok((loaded(vector.render(*side)?, None), None)),
+        Work::Restyle(vector, layers) => {
+            let v = vector.restyled(layers).ok_or("svg: could not restyle its layers")?;
+            Ok((loaded(v.render(MAX_SIDE)?, Some(Arc::new(v))), None))
+        }
     }
 }
 
@@ -317,6 +327,18 @@ fn lod_key(key: &str, side: u32) -> String {
 
 fn is_lod_key(key: &str) -> bool {
     key.starts_with("lod:")
+}
+
+/// Cache key of `key`'s SVG with `layers` restyled.
+fn restyle_key(key: &str, layers: &[LayerStyle]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{layers:?}").hash(&mut h);
+    format!("layers:{:016x}:{key}", h.finish())
+}
+
+fn is_restyle_key(key: &str) -> bool {
+    key.starts_with("layers:")
 }
 
 /// The rendering size for drawing an SVG `need` pixels on its longer side: the next power of
@@ -354,6 +376,7 @@ impl ImageCache {
                     match &work {
                         Work::Fetch(req) => log::debug!("loading {req:?}"),
                         Work::Render(_, side) => log::debug!("rendering {key} at {side} px"),
+                        Work::Restyle(..) => log::debug!("restyling {key}"),
                     }
                     let res = run(&work).map(|(l, fetched)| {
                         if let (Some(b), Some(dir), Some(k)) = (fetched, cache_dir.read().unwrap().clone(), key.strip_prefix("asset:")) {
@@ -371,6 +394,7 @@ impl ImageCache {
             map: HashMap::new(),
             cpu: HashMap::new(),
             svg: HashMap::new(),
+            last_restyled: HashMap::new(),
             lod_bytes: 0,
             lru: VecDeque::new(),
             queue,
@@ -530,10 +554,15 @@ impl ImageCache {
         self.forget_svg(cache_key);
     }
 
-    /// Drop a key's vector form and every rendering made from it.
+    /// Drop a key's vector form and every rendering and restyling made from it.
     fn forget_svg(&mut self, cache_key: &str) {
         self.svg.remove(cache_key);
         let suffix = format!(":{cache_key}");
+        let restyled: Vec<String> = self.map.keys().filter(|k| is_restyle_key(k) && k.ends_with(&suffix)).cloned().collect();
+        for k in restyled {
+            self.forget(&k);
+        }
+        self.last_restyled.remove(cache_key);
         let lods: Vec<String> = self.map.keys().filter(|k| is_lod_key(k) && k.ends_with(&suffix)).cloned().collect();
         for k in lods {
             self.remove_lod(&k);
@@ -587,6 +616,40 @@ impl ImageCache {
         None
     }
 
+    /// The texture to draw an SVG image with when it has `layers` restyled, and the cache key it
+    /// is under (which serves [`lod_texture`](Self::lod_texture) as any SVG's does). The first
+    /// time, the restyling is made on a worker; meanwhile the last one of this image there was,
+    /// so dragging a layer's colour does not flash the original. `None` (draw the image as it
+    /// is) for a picture that is not a loaded SVG, or with nothing restyled. Call every frame
+    /// the image is drawn.
+    pub fn restyled(&mut self, cache_key: &str, layers: &[LayerStyle]) -> Option<(String, TextureHandle)> {
+        if layers.iter().all(LayerStyle::is_plain) {
+            return None;
+        }
+        let vector = self.svg.get(cache_key)?.clone();
+        let rk = restyle_key(cache_key, layers);
+        match self.map.get(&rk) {
+            Some(ImgState::Ready { tex, .. }) => {
+                let tex = tex.clone();
+                self.touch(&rk);
+                self.last_restyled.insert(cache_key.to_string(), rk.clone());
+                return Some((rk, tex));
+            }
+            Some(ImgState::Loading) => self.want(&rk),
+            Some(ImgState::Failed(_)) => return None,
+            None => self.queue(rk, Work::Restyle(vector, layers.to_vec())),
+        }
+        let last = self.last_restyled.get(cache_key)?.clone();
+        match self.map.get(&last) {
+            Some(ImgState::Ready { tex, .. }) => {
+                let tex = tex.clone();
+                self.touch(&last);
+                Some((last, tex))
+            }
+            _ => None,
+        }
+    }
+
     fn queue(&mut self, key: String, work: Work) {
         self.map.insert(key.clone(), ImgState::Loading);
         self.loads_in_flight += 1;
@@ -609,14 +672,14 @@ impl ImageCache {
                     self.fetching += 1;
                     self.load_web(key, req);
                 }
-                Work::Render(vector, side) => {
+                work => {
                     if rendered {
-                        let job = Job { work: Work::Render(vector, side), frame: self.frame, order: 0 };
+                        let job = Job { work, frame: self.frame, order: 0 };
                         self.queue.jobs.lock().unwrap().insert(key, job);
                         break;
                     }
                     rendered = true;
-                    let _ = self.dtx.send((key, vector.render(side).map(|img| loaded(img, None))));
+                    let _ = self.dtx.send((key, run(&work).map(|(l, _)| l)));
                 }
             }
         }
@@ -675,7 +738,7 @@ impl ImageCache {
         while let Ok((key, res)) = self.rx.try_recv() {
             #[cfg(target_arch = "wasm32")]
             {
-                if !is_lod_key(&key) {
+                if !is_lod_key(&key) && !is_restyle_key(&key) {
                     self.fetching = self.fetching.saturating_sub(1);
                 }
             }

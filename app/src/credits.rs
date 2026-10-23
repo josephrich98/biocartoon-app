@@ -347,7 +347,7 @@ mod tests {
     }
 
     fn image(n: u64, source: ImageSource) -> Item {
-        Item::new(n, "img", ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4] }, Pos2::ZERO, Vec2::splat(10.0))
+        Item::new(n, "img", ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() }, Pos2::ZERO, Vec2::splat(10.0))
     }
 
     #[test]
@@ -385,6 +385,7 @@ mod tests {
             variant: String::new(),
             category: String::new(),
             description: String::new(),
+            tags: Vec::new(),
             license: "CC-BY-4.0".into(),
             credit: "\"Cell\", Servier".into(),
             author: String::new(),
@@ -396,6 +397,7 @@ mod tests {
             stars: 0,
             starred: false,
             taxa: Vec::new(),
+            layers: Vec::new(),
         };
         fill(doc.slides.iter_mut(), &[row]);
         assert!(missing(&doc).is_empty());

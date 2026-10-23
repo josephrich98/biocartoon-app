@@ -19,6 +19,7 @@ pub struct Template {
     pub title: String,
     pub description: String,
     pub category: String,
+    pub tags: Vec<String>,
     pub author: String,
     pub license: String,
     pub created_at: String,
@@ -32,7 +33,7 @@ pub struct Template {
 
 /// Every template the editor would list: its built-in layouts, then the ones in
 /// `<app dir>/templates.sqlite` (the user's own and the published library). `query` filters by
-/// words in the title, description or category (all must appear).
+/// words in the title, description, category or tags (all must appear).
 pub fn templates(query: &str) -> Vec<Template> {
     let base = asset_base_url();
     let mut out: Vec<Template> = crate::app::BioCartoon::template_names()
@@ -43,6 +44,7 @@ pub fn templates(query: &str) -> Vec<Template> {
             title: title.to_string(),
             description: desc.to_string(),
             category: "Layout".into(),
+            tags: Vec::new(),
             author: String::new(),
             license: String::new(),
             created_at: String::new(),
@@ -64,6 +66,7 @@ pub fn templates(query: &str) -> Vec<Template> {
                 title: r.meta.title,
                 description: r.meta.description,
                 category: r.meta.category,
+                tags: r.meta.tags,
                 author: r.meta.author,
                 license: r.meta.license,
                 created_at: r.meta.created_at,
@@ -76,7 +79,7 @@ pub fn templates(query: &str) -> Vec<Template> {
     let terms = terms(query);
     if !terms.is_empty() {
         out.retain(|t| {
-            let hay = format!("{} {} {}", t.title, t.description, t.category).to_lowercase();
+            let hay = format!("{} {} {} {}", t.title, t.description, t.category, t.tags.join(" ")).to_lowercase();
             terms.iter().all(|w| hay.contains(w.as_str()))
         });
     }

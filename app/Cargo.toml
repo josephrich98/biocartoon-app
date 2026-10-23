@@ -2,6 +2,7 @@
 name = "biocartoon"
 version = "0.3.9"
 edition = "2021"
+authors = ["Joseph Rich <josephrich98@gmail.com>"]
 description = "A free, AI-centered scientific illustration editor built on egui"
 license = "AGPL-3.0-or-later"
 default-run = "biocartoon-app"

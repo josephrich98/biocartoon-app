@@ -336,6 +336,8 @@ pub struct SearchFilter {
     pub licenses: Vec<String>,
     /// File types, `catalog::FORMAT_SVG` or `catalog::FORMAT_PNG`.
     pub formats: Vec<String>,
+    /// Tags, separated by commas: a result with any of them as one of its tags.
+    pub tags: String,
 }
 
 impl SearchFilter {
@@ -343,9 +345,22 @@ impl SearchFilter {
         self.authors.split(',').map(|a| a.trim().to_lowercase()).filter(|a| !a.is_empty()).collect()
     }
 
+    /// The tags typed, as written.
+    pub fn tags(&self) -> Vec<String> {
+        crate::catalog::parse_tags(&self.tags)
+    }
+
     /// How many of the filters are set.
     pub fn active(&self) -> usize {
-        [!self.sources.is_empty(), !self.authors().is_empty(), !self.cats.is_empty() || !self.subs.is_empty(), !self.db_cats.is_empty(), !self.licenses.is_empty(), !self.formats.is_empty()]
+        [
+            !self.sources.is_empty(),
+            !self.authors().is_empty(),
+            !self.cats.is_empty() || !self.subs.is_empty(),
+            !self.db_cats.is_empty(),
+            !self.licenses.is_empty(),
+            !self.formats.is_empty(),
+            !self.tags().is_empty(),
+        ]
             .iter()
             .filter(|&&on| on)
             .count()
@@ -369,6 +384,7 @@ impl SearchFilter {
             taxa,
             db_cats: self.db_cats.clone(),
             formats: self.formats.clone(),
+            tags: self.tags(),
         }
     }
 }
@@ -643,6 +659,8 @@ pub struct UploadDialog {
     pub name: String,
     pub category: String,
     pub description: String,
+    /// Search words, separated by commas.
+    pub tags: String,
     pub license: &'static str,
     /// Submit it to the BioCartoon library (reviewed before it is published), not only keep it
     /// in Your library. Fixed when the dialog opens.
@@ -1585,9 +1603,11 @@ impl BioCartoon {
         if let Some(target) = self.replace_target.take() {
             self.commit();
             if let Some(it) = self.item_mut(target) {
-                if let ItemKind::Image { source, crop, .. } = &mut it.kind {
+                if let ItemKind::Image { source, crop, layers, .. } = &mut it.kind {
                     *source = Self::asset_source(row);
                     *crop = [0.0, 0.0, 1.0, 1.0];
+                    // Another drawing's colours: the layers restyled no longer apply.
+                    layers.clear();
                     it.name = row.title.clone();
                     let (w, h) = (row.png_width.max(1) as f32, row.png_height.max(1) as f32);
                     let area = it.size[0] * it.size[1];
@@ -1606,6 +1626,7 @@ impl BioCartoon {
             source: Self::asset_source(row),
             crop: [0.0, 0.0, 1.0, 1.0],
             overlay: [255, 255, 255, 0],
+            layers: Vec::new(),
         };
         let item = Item::new(id, row.title.clone(), kind, Pos2::ZERO, size);
         self.pending_fit.push((id, Fit::Side(self.insert_side(0.25))));
@@ -1627,6 +1648,7 @@ impl BioCartoon {
             source: ImageSource::file(p),
             crop: [0.0, 0.0, 1.0, 1.0],
             overlay: [255, 255, 255, 0],
+            layers: Vec::new(),
         };
         let mut item = Item::new(id, name, kind, Pos2::ZERO, Vec2::splat(target));
         match size {
@@ -2508,6 +2530,7 @@ impl BioCartoon {
             variant: String::new(),
             category: String::new(),
             description: format!("Prompt: {prompt}"),
+            tags: Vec::new(),
             // No license until it is submitted.
             license: String::new(),
             author,
@@ -2519,6 +2542,7 @@ impl BioCartoon {
             stars: 0,
             starred: false,
             taxa: Vec::new(),
+            layers: Vec::new(),
         };
         if let Err(e) = self.save_user_png(img, svg_file(Path::new(path)).as_deref(), &mut row) {
             self.toast_err(e);
@@ -2589,13 +2613,18 @@ impl BioCartoon {
             return;
         }
         let target = targets.remove(0);
-        let (name, category, description) = match &target {
-            UploadTarget::File(p) => (p.file_stem().map(|s| s.to_string_lossy().replace(['_', '-'], " ")).unwrap_or_default(), String::new(), String::new()),
+        let (name, category, description, tags) = match &target {
+            UploadTarget::File(p) => (p.file_stem().map(|s| s.to_string_lossy().replace(['_', '-'], " ")).unwrap_or_default(), String::new(), String::new(), String::new()),
             // Rows saved before descriptions were kept have their credit there instead.
-            UploadTarget::Library(row) => (row.title.clone(), row.category.clone(), if row.description == row.credit { String::new() } else { row.description.clone() }),
+            UploadTarget::Library(row) => (
+                row.title.clone(),
+                row.category.clone(),
+                if row.description == row.credit { String::new() } else { row.description.clone() },
+                row.tags.join(", "),
+            ),
             UploadTarget::Template(t) => match &t.saved {
-                Some(m) => (m.title.clone(), m.category.clone(), m.description.clone()),
-                None => (t.slide.name.clone(), String::new(), String::new()),
+                Some(m) => (m.title.clone(), m.category.clone(), m.description.clone(), m.tags.join(", ")),
+                None => (t.slide.name.clone(), String::new(), String::new(), String::new()),
             },
         };
         let svg_text = match &target {
@@ -2629,6 +2658,7 @@ impl BioCartoon {
             name,
             category,
             description,
+            tags,
             license,
             share,
             svg,
@@ -2739,6 +2769,12 @@ impl BioCartoon {
         }
         let category: String = d.category.trim().chars().take(60).collect();
         let description: String = d.description.trim().chars().take(500).collect();
+        let tags = crate::catalog::parse_tags(&d.tags);
+        if let Err(e) = crate::catalog::check_tags(&tags) {
+            self.toast_err(format!("Tags: {e}"));
+            self.upload_dialog = Some(d);
+            return;
+        }
         let credit: String = d.credit.trim().chars().take(60).collect();
         if !d.svg && !d.png_ok && !matches!(d.target, UploadTarget::Template(_)) {
             self.toast_err("Confirm adding it as a PNG first");
@@ -2808,6 +2844,7 @@ impl BioCartoon {
                     title: name.clone(),
                     description: description.clone(),
                     category: category.clone(),
+                    tags: tags.clone(),
                     author: if credit.is_empty() { "anonymous".into() } else { credit.clone() },
                     license: d.license.into(),
                     email,
@@ -2821,7 +2858,7 @@ impl BioCartoon {
             None => credit,
         };
         match &d.target {
-            UploadTarget::Template(t) => self.save_template((**t).clone(), name, category, description, d.license, author, share),
+            UploadTarget::Template(t) => self.save_template((**t).clone(), name, category, description, tags, d.license, author, share),
             target => {
                 let img = match (&d.image, target) {
                     // Read when the dialog opened, at the size shown there.
@@ -2856,6 +2893,7 @@ impl BioCartoon {
                     variant: String::new(),
                     category,
                     description,
+                    tags,
                     license: license.into(),
                     credit: credit_line,
                     author,
@@ -2867,6 +2905,7 @@ impl BioCartoon {
                     stars: 0,
                     starred: false,
                     taxa: Vec::new(),
+                    layers: Vec::new(),
                 };
                 match img {
                     Ok(img) => self.upload_asset(img, svg, row, share, replaces, fingerprint),
@@ -3007,13 +3046,25 @@ impl BioCartoon {
         (requests, cached)
     }
 
-    fn save_template(&mut self, t: TemplateSlide, title: String, category: String, description: String, license: &str, author: String, submit: Option<(String, SubmitMeta)>) {
+    #[allow(clippy::too_many_arguments)]
+    fn save_template(
+        &mut self,
+        t: TemplateSlide,
+        title: String,
+        category: String,
+        description: String,
+        tags: Vec<String>,
+        license: &str,
+        author: String,
+        submit: Option<(String, SubmitMeta)>,
+    ) {
         let slug = Self::upload_slug(&title);
         let meta = TemplateMeta {
             id: slug.clone(),
             title,
             description,
             category,
+            tags,
             author,
             license: license.into(),
             created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -4902,7 +4953,7 @@ impl BioCartoon {
                     });
                     if ui.add(crate::logo(ui.ctx(), 22.0).sense(egui::Sense::click()))
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("Search icons")
+                        .on_hover_text("Search icons and templates")
                         .clicked()
                     {
                         self.search_all();
@@ -5329,6 +5380,9 @@ impl BioCartoon {
                 });
                 field(ui, "Description");
                 ui.add(egui::TextEdit::multiline(&mut d.description).char_limit(500).hint_text("optional").desired_rows(3).desired_width(w));
+                field(ui, "Tags");
+                ui.add(egui::TextEdit::singleline(&mut d.tags).hint_text("optional, commas between").desired_width(w))
+                    .on_hover_text(format!("Words to find it by in search, up to {} (each up to {} characters)", crate::catalog::MAX_TAGS, crate::catalog::MAX_TAG_CHARS));
                 let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
                 // Your library keeps it on this computer: license, credit and contact are for submissions.
                 if d.share {
@@ -5757,7 +5811,7 @@ impl BioCartoon {
                             if i == 1 {
                                 source = source.derived(self.app_dir.join("generated").join("missing.png").display().to_string());
                             }
-                            let item = Item::new(self.doc.alloc_id(), title, ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0] }, Pos2::new(80.0 + 280.0 * i as f32, 200.0), Vec2::splat(240.0));
+                            let item = Item::new(self.doc.alloc_id(), title, ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0], layers: Vec::new() }, Pos2::new(80.0 + 280.0 * i as f32, 200.0), Vec2::splat(240.0));
                             self.doc.slides[self.cur_slide].items.push(item);
                         }
                         self.show_attributions = true;
@@ -6154,6 +6208,7 @@ mod tests {
             variant: String::new(),
             category: String::new(),
             description: String::new(),
+            tags: Vec::new(),
             license: String::new(),
             credit: String::new(),
             author: String::new(),
@@ -6165,6 +6220,7 @@ mod tests {
             stars: 0,
             starred: false,
             taxa: Vec::new(),
+            layers: Vec::new(),
         };
         assert!(row_submitted(&mut memo, &[fp], &row));
         assert!(row_submitted(&mut memo, &["id:user/x".into()], &row));

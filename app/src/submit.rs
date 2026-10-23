@@ -27,6 +27,8 @@ pub struct SubmitMeta {
     pub title: String,
     pub description: String,
     pub category: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub author: String,
     pub license: String,
     /// Optional contact address for the reviewers; the Worker stores it privately and never publishes it.

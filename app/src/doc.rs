@@ -621,6 +621,25 @@ fn one() -> f32 {
     1.0
 }
 
+/// One colour layer of an SVG image restyled: every shape the file paints in one of `colors`
+/// (rgb) is painted in `color` instead (its own colours when `None`), at `opacity` of its own.
+/// The layers come from the catalog's `layers` (named by hand) or from the drawing's colours.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LayerStyle {
+    pub colors: Vec<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
+    #[serde(default = "one")]
+    pub opacity: f32,
+}
+
+impl LayerStyle {
+    /// Whether it changes nothing.
+    pub fn is_plain(&self) -> bool {
+        self.color.is_none() && self.opacity >= 1.0
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ItemKind {
     Image {
@@ -629,6 +648,10 @@ pub enum ItemKind {
         crop: [f32; 4],
         /// Colour overlay (rgb) and its strength (a). a = 0 means no overlay.
         overlay: [u8; 4],
+        /// Parts of an SVG drawn in another colour or faded (see [`LayerStyle`]); only the
+        /// restyled ones.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        layers: Vec<LayerStyle>,
     },
     Text {
         text: String,
@@ -1013,7 +1036,7 @@ mod tests {
     }
 
     fn image_item(pos: Pos2, size: Vec2, crop: [f32; 4]) -> Item {
-        Item::new(1, "i", ItemKind::Image { source: ImageSource::file("a.svg".into()), crop, overlay: [0; 4] }, pos, size)
+        Item::new(1, "i", ItemKind::Image { source: ImageSource::file("a.svg".into()), crop, overlay: [0; 4], layers: Vec::new() }, pos, size)
     }
 
     fn close(r: Rect, want: Rect) -> bool {
@@ -1046,7 +1069,7 @@ mod tests {
         let (r, crop) = fit_to_drawing(&flipped, art, drawing).unwrap();
         assert!(close(r, Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(200.0, 200.0))), "{r:?}");
         assert_eq!(crop, full);
-        flipped.kind = ItemKind::Image { source: ImageSource::file("a.svg".into()), crop: [0.25, 0.0, 0.75, 1.0], overlay: [0; 4] };
+        flipped.kind = ItemKind::Image { source: ImageSource::file("a.svg".into()), crop: [0.25, 0.0, 0.75, 1.0], overlay: [0; 4], layers: Vec::new() };
         flipped.size = [100.0, 200.0];
         let (r, crop) = fit_to_drawing(&flipped, art, drawing).unwrap();
         assert!(close(r, Rect::from_min_max(Pos2::new(50.0, 0.0), Pos2::new(100.0, 200.0))), "{r:?}");

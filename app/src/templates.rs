@@ -29,6 +29,7 @@ pub struct TemplateMeta {
     pub title: String,
     pub description: String,
     pub category: String,
+    pub tags: Vec<String>,
     pub author: String,
     pub license: String,
     pub created_at: String,
@@ -57,8 +58,14 @@ pub struct TemplateRow {
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, category TEXT, author TEXT,
     license TEXT, created_at TEXT, json_key TEXT NOT NULL, thumb_key TEXT,
-    json_local TEXT, thumb_local TEXT);
+    json_local TEXT, thumb_local TEXT,
+    tags TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);";
+
+/// Whether `table` (e.g. `pub.templates`) has a `tags` column: lists made before templates had tags don't.
+fn has_tags(c: &Connection, table: &str) -> bool {
+    c.prepare(&format!("SELECT tags FROM {table} LIMIT 0")).is_ok()
+}
 
 pub struct TemplateStore {
     conn: Option<Connection>,
@@ -77,7 +84,12 @@ impl TemplateStore {
                 }
             }
         }
-        let conn = Connection::open(path).and_then(|c| c.execute_batch(SCHEMA).map(|_| c));
+        let conn = Connection::open(path).and_then(|c| c.execute_batch(SCHEMA).map(|_| c)).and_then(|c| {
+            if !has_tags(&c, "templates") {
+                c.execute_batch("ALTER TABLE templates ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';")?;
+            }
+            Ok(c)
+        });
         match conn {
             Ok(c) => Self { conn: Some(c), path: path.to_path_buf() },
             Err(e) => {
@@ -105,8 +117,8 @@ impl TemplateStore {
         let q = || -> rusqlite::Result<Vec<TemplateRow>> {
             let mut st = c.prepare(
                 "SELECT id, title, coalesce(description,''), coalesce(category,''), coalesce(author,''), \
-                 coalesce(license,''), coalesce(created_at,''), coalesce(thumb_key,''), json_key, json_local, thumb_local \
-                 FROM templates ORDER BY json_local IS NULL, lower(title), id",
+                 coalesce(license,''), coalesce(created_at,''), coalesce(thumb_key,''), json_key, json_local, thumb_local, \
+                 coalesce(tags,'[]') FROM templates ORDER BY json_local IS NULL, lower(title), id",
             )?;
             let rows = st
                 .query_map([], |r| {
@@ -116,6 +128,7 @@ impl TemplateStore {
                             title: r.get(1)?,
                             description: r.get(2)?,
                             category: r.get(3)?,
+                            tags: crate::catalog::tags_from_json(&r.get::<_, String>(11)?),
                             author: r.get(4)?,
                             license: r.get(5)?,
                             created_at: r.get(6)?,
@@ -139,8 +152,22 @@ impl TemplateStore {
         let Some(c) = &self.conn else { return Err("template library unavailable".into()) };
         let m = &row.meta;
         c.execute(
-            "INSERT OR REPLACE INTO templates VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![m.id, m.title, m.description, m.category, m.author, m.license, m.created_at, row.json_key, m.thumb_key, row.json_local, row.thumb_local],
+            "INSERT OR REPLACE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, \
+             json_local, thumb_local, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                m.id,
+                m.title,
+                m.description,
+                m.category,
+                m.author,
+                m.license,
+                m.created_at,
+                row.json_key,
+                m.thumb_key,
+                row.json_local,
+                row.thumb_local,
+                serde_json::to_string(&m.tags).map_err(|e| e.to_string())?
+            ],
         )
         .map_err(|e| e.to_string())?;
         self.persist();
@@ -163,11 +190,12 @@ impl TemplateStore {
     pub fn merge_published(&self, downloaded: &Path, version: &str) -> Result<(), String> {
         let Some(c) = &self.conn else { return Err("template library unavailable".into()) };
         c.execute("ATTACH DATABASE ?1 AS pub", params![downloaded.display().to_string()]).map_err(|e| e.to_string())?;
-        let r = c.execute_batch(
+        let tags = if has_tags(c, "pub.templates") { "coalesce(tags,'[]')" } else { "'[]'" };
+        let r = c.execute_batch(&format!(
             "BEGIN; DELETE FROM templates WHERE json_local IS NULL; \
-             INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key) \
-             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key FROM pub.templates; COMMIT;",
-        );
+             INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, tags) \
+             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags} FROM pub.templates; COMMIT;"
+        ));
         if r.is_err() {
             let _ = c.execute_batch("ROLLBACK;");
         }
@@ -448,8 +476,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pic = dir.join("pic.png");
         image::RgbaImage::from_pixel(40, 30, image::Rgba([200, 60, 60, 255])).save(&pic).unwrap();
-        let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), author: "tester".into(), license: "CC0-1.0".into(), email: String::new() };
-        let image = ItemKind::Image { source: ImageSource::file(pic.display().to_string()), crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0] };
+        let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), tags: vec!["test".into()], author: "tester".into(), license: "CC0-1.0".into(), email: String::new() };
+        let image = ItemKind::Image { source: ImageSource::file(pic.display().to_string()), crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0], layers: Vec::new() };
         let text = ItemKind::text("Step 1", 20.0, [0, 0, 0, 255], crate::doc::TextAlign::Left, true);
         let slide = Slide { name: "x".into(), items: vec![Item::new(1, "pic", image, egui::Pos2::ZERO, egui::Vec2::splat(50.0)), Item::new(2, "t", text, egui::Pos2::ZERO, egui::Vec2::splat(50.0))], comments: Vec::new(), background: None };
         let tmeta = TemplateMeta { id: "local-id".into(), title: meta.title.clone(), thumb_key: "templates/local-id/thumb.png".into(), ..Default::default() };
@@ -477,7 +505,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = TemplateStore::open(&dir.join("templates.sqlite"));
         let row = |id: &str, local: bool| TemplateRow {
-            meta: TemplateMeta { id: id.into(), title: id.into(), ..Default::default() },
+            meta: TemplateMeta { id: id.into(), title: id.into(), tags: vec![format!("{id} tag")], ..Default::default() },
             json_key: format!("templates/{id}/template.json"),
             json_local: local.then(|| "/x/template.json".into()),
             thumb_local: None,
@@ -491,7 +519,23 @@ mod tests {
         store.merge_published(&dir.join("pub.sqlite"), "v1").unwrap();
         let got: Vec<(String, bool)> = store.list().into_iter().map(|r| (r.meta.id, r.json_local.is_some())).collect();
         assert_eq!(got, vec![("mine".into(), true), ("new-published".into(), false)]);
+        assert_eq!(store.list()[1].meta.tags, ["new-published tag"]);
         assert_eq!(store.version().as_deref(), Some("v1"));
+        // A published list from before templates had tags.
+        let old = Connection::open(dir.join("old.sqlite")).unwrap();
+        old.execute_batch(
+            "CREATE TABLE templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, category TEXT, author TEXT, \
+             license TEXT, created_at TEXT, json_key TEXT NOT NULL, thumb_key TEXT, json_local TEXT, thumb_local TEXT); \
+             INSERT INTO templates (id, title, json_key) VALUES ('old', 'Old', 'templates/old/template.json');",
+        )
+        .unwrap();
+        drop(old);
+        store.merge_published(&dir.join("old.sqlite"), "v2").unwrap();
+        assert!(store.list().iter().any(|r| r.meta.id == "old" && r.meta.tags.is_empty()));
+        // And a local list from before: opening it adds the column.
+        drop(store);
+        Connection::open(dir.join("templates.sqlite")).unwrap().execute_batch("ALTER TABLE templates DROP COLUMN tags;").unwrap();
+        assert_eq!(TemplateStore::open(&dir.join("templates.sqlite")).list().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,7 +7,7 @@ use crate::templates::TemplateRow;
 use crate::assets::ImgState;
 use crate::canvas::{draw_slide, tool_button, Xform};
 use crate::catalog::{AssetRow, IconSort};
-use crate::doc::{c32, c4, CodeLang, CodeTheme, ImageSource, Item, ItemKind, LineFamily, LineKind, LineStyle, ShapeKind, TextAlign, TextFont, TextVAlign, Unit};
+use crate::doc::{c32, c4, CodeLang, CodeTheme, ImageSource, Item, ItemKind, LayerStyle, LineFamily, LineKind, LineStyle, ShapeKind, TextAlign, TextFont, TextVAlign, Unit};
 use crate::stars::format_stars;
 use crate::theme;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
@@ -18,6 +18,8 @@ const PANEL_W: f32 = 340.0;
 const PANEL_MIN_W: f32 = 260.0;
 const PANEL_MAX_W: f32 = 720.0;
 const TILE: f32 = 96.0;
+/// Most layers an SVG offers from its own colours (when the catalog names none), the most used.
+const MAX_COLOR_LAYERS: usize = 8;
 
 /// The Slides panel starts narrower, and can be dragged narrower, than the others.
 const SLIDES_W: f32 = 186.0;
@@ -96,7 +98,7 @@ impl BioCartoon {
                 ui.set_width(ui.available_width());
                 let (title, back) = match self.icons.mode {
                     IconsMode::Home => ("Icons".to_string(), false),
-                    IconsMode::Search => ("Search".into(), true),
+                    IconsMode::Search => ("Search icons and templates".into(), true),
                     IconsMode::Generate => ("Generate with AI".into(), true),
                     IconsMode::Uploads => ("Uploads".into(), true),
                     IconsMode::Contribute if self.contribute.share => ("Add to BioCartoon library".into(), true),
@@ -273,10 +275,12 @@ impl BioCartoon {
                 let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
                 let q = self.icons.query.trim().to_lowercase();
                 let authors = f.authors();
+                let tags = f.tags();
                 // A template's category is free text: it matches a picked category or subcategory by name.
                 let places: Vec<&str> = f.cats.iter().map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
-                rows.filter(|r| q.is_empty() || [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q)))
+                rows.filter(|r| q.is_empty() || [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q)) || r.meta.tags.iter().any(|t| t.to_lowercase().contains(&q)))
                     .filter(|r| authors.is_empty() || authors.iter().any(|a| r.meta.author.to_lowercase().contains(a)))
+                    .filter(|r| tags.is_empty() || tags.iter().any(|t| r.meta.tags.iter().any(|x| eq(x, t))))
                     .filter(|r| f.licenses.is_empty() || f.licenses.iter().any(|l| eq(l, &r.meta.license)))
                     .filter(|r| places.is_empty() || places.iter().any(|p| eq(p, &r.meta.category)))
                     // Their categories are BioCartoon's own database categories.
@@ -299,7 +303,7 @@ impl BioCartoon {
         i.mode = IconsMode::Home;
     }
 
-    /// The filters under the search box: database, author, category, subcategory, license and file type.
+    /// The filters under the search box: database, author, category, subcategory, license, file type and tags.
     /// The search re-runs once one changes (see `last_sent_filter`).
     fn filters_panel(&mut self, ui: &mut egui::Ui) {
         if self.icons.facets_for.as_ref().is_none_or(|(q, f)| q != self.icons.query.trim() || *f != self.icons.filter) {
@@ -387,7 +391,7 @@ impl BioCartoon {
             // The second column takes what the labels leave; any wider and the grid would push the
             // panel out (it grows to fit), a little more each frame.
             let font = egui::TextStyle::Body.resolve(ui.style());
-            let labels = ["Database", "Author", "Category", "Subcategory", "Database category", "License", "File type"];
+            let labels = ["Database", "Author", "Category", "Subcategory", "Database category", "License", "File type", "Tags"];
             let label_w = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), Color32::WHITE).size().x).fold(0.0, f32::max);
             let w = (ui.available_width() - label_w - 8.0).max(60.0);
             egui::Grid::new("search_filters").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
@@ -419,6 +423,9 @@ impl BioCartoon {
                 ui.end_row();
                 ui.label("File type").on_hover_text("SVG: the source publishes a vector version. PNG: an image only");
                 multi_select(ui, "filter_format", w, &mut f.formats, &formats);
+                ui.end_row();
+                ui.label("Tags").on_hover_text("Icons and templates with one of these as a whole tag, any case");
+                ui.add(egui::TextEdit::singleline(&mut f.tags).hint_text("Any (commas for several)").desired_width(w));
                 ui.end_row();
             });
             if f.active() > 0 {
@@ -455,6 +462,10 @@ impl BioCartoon {
         if !f.formats.is_empty() {
             parts.push(f.formats.join(", "));
         }
+        let tags = f.tags();
+        if !tags.is_empty() {
+            parts.push(format!("tagged {}", tags.join(", ")));
+        }
         parts.join("  ·  ")
     }
 
@@ -478,7 +489,7 @@ impl BioCartoon {
                         0 => (ph::FUNNEL.to_string(), if self.icons.show_filters { theme::text() } else { theme::text_dim() }),
                         n => (format!("{} {n}", ph::FUNNEL), theme::accent()),
                     };
-                    let tip = if self.icons.show_filters { "Hide the filters" } else { "Filter by database, author, category or license" };
+                    let tip = if self.icons.show_filters { "Hide the filters" } else { "Filter by database, author, category, license or tags" };
                     if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
                         self.icons.show_filters = !self.icons.show_filters;
                     }
@@ -533,7 +544,7 @@ impl BioCartoon {
         match self.icons.mode {
             IconsMode::Home => {
                 self.home_row_buttons(ui, &[
-                    (ph::MAGNIFYING_GLASS, "Search", IconsMode::Search),
+                    (ph::MAGNIFYING_GLASS, "Search icons and templates", IconsMode::Search),
                     (ph::SPARKLE, "Generate with AI", IconsMode::Generate),
                 ]);
                 ui.add_space(8.0);
@@ -1421,6 +1432,99 @@ impl BioCartoon {
         Some(info)
     }
 
+    /// The layers an image offers to restyle, each a name and the colours in it: the catalog's
+    /// named ones for a library asset (once its row has come), else the SVG's own colours, the
+    /// [`MAX_COLOR_LAYERS`] most used. None for a picture that is not an SVG or has one colour.
+    fn image_layers(&self, source: &ImageSource) -> Vec<(String, Vec<[u8; 3]>)> {
+        let Some(vector) = self.images.vector(&source.cache_key()) else { return Vec::new() };
+        if let ImageSource::Asset { id, .. } = source {
+            let Some(row) = self.variants.iter().find(|r| &r.id == id) else { return Vec::new() };
+            let hex = |c: &str| -> Option<[u8; 3]> {
+                let h = c.strip_prefix('#').filter(|h| h.len() == 6)?;
+                let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+                Some([b(0)?, b(2)?, b(4)?])
+            };
+            let named: Vec<_> = row.layers.iter().map(|l| (l.name.clone(), l.colors.iter().filter_map(|c| hex(c)).collect::<Vec<_>>())).filter(|(_, c)| !c.is_empty()).collect();
+            if !named.is_empty() {
+                return named;
+            }
+        }
+        let colors = vector.colors();
+        if colors.len() < 2 {
+            return Vec::new();
+        }
+        colors.iter().take(MAX_COLOR_LAYERS).map(|c| (format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]), vec![*c])).collect()
+    }
+
+    /// Layers: a colour and an opacity for each of [`image_layers`](Self::image_layers), kept in
+    /// `layers` while they differ from the drawing's own. Whether anything changed.
+    fn layers_ui(&self, ui: &mut egui::Ui, source: &ImageSource, layers: &mut Vec<LayerStyle>) -> bool {
+        let offered = self.image_layers(source);
+        if offered.len() < 2 {
+            return false;
+        }
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Layers").strong()).on_hover_text("Recolor or fade one part of the drawing at a time");
+            if layers.iter().any(|l| !l.is_plain()) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Reset").on_hover_text("Every layer back to the drawing's own colors").clicked() {
+                        layers.clear();
+                        changed = true;
+                    }
+                });
+            }
+        });
+        egui::Grid::new("image_layers").num_columns(5).spacing([6.0, 4.0]).show(ui, |ui| {
+            for (name, colors) in &offered {
+                let i = layers.iter().position(|l| &l.colors == colors);
+                let before = i.map(|i| layers[i].clone()).unwrap_or(LayerStyle { colors: colors.clone(), color: None, opacity: 1.0 });
+                let mut style = before.clone();
+                ui.horizontal(|ui| {
+                    // Its own colours, side by side.
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                    let w = rect.width() / colors.len() as f32;
+                    for (k, c) in colors.iter().enumerate() {
+                        let r = Rect::from_min_size(rect.min + Vec2::new(w * k as f32, 0.0), Vec2::new(w, rect.height()));
+                        ui.painter().rect_filled(r, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
+                    }
+                    ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
+                    ui.label(name.as_str());
+                });
+                let mut rgb = style.color.unwrap_or(colors[0]);
+                if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Color").changed() {
+                    style.color = Some(rgb);
+                }
+                let mut op = style.opacity * 100.0;
+                if ui.add(egui::DragValue::new(&mut op).speed(1.0).range(0.0..=100.0).suffix("%")).on_hover_text("Opacity").changed() {
+                    style.opacity = op / 100.0;
+                }
+                let hidden = style.opacity <= 0.0;
+                if ui.small_button(if hidden { ph::EYE_SLASH } else { ph::EYE }).on_hover_text(if hidden { "Show" } else { "Hide" }).clicked() {
+                    style.opacity = if hidden { 1.0 } else { 0.0 };
+                }
+                if before.is_plain() {
+                    ui.label("");
+                } else if ui.small_button(ph::ARROW_COUNTER_CLOCKWISE).on_hover_text("Its own color").clicked() {
+                    style.color = None;
+                    style.opacity = 1.0;
+                }
+                ui.end_row();
+                if style != before {
+                    changed = true;
+                    match i {
+                        Some(i) => layers[i] = style,
+                        None => layers.push(style),
+                    }
+                }
+            }
+        });
+        if changed {
+            layers.retain(|l| !l.is_plain());
+        }
+        changed
+    }
+
     fn edit_panel(&mut self, ui: &mut egui::Ui) {
         if self.selection.is_empty() {
             ui.label(egui::RichText::new("Select something on the canvas to edit it.").small().color(theme::text_dim()));
@@ -1487,7 +1591,7 @@ impl BioCartoon {
         ui.separator();
 
         match &mut edited.kind {
-            ItemKind::Image { source, overlay, .. } => {
+            ItemKind::Image { source, overlay, layers, .. } => {
                 // Presets: other colour variants of the same asset.
                 if let ImageSource::Asset { id: aid, .. } = source {
                     self.request_variants(aid);
@@ -1518,6 +1622,7 @@ impl BioCartoon {
                         }
                     }
                 }
+                changed |= self.layers_ui(ui, source, layers);
                 ui.label(egui::RichText::new("Style").strong());
                 ui.horizontal(|ui| {
                     ui.label("Color overlay");
