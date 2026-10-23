@@ -44,7 +44,16 @@ web() {
 
 site() {
   step "website"
-  cp "$APP/app/assets/app_screenshot.png" "$APP/site/public/app_screenshot.png"
+  # The full-size screenshot (for the README) is scaled to 1920px wide for the site, and the
+  # <img> width/height are set to match so the page doesn't shift while it loads.
+  local shot="$APP/site/public/app_screenshot.png"
+  sips --resampleWidth 1920 "$APP/app/assets/app_screenshot.png" --out "$shot" >/dev/null
+  local w h
+  w="$(sips -g pixelWidth "$shot" | awk '/pixelWidth/ {print $2}')"
+  h="$(sips -g pixelHeight "$shot" | awk '/pixelHeight/ {print $2}')"
+  sed -i '' -E "s#(src=\"app_screenshot.png\") width=\"[0-9]+\" height=\"[0-9]+\"#\1 width=\"$w\" height=\"$h\"#" "$APP/site/public/index.html"
+  grep -q "src=\"app_screenshot.png\" width=\"$w\" height=\"$h\"" "$APP/site/public/index.html" \
+    || die "site/public/index.html: couldn't set the screenshot's width/height"
   (cd "$APP/site" && npx wrangler deploy)
 }
 

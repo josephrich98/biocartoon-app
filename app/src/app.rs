@@ -5130,7 +5130,6 @@ impl BioCartoon {
                     ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(theme::text_dim()));
                     ui.add_space(10.0);
                     linked_line(ui, "Developed by ", "Joseph Rich", "https://joseph-rich.com");
-                    linked_line(ui, "Part of the ", "Pachter Lab", "https://pachterlab.github.io");
                     ui.add_space(10.0);
                     linked_line(ui, "Learn more at ", "www.biocartoon.com", "https://www.biocartoon.com");
                     linked_line(ui, "Web app: ", "app.biocartoon.com", "https://app.biocartoon.com");

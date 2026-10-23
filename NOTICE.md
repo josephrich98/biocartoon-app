@@ -52,3 +52,9 @@ third-party assets inside a figure keep their own licenses.
 
 Third-party software dependencies are under their own licenses; see `app/Cargo.lock` and
 `package.json`.
+
+## Trademarks
+
+"BioCartoon" and the BioCartoon logo are trademarks of Joseph Rich. The AGPL covers the
+logo's artwork as a copyright license only; under AGPL section 7(e), it does not grant rights
+to use the name or logo as trademarks. See [TRADEMARKS.md](TRADEMARKS.md).

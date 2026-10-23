@@ -940,15 +940,6 @@ impl Document {
     pub fn page_rect(&self) -> Rect {
         Rect::from_min_size(Pos2::ZERO, Vec2::new(self.width, self.height))
     }
-
-    pub fn size_label(&self) -> String {
-        let u = self.unit;
-        match u {
-            Unit::Px => format!("{} x {} px", self.width.round(), self.height.round()),
-            _ => format!("{:.2} x {:.2} {}", u.from_px(self.width), u.from_px(self.height), u.label())
-                .replace(".00 ", " "),
-        }
-    }
 }
 
 pub fn c32(c: [u8; 4]) -> Color32 {

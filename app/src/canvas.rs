@@ -939,7 +939,6 @@ impl BioCartoon {
                 }
             }
             self.draw_guides(&painter, rect, &xf);
-            painter.text(page_s.left_top() + Vec2::new(0.0, -8.0), egui::Align2::LEFT_BOTTOM, self.doc.size_label(), FontId::proportional(11.0), theme::text_dim());
             if self.settings.show_rulers {
                 self.draw_rulers(&painter, rect, &xf);
             }

@@ -238,19 +238,26 @@ impl BioCartoon {
     fn credits_action(&mut self, ctx: &egui::Context, action: CreditsAction, credits: &[Credit], stem: &str) {
         match action {
             CreditsAction::Copy { required } => {
-                ctx.copy_text(list(credits, required));
+                ctx.copy_text(shared_list(credits, required));
                 self.toast(if required { "Copied the required credits" } else { "Copied all credits" });
             }
             CreditsAction::Save { required } => {
                 let name = format!("{stem}-{}credits.txt", if required { "required-" } else { "" });
                 let Some(path) = crate::platform::save_path("Text", "txt", &name) else { return };
-                match crate::platform::write_output(&path, format!("{}\n", list(credits, required)).as_bytes()) {
+                match crate::platform::write_output(&path, format!("{}\n", shared_list(credits, required)).as_bytes()) {
                     Ok(()) => self.toast(if required { "Saved the required credits" } else { "Saved all credits" }),
                     Err(e) => self.toast_err(&format!("{}: {e}", path.display())),
                 }
             }
         }
     }
+}
+
+/// The credit list a copy or save button hands over: all credits end by naming the app; the
+/// required ones stay just what the licenses ask for.
+fn shared_list(credits: &[Credit], only_required: bool) -> String {
+    let lines = list(credits, only_required);
+    if only_required { lines } else { format!("{lines}\nFigure made in BioCartoon.") }
 }
 
 /// How long the "Image saved successfully" banner stays above the Attributions popup.
