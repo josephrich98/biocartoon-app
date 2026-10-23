@@ -1845,6 +1845,14 @@ impl BioCartoon {
         if ui.add(b).on_hover_text(tip).clicked() {
             self.actions.push(Action::ArmComment(!self.placing_comment));
         }
+        ui.add_space(6.0);
+        let shown = self.settings.show_comments;
+        if toggle_row(ui, ph::EYE, "Show comments on the page", shown).clicked() {
+            self.settings.show_comments = !shown;
+            if shown {
+                self.open_comment = None;
+            }
+        }
         ui.add_space(10.0);
         let comments = &self.slide().comments;
         if comments.is_empty() {

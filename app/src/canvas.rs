@@ -972,7 +972,8 @@ impl BioCartoon {
         let mut moved = None;
         let mut popup_at = None;
         let mut open = self.open_comment;
-        for (n, c) in self.slide().comments.iter().enumerate() {
+        let shown = if self.settings.show_comments { self.slide().comments.as_slice() } else { &[] };
+        for (n, c) in shown.iter().enumerate() {
             let tip = xf.to_screen(c.pos());
             let body = comment_bubble(&painter, tip, &format!("{}", n + 1), 1.0);
             if !canvas.contains(tip) {

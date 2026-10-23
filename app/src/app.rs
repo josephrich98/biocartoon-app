@@ -103,6 +103,8 @@ pub struct Settings {
     pub check_grammar: bool,
     /// Squiggles under spelling and grammar mistakes while editing (main menu).
     pub show_spelling: bool,
+    /// Comment bubbles show on the page (the Comments panel lists them either way).
+    pub show_comments: bool,
     /// Web: the home screen's backup reminder stays hidden until then (Unix milliseconds).
     pub backup_snoozed_until: i64,
 }
@@ -154,6 +156,7 @@ impl Default for Settings {
             custom_words: Vec::new(),
             check_grammar: true,
             show_spelling: false,
+            show_comments: true,
             backup_snoozed_until: 0,
         }
     }
@@ -4214,6 +4217,7 @@ impl BioCartoon {
                 self.finish_text_edit();
                 self.placing_comment = on;
                 if on {
+                    self.settings.show_comments = true;
                     self.placing_text = false;
                     self.drawing = false;
                     self.stroke.clear();
@@ -4278,6 +4282,7 @@ impl BioCartoon {
                     let page = self.doc.page_rect();
                     self.view.pan = (page.center() - c.pos()) * self.view.zoom;
                     self.open_comment = Some(id);
+                    self.settings.show_comments = true;
                     self.comment_draft = None;
                     self.placing_comment = false;
                     if phone_width(ctx) {
@@ -5548,7 +5553,7 @@ impl BioCartoon {
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, dictionary, textedit, tableedit, placetext,
-    /// comments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
+    /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -5671,6 +5676,10 @@ impl BioCartoon {
                         }
                         self.open_comment = self.slide().comments.first().map(|c| c.id);
                         self.rail = Some(RailTab::Comments);
+                    }
+                    "hidecomments" => {
+                        self.settings.show_comments = false;
+                        self.open_comment = None;
                     }
                     "draftcomment" => {
                         self.show_settings = false;
