@@ -276,8 +276,10 @@ impl BioCartoon {
         let what = if changed == 1 { "1 project has".to_string() } else { format!("{changed} projects have") };
         let risk = if crate::storage::persisted() == Some(true) {
             "Projects live only in this browser, and are lost if its site data is cleared."
-        } else {
+        } else if crate::storage::is_safari() {
             "Projects live only in this browser, which may clear them (Safari does after 7 days without a visit)."
+        } else {
+            "Projects live only in this browser, which may clear them if the device runs low on space."
         };
         egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::accent())).corner_radius(8).inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
             ui.set_width(ui.available_width());

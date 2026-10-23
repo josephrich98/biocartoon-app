@@ -60,6 +60,11 @@ mod imp {
     pub fn writes_pending() -> bool {
         false
     }
+
+    /// The desktop app keeps files on disk, never in a browser.
+    pub fn is_safari() -> bool {
+        false
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -131,6 +136,13 @@ mod imp {
             2 => Some(false),
             _ => None,
         }
+    }
+
+    /// Whether this is Safari, which clears a site's storage after about 7 days without a visit.
+    /// Every other browser's user agent that mentions Safari also names itself.
+    pub fn is_safari() -> bool {
+        let Some(ua) = web_sys::window().and_then(|w| w.navigator().user_agent().ok()) else { return false };
+        ua.contains("Safari") && !["Chrome", "Chromium", "CriOS", "FxiOS", "EdgiOS", "Edg/", "OPR/", "Android"].iter().any(|b| ua.contains(b))
     }
 
     async fn load() -> Result<(Database, usize), idb::Error> {

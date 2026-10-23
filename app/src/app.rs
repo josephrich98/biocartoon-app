@@ -514,13 +514,25 @@ pub fn scaled_size((w, h): (u32, u32), scale: f32) -> (u32, u32) {
     (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1))
 }
 
-/// The PNG `img` makes scaled by `scale`: its width, height and size in bytes (however large;
-/// the limit is checked where it is shown).
-pub fn png_out(img: &image::RgbaImage, scale: f32) -> Result<(u32, u32, usize), String> {
-    let img = scaled(img, scale);
+/// `img` as a PNG: its size in bytes.
+fn png_bytes(img: &image::RgbaImage) -> Result<usize, String> {
     let mut out = std::io::Cursor::new(Vec::new());
     img.write_to(&mut out, image::ImageFormat::Png).map_err(|e| e.to_string())?;
-    Ok((img.width(), img.height(), out.into_inner().len()))
+    Ok(out.into_inner().len())
+}
+
+/// `img` at full size when its PNG fits in `limit` bytes, else scaled down (in proportion) to
+/// about the largest size that does, and that PNG's size in bytes.
+pub fn fit_png(img: &image::RgbaImage, limit: usize) -> Result<(image::RgbaImage, usize), String> {
+    let mut bytes = png_bytes(img)?;
+    let (mut out, mut scale) = (img.clone(), 1.0f32);
+    // A PNG's size goes roughly with its pixel count, so each try aims just under the limit.
+    while bytes > limit && out.width().max(out.height()) > 1 {
+        scale *= ((limit as f32 / bytes as f32).sqrt() * 0.98).min(0.95);
+        out = scaled(img, scale);
+        bytes = png_bytes(&out)?;
+    }
+    Ok((out, bytes))
 }
 
 /// The SVG kept beside one of the user's library icons, if it has one.
@@ -591,16 +603,17 @@ pub struct UploadDialog {
     pub svg: bool,
     /// The user confirmed adding a PNG rather than an SVG.
     pub png_ok: bool,
-    /// A raster image's pixels as read (`None` for an SVG or a template), to resize.
+    /// A raster image's pixels as they are added (`None` for an SVG or a template): made
+    /// smaller only if its PNG would be over the limit.
     pub image: Option<std::sync::Arc<image::RgbaImage>>,
-    /// How much to scale a raster image down (1: as it is); width and height keep its proportions.
-    pub scale: f32,
-    /// What is added at `out_scale`: width and height in pixels, and bytes (or why not).
+    /// The raster image's own width and height, when it was made smaller to fit the limit.
+    pub reduced_from: Option<(u32, u32)>,
+    /// The user confirmed adding it at the smaller size.
+    pub reduced_ok: bool,
+    /// `image` as a texture, for the preview.
+    pub preview: Option<egui::TextureHandle>,
+    /// What is added: width and height in pixels, and bytes (or why not).
     pub out: Option<Result<(u32, u32, usize), String>>,
-    /// The scale `out` was worked out for; while it differs (a size being dragged) the bytes wait.
-    pub out_scale: f32,
-    /// The resize fields show percent rather than pixels.
-    pub percent: bool,
     /// Public credit name for a submission.
     pub credit: String,
     /// Private contact address for a submission (optional).
@@ -2509,18 +2522,26 @@ impl BioCartoon {
             UploadTarget::Template(_) => None,
         };
         let svg = svg_text.is_some();
-        // A raster image is read now, so its size can be shown (and changed) before it is added.
-        let image = match (&target, svg) {
+        // A raster image is read now, so its size can be shown, and made smaller if its PNG
+        // would be over the limit, before it is added.
+        let read = match (&target, svg) {
             (UploadTarget::File(p), false) => read_image(p).ok(),
             (UploadTarget::Library(row), false) => row.png_local.as_deref().and_then(|p| read_image(Path::new(p)).ok()),
             _ => None,
-        }
-        .map(std::sync::Arc::new);
-        let out = match (&svg_text, &image) {
-            (Some(t), _) => crate::assets::image_size(t.as_bytes()).map(|(w, h)| Ok((w.round() as u32, h.round() as u32, t.len()))),
-            (None, Some(img)) => Some(png_out(img, 1.0)),
-            (None, None) => None,
         };
+        let (mut image, mut reduced_from, mut out) = (None, None, None);
+        if let Some(t) = &svg_text {
+            out = crate::assets::image_size(t.as_bytes()).map(|(w, h)| Ok((w.round() as u32, h.round() as u32, t.len())));
+        } else if let Some(img) = read {
+            match fit_png(&img, crate::submit::MAX_PNG_BYTES) {
+                Ok((fit, bytes)) => {
+                    out = Some(Ok((fit.width(), fit.height(), bytes)));
+                    reduced_from = Some(img.dimensions()).filter(|&d| d != fit.dimensions());
+                    image = Some(std::sync::Arc::new(fit));
+                }
+                Err(e) => out = Some(Err(e)),
+            }
+        }
         self.upload_dialog = Some(UploadDialog {
             target,
             name,
@@ -2531,10 +2552,10 @@ impl BioCartoon {
             svg,
             png_ok: false,
             image,
-            scale: 1.0,
+            reduced_from,
+            reduced_ok: false,
+            preview: None,
             out,
-            out_scale: 1.0,
-            percent: false,
             credit: self.settings.contributor_name.clone(),
             email: self.settings.contributor_email.clone(),
             step: (step, step + targets.len()),
@@ -2641,6 +2662,11 @@ impl BioCartoon {
             self.upload_dialog = Some(d);
             return;
         }
+        if d.reduced_from.is_some() && !d.reduced_ok {
+            self.toast_err("Confirm adding it at the reduced size first");
+            self.upload_dialog = Some(d);
+            return;
+        }
         // The image's fingerprint, to submit it only once.
         let source = match &d.target {
             UploadTarget::File(p) => Some(p.display().to_string()),
@@ -2715,8 +2741,8 @@ impl BioCartoon {
             UploadTarget::Template(t) => self.save_template((**t).clone(), name, category, description, d.license, author, share),
             target => {
                 let img = match (&d.image, target) {
-                    // Read when the dialog opened, at the size picked there.
-                    (Some(img), _) => Ok(scaled(img, d.scale)),
+                    // Read when the dialog opened, at the size shown there.
+                    (Some(img), _) => Ok((**img).clone()),
                     (None, UploadTarget::File(p)) => read_image(p),
                     (None, UploadTarget::Library(row)) => read_image(Path::new(row.png_local.as_deref().unwrap_or_default())),
                     (None, UploadTarget::Template(_)) => unreachable!(),
@@ -4789,31 +4815,42 @@ impl BioCartoon {
         egui::Panel::bottom("bottombar").exact_size(36.0).frame(frame).show_separator_line(false).show(ui, |ui| {
             let full = ui.max_rect();
             let row = |layout: egui::Layout, rect: Rect| egui::UiBuilder::new().max_rect(rect).layout(layout);
-            ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), full), |ui| {
+            let left = ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), full), |ui| {
                 if ui.add(egui::Button::new(format!("{}  Icons", ph::DNA)).selected(self.settings.show_icons)).on_hover_text("Show or hide the Icons panel").clicked() {
                     self.settings.show_icons = !self.settings.show_icons;
                 }
             });
-            ui.scope_builder(row(egui::Layout::right_to_left(egui::Align::Center), full), |ui| {
+            let right = ui.scope_builder(row(egui::Layout::right_to_left(egui::Align::Center), full), |ui| {
                 if ui.add(egui::Button::new(ph::CARET_RIGHT).frame(false)).clicked() && self.cur_slide + 1 < n { self.actions.push(Action::GoSlide(self.cur_slide + 1)); }
                 ui.label(format!("{}/{}", self.cur_slide + 1, n));
                 if ui.add(egui::Button::new(ph::CARET_LEFT).frame(false)).clicked() && self.cur_slide > 0 { self.actions.push(Action::GoSlide(self.cur_slide - 1)); }
                 if ui.add(egui::Button::new(format!("{}  Slides", ph::PRESENTATION)).selected(self.rail == Some(RailTab::Slides))).clicked() { self.actions.push(Action::SetRail(Some(RailTab::Slides))); }
             });
-            // Zoom controls, centred in the window using their width from the previous frame.
-            let width_id = egui::Id::new("zoom_controls_width");
-            let w = ui.ctx().data(|d| d.get_temp::<f32>(width_id)).unwrap_or(260.0);
-            let center = Pos2::new(ui.ctx().content_rect().center().x, full.center().y);
-            let zoom = ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), Rect::from_center_size(center, Vec2::new(w, full.height()))), |ui| {
+            // Zoom controls, centred in the window using their width from the previous frame, but
+            // kept in the gap between the buttons on either side: on a narrow screen the slider
+            // gets shorter, and goes when there is no room for it. Stored: the width of everything
+            // but the slider and its spacing.
+            let width_id = egui::Id::new("zoom_controls_fixed_width");
+            let fixed = ui.ctx().data(|d| d.get_temp::<f32>(width_id)).unwrap_or(150.0);
+            let sp = ui.spacing().item_spacing.x;
+            let (lo, hi) = (left.response.rect.right() + 8.0, right.response.rect.left() - 8.0);
+            let slider_w = ui.spacing().slider_width.min(hi - lo - fixed - sp);
+            let slider = slider_w >= 40.0;
+            let w = fixed + if slider { slider_w + sp } else { 0.0 };
+            let x = ui.ctx().content_rect().center().x.clamp(lo + w / 2.0, (hi - w / 2.0).max(lo + w / 2.0));
+            let zoom = ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), Rect::from_center_size(Pos2::new(x, full.center().y), Vec2::new(w, full.height()))), |ui| {
                 if ui.add(egui::Button::new(ph::MINUS).frame(false)).on_hover_text("Zoom out (Cmd+-)").clicked() { self.actions.push(Action::ZoomTo(self.view.zoom / 1.2)); }
-                let mut z = self.view.zoom * 100.0;
-                if ui.add(egui::Slider::new(&mut z, 10.0..=400.0).show_value(false).logarithmic(true)).changed() { self.view.zoom = z / 100.0; }
+                if slider {
+                    ui.spacing_mut().slider_width = slider_w;
+                    let mut z = self.view.zoom * 100.0;
+                    if ui.add(egui::Slider::new(&mut z, 10.0..=400.0).show_value(false).logarithmic(true)).changed() { self.view.zoom = z / 100.0; }
+                }
                 if ui.add(egui::Button::new(ph::PLUS).frame(false)).on_hover_text("Zoom in (Cmd+=)").clicked() { self.actions.push(Action::ZoomTo(self.view.zoom * 1.2)); }
                 ui.label(format!("{:.0}%", self.view.zoom * 100.0));
                 if ui.add(egui::Button::new(ph::CORNERS_OUT).frame(false)).on_hover_text("Fit (Cmd+0)").clicked() { self.actions.push(Action::ZoomFit); }
             });
-            let used = zoom.response.rect.width();
-            if (used - w).abs() > 0.5 {
+            let used = zoom.response.rect.width() - if slider { slider_w + sp } else { 0.0 };
+            if (used - fixed).abs() > 0.5 {
                 ui.ctx().data_mut(|d| d.insert_temp(width_id, used));
                 ui.ctx().request_repaint();
             }
@@ -5149,63 +5186,10 @@ impl BioCartoon {
                 let mut over = false;
                 if !template {
                     let limit = if d.svg { crate::submit::MAX_SVG_BYTES } else { crate::submit::MAX_PNG_BYTES };
-                    // A raster image can be made smaller: width and height (or percent), in
-                    // proportion. An SVG has no pixels to change.
-                    let mut dragging = false;
-                    if let Some(img) = d.image.clone() {
-                        let (ow, oh) = img.dimensions();
-                        ui.horizontal(|ui| {
-                            ui.label("Resize");
-                            // Filled like the text fields above, so the numbers read as boxes to type in.
-                            let field_bg = ui.visuals().extreme_bg_color;
-                            ui.visuals_mut().widgets.inactive.weak_bg_fill = field_bg;
-                            let (mut w, mut h) = scaled_size((ow, oh), d.scale);
-                            let mut pct = d.scale * 100.0;
-                            let mut field = |ui: &mut egui::Ui, v: &mut f32, max: f32| {
-                                let r = ui.add(egui::DragValue::new(v).range(1.0..=max).max_decimals(if d.percent { 1 } else { 0 }).speed(if d.percent { 0.5 } else { 2.0 }));
-                                dragging |= r.dragged();
-                                r.changed()
-                            };
-                            if d.percent {
-                                let (mut a, mut b) = (pct, pct);
-                                let ch = field(ui, &mut a, 100.0);
-                                ui.label("×");
-                                let ch2 = field(ui, &mut b, 100.0);
-                                if ch { pct = a } else if ch2 { pct = b }
-                                d.scale = pct / 100.0;
-                            } else {
-                                let (mut wf, mut hf) = (w as f32, h as f32);
-                                if field(ui, &mut wf, ow as f32) {
-                                    w = wf.round() as u32;
-                                    d.scale = w as f32 / ow as f32;
-                                }
-                                ui.label("×");
-                                if field(ui, &mut hf, oh as f32) {
-                                    h = hf.round() as u32;
-                                    d.scale = h as f32 / oh as f32;
-                                }
-                            }
-                            egui::ComboBox::from_id_salt("upload_resize_unit").width(48.0).selected_text(if d.percent { "%" } else { "px" }).show_ui(ui, |ui| {
-                                ui.selectable_value(&mut d.percent, false, "px");
-                                ui.selectable_value(&mut d.percent, true, "%");
-                            });
-                        })
-                        .response
-                        .on_hover_text("Width and height keep the image's proportions");
-                        // The file size is worked out once a size is let go of, not on every step of a drag.
-                        if d.scale != d.out_scale && !dragging {
-                            d.out = Some(png_out(&img, d.scale));
-                            d.out_scale = d.scale;
-                        }
-                    }
                     match &d.out {
-                        Some(Ok((w, h, bytes))) if d.scale == d.out_scale => {
+                        Some(Ok((w, h, bytes))) => {
                             ui.label(format!("Size: {w} × {h} px ({})", crate::offline::human_bytes(*bytes as u64)));
                             over = *bytes > limit;
-                        }
-                        Some(Ok(_)) => {
-                            let (w, h) = d.image.as_ref().map(|i| scaled_size(i.dimensions(), d.scale)).unwrap_or_default();
-                            ui.label(format!("Size: {w} × {h} px (…)"));
                         }
                         Some(Err(e)) => {
                             ui.colored_label(theme::danger(), e);
@@ -5213,18 +5197,25 @@ impl BioCartoon {
                         None => {}
                     }
                     if over {
-                        let fix = if d.image.is_some() { "make it smaller above" } else { "simplify the drawing" };
-                        ui.colored_label(theme::danger(), format!("Icons can be up to {}: {fix}.", crate::offline::human_bytes(limit as u64)));
+                        ui.colored_label(theme::danger(), format!("Icons can be up to {}: simplify the drawing.", crate::offline::human_bytes(limit as u64)));
                     }
                     ui.label(if d.svg { "File type: SVG (vector)" } else { "File type: PNG (raster)" });
                 }
                 if png {
                     ui.checkbox(&mut d.png_ok, "This file is a PNG (raster). SVG (vector) is recommended for upload. Please check here to confirm this choice.");
                 }
+                let reduced = match (d.reduced_from, &d.out) {
+                    (Some((ow, oh)), Some(Ok((w, h, _)))) => Some((ow, oh, *w, *h)),
+                    _ => None,
+                };
+                if let Some((ow, oh, w, h)) = reduced {
+                    let pct = (100.0 * (1.0 - w as f32 / ow as f32)).round();
+                    ui.checkbox(&mut d.reduced_ok, format!("The image size was reduced {pct}% ({ow} × {oh} px {} {w} × {h} px) in order to meet the maximum upload size. Please check here to confirm this choice.", ph::ARROW_RIGHT));
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let credited = !d.share || d.license != "CC-BY-4.0" || !d.credit.trim().is_empty();
-                    let can = !d.name.trim().is_empty() && credited && (!d.share || can_submit) && (!png || d.png_ok) && !over;
+                    let can = !d.name.trim().is_empty() && credited && (!d.share || can_submit) && (!png || d.png_ok) && (reduced.is_none() || d.reduced_ok) && !over;
                     let label = if d.share { "Submit" } else { "Save" };
                     let b = ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(theme::accent()));
                     let why = if d.name.trim().is_empty() {
@@ -5234,9 +5225,11 @@ impl BioCartoon {
                     } else if d.share && !can_submit {
                         "No submission server is set up"
                     } else if over {
-                        "Too large: make it smaller first"
-                    } else {
+                        "Too large: simplify it first"
+                    } else if png && !d.png_ok {
                         "Confirm adding it as a PNG first"
+                    } else {
+                        "Confirm adding it at the reduced size first"
                     };
                     if b.on_disabled_hover_text(why).clicked() { *submit = true; }
                     if ui.button(if d.queue.is_empty() { "Cancel" } else { "Cancel all" }).clicked() { *cancel = true; }
@@ -5281,7 +5274,13 @@ impl BioCartoon {
                 painter.rect_filled(c.intersect(rect), 0.0, Color32::from_gray(232));
             }
         }
+        // A raster image shows the pixels that are added, which may be fewer than the file's.
+        if let (Some(img), None) = (&d.image, &d.preview) {
+            let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+            d.preview = Some(ui.ctx().load_texture("upload_preview", ci, egui::TextureOptions::LINEAR));
+        }
         let content: Option<Vec2> = match &d.target {
+            _ if d.preview.is_some() => d.preview.as_ref().map(|t| t.size_vec2()),
             UploadTarget::File(_) | UploadTarget::Library(_) => match self.images.file(&d.target.image_path().unwrap_or_default()) {
                 ImgState::Ready { size, .. } => Some(Vec2::new(size[0] as f32, size[1] as f32)),
                 _ => None,
@@ -5313,6 +5312,11 @@ impl BioCartoon {
             let shown = Rect::from_center_size(rect.center() + d.view_pan, c * scale);
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             match &d.target {
+                _ if d.preview.is_some() => {
+                    if let Some(t) = &d.preview {
+                        painter.image(t.id(), shown, uv, Color32::WHITE);
+                    }
+                }
                 UploadTarget::File(_) | UploadTarget::Library(_) => {
                     if let ImgState::Ready { tex, .. } = self.images.file(&d.target.image_path().unwrap_or_default()) {
                         painter.image(tex.id(), shown, uv, Color32::WHITE);
@@ -5373,7 +5377,7 @@ impl BioCartoon {
     /// Headless-ish smoke test: `BIOCARTOON_SCREENSHOT=out.png` captures the window after a
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
-    /// settings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
+    /// settings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, textedit, tableedit, placetext,
     /// comments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
@@ -5595,6 +5599,15 @@ impl BioCartoon {
                         let path = self.app_dir.join("generated").join(name);
                         if crate::storage::write(&path, bytes).is_ok() {
                             self.open_upload_dialog(UploadTarget::File(path), step.starts_with("share"));
+                        }
+                    }
+                    // A PNG over the upload limit, so the dialog makes it smaller.
+                    "sharebigpng" => {
+                        let img = image::RgbaImage::from_fn(1600, 1200, |x, y| image::Rgba((x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_mul(2246822519).to_le_bytes()));
+                        let path = self.app_dir.join("generated").join("demo-big.png");
+                        let mut bytes = std::io::Cursor::new(Vec::new());
+                        if img.write_to(&mut bytes, image::ImageFormat::Png).is_ok() && crate::storage::write(&path, &bytes.into_inner()).is_ok() {
+                            self.open_upload_dialog(UploadTarget::File(path), true);
                         }
                     }
                     "aisetup" => self.open_ai_setup(None),
@@ -5897,9 +5910,17 @@ mod tests {
         assert_eq!(scaled(&img, 2.0).dimensions(), (400, 100));
         assert_eq!(scaled(&img, 0.32).dimensions(), (128, 32));
         assert_eq!(scaled_size((400, 100), 0.001), (1, 1));
-        let (w, h, bytes) = png_out(&img, 0.32).unwrap();
-        assert_eq!((w, h), (128, 32));
-        assert!(bytes > 0 && bytes <= png_out(&img, 1.0).unwrap().2);
+        // Kept as it is under the limit; made smaller, in proportion, to fit under it.
+        let (fit, bytes) = fit_png(&img, crate::submit::MAX_PNG_BYTES).unwrap();
+        assert_eq!((fit.dimensions(), bytes), ((400, 100), png_bytes(&img).unwrap()));
+        let noise = image::RgbaImage::from_fn(600, 300, |x, y| {
+            let v = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_mul(2246822519);
+            image::Rgba(v.to_le_bytes())
+        });
+        let limit = png_bytes(&noise).unwrap() / 3;
+        let (fit, bytes) = fit_png(&noise, limit).unwrap();
+        assert!(bytes <= limit && bytes > limit / 2, "{bytes} of {limit}");
+        assert!(fit.width() < 600 && (fit.width() as f32 / fit.height() as f32 - 2.0).abs() < 0.02);
     }
 
     /// Submitted files, and library icons by fingerprint or by id, are recognized.
