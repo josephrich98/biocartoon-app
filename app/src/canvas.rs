@@ -3,7 +3,7 @@
 
 use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, UploadTarget};
 use crate::assets::{ImageCache, ImgState, IMAGE_EXTS};
-use crate::doc::{c32, screen_font, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, ShapeKind, Slide, TextAlign, TextVAlign, Unit, DPI};
+use crate::doc::{c32, screen_font, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, ShapeKind, Slide, TextAlign, TextFlag, TextVAlign, Unit, DPI};
 use crate::theme;
 use egui::emath::Rot2;
 use std::path::Path;
@@ -539,17 +539,14 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
                 }
             }
         }
-        ItemKind::Text { color, bold, .. } => {
+        ItemKind::Text { text, color, .. } => {
             let col = c32(*color).gamma_multiply(op);
-            let Some((galley, pos, c)) = text_layout(painter, xf, it, col) else { return };
-            let p = rotate_about(pos, c, it.rotation);
-            let mut ts = egui::epaint::TextShape::new(p, galley.clone(), col).with_angle(it.rotation);
-            if *bold {
+            let Some((galley, pos, c)) = text_layout(painter, xf, it, op) else { return };
+            if let Some(job) = bold_overlay(&galley.job, &it.kind, text) {
                 let p2 = rotate_about(pos + Vec2::new(0.6 * z.max(1.0), 0.0), c, it.rotation);
-                painter.add(Shape::Text(egui::epaint::TextShape::new(p2, galley, col).with_angle(it.rotation)));
+                painter.add(Shape::Text(egui::epaint::TextShape::new(p2, painter.layout_job(job), col).with_angle(it.rotation)));
             }
-            ts.override_text_color = Some(col);
-            painter.add(Shape::Text(ts));
+            painter.add(Shape::Text(egui::epaint::TextShape::new(rotate_about(pos, c, it.rotation), galley, col).with_angle(it.rotation)));
         }
         ItemKind::Shape { shape, fill, stroke, stroke_width } => {
             let r = it.rect();
@@ -684,26 +681,52 @@ fn draw_code(painter: &egui::Painter, rs: Rect, z: f32, op: f32, code: &str, lan
     }
 }
 
-/// The layout job for a text item's text at `zoom`, wrapped to `width` screen px. The canvas, the
-/// on-canvas editor and the exports all lay text out with it, so they break lines the same way.
-pub(crate) fn text_job(ctx: &egui::Context, text: &str, kind: &ItemKind, zoom: f32, width: f32, col: Color32) -> egui::text::LayoutJob {
-    let ItemKind::Text { size, align, italic, underline, font, line_spacing, .. } = kind else { return Default::default() };
+/// The layout job for a text item's text at `zoom`, wrapped to `width` screen px, faded to
+/// `op`. The canvas, the on-canvas editor and the exports all lay text out with it, so they
+/// break lines the same way. Its sections are [`crate::doc::text_sections`]'s.
+pub(crate) fn text_job(ctx: &egui::Context, text: &str, kind: &ItemKind, zoom: f32, width: f32, op: f32) -> egui::text::LayoutJob {
+    let ItemKind::Text { size, align, font, line_spacing, .. } = kind else { return Default::default() };
     let px = screen_font(ctx, size * zoom);
     let font_id = font.font_id(px);
     let line_height = (*line_spacing != 1.0).then(|| ctx.fonts_mut(|f| f.row_height(&font_id)) * line_spacing.max(0.1));
-    let format = egui::TextFormat {
-        font_id,
-        color: col,
-        italics: *italic,
-        underline: if *underline { Stroke::new((px / 14.0).max(1.0), col) } else { Stroke::NONE },
-        line_height,
-        ..Default::default()
-    };
-    let mut job = egui::text::LayoutJob::single_section(text.to_string(), format);
+    let line = (px / 14.0).max(1.0);
+    let mut job = egui::text::LayoutJob::default();
+    for (range, look) in crate::doc::text_sections(kind, text) {
+        let col = c32(look.color).gamma_multiply(op);
+        let format = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: col,
+            italics: look.italic,
+            underline: if look.underline { Stroke::new(line, col) } else { Stroke::NONE },
+            strikethrough: if look.strike { Stroke::new(line, col) } else { Stroke::NONE },
+            line_height,
+            ..Default::default()
+        };
+        job.append(&text[range], 0.0, format);
+    }
     job.wrap.max_width = width.max(4.0);
     job.halign = text_halign(*align);
     job.justify = *align == TextAlign::Justify;
     job
+}
+
+/// `job` (a [`text_job`] of `text`) with only its bold characters showing, and no lines under or
+/// through them: drawn a little to the right of the text, it thickens them (the fonts have no
+/// bold faces). `None` when nothing is bold.
+pub(crate) fn bold_overlay(job: &egui::text::LayoutJob, kind: &ItemKind, text: &str) -> Option<egui::text::LayoutJob> {
+    let sections = crate::doc::text_sections(kind, text);
+    if !sections.iter().any(|(r, l)| l.bold && !r.is_empty()) {
+        return None;
+    }
+    let mut job = job.clone();
+    for (sec, (_, look)) in job.sections.iter_mut().zip(&sections) {
+        sec.format.underline = Stroke::NONE;
+        sec.format.strikethrough = Stroke::NONE;
+        if !look.bold {
+            sec.format.color = Color32::TRANSPARENT;
+        }
+    }
+    Some(job)
 }
 
 pub(crate) fn text_halign(align: TextAlign) -> egui::Align {
@@ -732,10 +755,10 @@ pub(crate) fn text_origin(galley: &egui::Galley, r: Rect, kind: &ItemKind) -> Po
 
 /// A text item laid out on screen: the galley, its top-left before rotation, and the centre it
 /// rotates about.
-fn text_layout(painter: &egui::Painter, xf: &Xform, it: &Item, col: Color32) -> Option<(std::sync::Arc<egui::Galley>, Pos2, Pos2)> {
+fn text_layout(painter: &egui::Painter, xf: &Xform, it: &Item, op: f32) -> Option<(std::sync::Arc<egui::Galley>, Pos2, Pos2)> {
     let ItemKind::Text { text, .. } = &it.kind else { return None };
     let rs = xf.rect(it.rect());
-    let galley = painter.layout_job(text_job(painter.ctx(), text, &it.kind, xf.zoom, rs.width(), col));
+    let galley = painter.layout_job(text_job(painter.ctx(), text, &it.kind, xf.zoom, rs.width(), op));
     Some((galley.clone(), text_origin(&galley, rs, &it.kind), rs.center()))
 }
 
@@ -777,7 +800,7 @@ fn draw_squiggles(painter: &egui::Painter, xf: &Xform, slide: &Slide, spell: &cr
                 if skipped.is_some() || spell.at(it.id, None).next().is_none() {
                     continue;
                 }
-                let Some((galley, pos, c)) = text_layout(painter, xf, it, Color32::WHITE) else { continue };
+                let Some((galley, pos, c)) = text_layout(painter, xf, it, 1.0) else { continue };
                 crate::spell::paint_squiggles(painter, &galley, text, spell.at(it.id, None), z, |p| rotate_about(pos + p.to_vec2(), c, it.rotation));
             }
             ItemKind::Table { rows, cols, cells, font_size, .. } => {
@@ -960,6 +983,7 @@ impl BioCartoon {
                 let r = xf.rect(Rect::from_two_pos(*start, *current));
                 painter.rect(r, 0.0, Color32::from_rgba_unmultiplied(47, 128, 237, 30), Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
             }
+            self.snake_ui(ui, &painter, &xf, page_s, bg);
             self.comments_ui(ui, rect, &xf);
         });
     }
@@ -1086,9 +1110,19 @@ impl BioCartoon {
         let z = xf.zoom;
         let rs = xf.rect(before.rect());
         let mut edited = before.clone();
-        let ItemKind::Text { text, color, bold, align, valign, .. } = &mut edited.kind else { return };
-        let col = c32(*color).gamma_multiply(before.opacity.clamp(0.0, 1.0));
-        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| ui.painter().layout_job(text_job(ui.ctx(), buf.as_str(), &before.kind, z, rs.width(), col));
+        if ui.memory(|m| m.has_focus(egui::Id::new(("text_editor", id)))) {
+            let keys = [(egui::Key::B, TextFlag::Bold), (egui::Key::I, TextFlag::Italic), (egui::Key::U, TextFlag::Underline)];
+            if let Some((_, flag)) = ui.input_mut(|i| keys.into_iter().find(|(k, _)| i.consume_key(egui::Modifiers::COMMAND, *k))) {
+                // The selected letters, or the whole box when none are.
+                let sel = self.text_selection(id);
+                let on = !crate::doc::flag_all(&edited.kind, sel.clone(), flag);
+                crate::doc::set_flag(&mut edited.kind, sel, flag, on);
+            }
+        }
+        let ItemKind::Text { text, color, align, valign, .. } = &mut edited.kind else { return };
+        let op = before.opacity.clamp(0.0, 1.0);
+        let col = c32(*color).gamma_multiply(op);
+        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| ui.painter().layout_job(text_job(ui.ctx(), buf.as_str(), &before.kind, z, rs.width(), op));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rs).layout(egui::Layout::top_down(egui::Align::Min)));
         child.set_clip_rect(canvas.intersect(ui.clip_rect()));
         // A blinking caret in the text's own colour (the theme's would vanish on a light page).
@@ -1111,8 +1145,9 @@ impl BioCartoon {
         // A light outline marks the box while typing (selection outline and handles are hidden meanwhile).
         child.painter().rect_stroke(rs.expand(2.0), 0.0, Stroke::new(1.0, Color32::from_gray(160)), StrokeKind::Outside);
         let pos = out.galley_pos - Vec2::new(out.galley.rect.left(), 0.0);
-        if *bold {
-            child.painter().galley(pos + Vec2::new(0.6 * z.max(1.0), 0.0), out.galley.clone(), col);
+        if let Some(job) = bold_overlay(&out.galley.job, &before.kind, text) {
+            let painter = child.painter();
+            painter.galley(pos + Vec2::new(0.6 * z.max(1.0), 0.0), painter.layout_job(job), col);
         }
         if self.spelling_visible() {
             crate::spell::paint_squiggles(child.painter(), &out.galley, text, self.spell.at(id, None), z, |q| pos + q.to_vec2());
@@ -1126,6 +1161,9 @@ impl BioCartoon {
             self.finish_text_edit();
         }
         if edited != before {
+            if let ItemKind::Text { text, .. } = &before.kind {
+                edited.remap_text_runs(text);
+            }
             self.update_item(&before, edited);
         }
     }
@@ -1297,7 +1335,7 @@ impl BioCartoon {
         if items.len() == 1 && items[0].is_line() {
             return;
         }
-        let sel = self.selection_rect().unwrap();
+        let Some(sel) = self.selection_rect() else { return };
         if single.is_none() {
             painter.rect_stroke(xf.rect(sel), 0.0, Stroke::new(1.0, theme::accent()), StrokeKind::Outside);
         }
@@ -1866,7 +1904,7 @@ impl BioCartoon {
         self.actions.extend(acts);
         ui.separator();
         let fav = asset_id.as_ref().is_some_and(|id| self.settings.favorites.contains(id));
-        let tip = if asset_id.is_some() { "Favorites are listed in the Icons panel" } else { "Only library artwork can be a favorite" };
+        let tip = if asset_id.is_some() { "Favorites are listed in the Artwork panel" } else { "Only library artwork can be a favorite" };
         let b = egui::Button::new(format!("{}  {}", ph::STAR, if fav { "Unfavorite" } else { "Favorite" }));
         if ui.add_enabled(asset_id.is_some(), b).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
             self.actions.extend(asset_id.map(Action::ToggleFavorite));

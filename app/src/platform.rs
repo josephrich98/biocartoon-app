@@ -39,6 +39,7 @@ pub fn pick_files(filter: &str, exts: &[&str], multiple: bool, done: impl FnOnce
 /// turns the write into a download.
 pub fn save_path(filter: &str, ext: &str, file_name: &str) -> Option<PathBuf> {
     #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_arch = "wasm32"))]
     return ::rfd::FileDialog::new().add_filter(filter, &[ext]).set_file_name(file_name).save_file();
     #[cfg(target_arch = "wasm32")]
     {
@@ -163,6 +164,108 @@ pub fn route_quit_through_close() {
                 }
             }
         }
+    }
+}
+
+/// macOS: Finder hands the app the files it opens (a double-clicked `.biocartoon` file, or one
+/// dropped on the Dock icon) as an Apple Event, not on the command line, both at launch and while
+/// it runs. Winit leaves that event to AppKit, which has no idea what to do with it. Call once,
+/// before the event loop starts: the launch's event comes before the first frame. Collect the
+/// files with [`take_opened_files`].
+pub fn receive_opened_files() {
+    #[cfg(target_os = "macos")]
+    mac_open::install();
+}
+
+/// Files Finder asked the app to open since the last call (see [`receive_opened_files`]). `ctx`
+/// is repainted when more arrive, so they're picked up even while the app is idle.
+pub fn take_opened_files(ctx: &egui::Context) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return mac_open::take(ctx);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ctx;
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod mac_open {
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, NSObject};
+    use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
+    use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager, NSNotification, NSNotificationCenter, NSString};
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    // Four-character codes: kCoreEventClass, kAEOpenDocuments and keyDirectObject.
+    const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
+    const OPEN_DOCUMENTS: u32 = u32::from_be_bytes(*b"odoc");
+    const DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
+
+    static OPENED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static CTX: OnceLock<egui::Context> = OnceLock::new();
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "BioCartoonOpenFiles"]
+        struct Handler;
+
+        impl Handler {
+            /// AppKit installs its own Apple Event handlers before this and dispatches the
+            /// launch's open event after it, so this is the moment to take that event over.
+            #[unsafe(method(willFinishLaunching:))]
+            fn will_finish_launching(&self, _note: &NSNotification) {
+                unsafe {
+                    let _: () = msg_send![
+                        &*NSAppleEventManager::sharedAppleEventManager(),
+                        setEventHandler: self as &AnyObject,
+                        andSelector: sel!(openDocuments:withReplyEvent:),
+                        forEventClass: CORE_EVENT_CLASS,
+                        andEventID: OPEN_DOCUMENTS
+                    ];
+                }
+            }
+
+            #[unsafe(method(openDocuments:withReplyEvent:))]
+            fn open_documents(&self, event: &NSAppleEventDescriptor, _reply: &NSAppleEventDescriptor) {
+                let Some(list): Option<Retained<NSAppleEventDescriptor>> = (unsafe { msg_send![event, paramDescriptorForKeyword: DIRECT_OBJECT] }) else { return };
+                // Usually a list of files, but a lone file is allowed too.
+                let items: Vec<_> = match list.numberOfItems() {
+                    0 => vec![list],
+                    n => (1..=n).filter_map(|i| list.descriptorAtIndex(i)).collect(),
+                };
+                let paths: Vec<PathBuf> = items.iter().filter_map(|d| d.fileURLValue()?.path()).map(|p| PathBuf::from(p.to_string())).collect();
+                if paths.is_empty() {
+                    return;
+                }
+                OPENED.lock().unwrap_or_else(|e| e.into_inner()).extend(paths);
+                if let Some(ctx) = CTX.get() {
+                    ctx.request_repaint();
+                }
+            }
+        }
+    );
+
+    pub fn install() {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let handler: Retained<Handler> = unsafe { msg_send![super(Handler::alloc(mtm).set_ivars(())), init] };
+        unsafe {
+            NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+                &handler,
+                sel!(willFinishLaunching:),
+                Some(&NSString::from_str("NSApplicationWillFinishLaunchingNotification")),
+                None,
+            );
+        }
+        // Neither the notification center nor the event manager keeps its target alive.
+        std::mem::forget(handler);
+    }
+
+    pub fn take(ctx: &egui::Context) -> Vec<PathBuf> {
+        CTX.get_or_init(|| ctx.clone());
+        std::mem::take(&mut *OPENED.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 

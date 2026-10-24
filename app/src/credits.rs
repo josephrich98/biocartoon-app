@@ -91,12 +91,14 @@ pub fn list(credits: &[Credit], only_required: bool) -> String {
 }
 
 /// Ids of catalog assets in `doc` that don't carry their credit yet (documents saved before
-/// credits were stored). Template images are left out: their credit comes with the template.
+/// credits were stored), or that were placed from their PNG before the catalog had their SVG.
+/// Template images are left out: their credit comes with the template.
 pub fn missing(doc: &Document) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for it in doc.slides.iter().flat_map(|s| &s.items) {
+        let no_svg = matches!(&it.kind, ItemKind::Image { source: ImageSource::Asset { svg: None, .. }, .. });
         if let Some((ImageSource::Asset { id, source, credit, .. }, _)) = origin(it) {
-            if credit.is_empty() && source != "template" && !ids.contains(id) {
+            if (credit.is_empty() || no_svg) && source != "template" && !ids.contains(id) {
                 ids.push(id.clone());
             }
         }
@@ -104,10 +106,19 @@ pub fn missing(doc: &Document) -> Vec<String> {
     ids
 }
 
-/// Copy credit lines from catalog rows into every image of `slides` that uses them.
+/// Copy credit lines from catalog rows into every image of `slides` that uses them, and give
+/// images placed from a PNG the SVG the catalog now has, so they export as vectors. A PNG
+/// shows the SVG's whole artboard, so the image is unfitted again and the editor (and export)
+/// moves it onto the drawing once the SVG loads; BioArt crops its PNGs to the drawing already.
 pub fn fill<'a>(slides: impl IntoIterator<Item = &'a mut Slide>, rows: &[AssetRow]) {
     for it in slides.into_iter().flat_map(|s| s.items.iter_mut()) {
         let ItemKind::Image { source, .. } = &mut it.kind else { continue };
+        if let ImageSource::Asset { id, svg: svg @ None, source: db, .. } = source {
+            if let Some(key) = rows.iter().find(|r| &r.id == id).and_then(|r| r.svg_key.clone()).filter(|_| db != "template") {
+                *svg = Some(key);
+                it.fitted = db == "bioart";
+            }
+        }
         if let Some(ImageSource::Asset { id, credit, license, .. }) = source.origin_mut() {
             if let Some(r) = rows.iter().find(|r| &r.id == id) {
                 *credit = r.credit.clone();
@@ -313,6 +324,9 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
             action = Some(CreditsAction::Save { required: true });
         }
     });
+    ui.label(dim(
+        "AI-generated labels for third party assets and user-generated assets may contain errors.",
+    ));
     ui.separator();
     // A filter for the list below, set apart from it so it doesn't read as a credit.
     ui.checkbox(only, "Only show credits for licenses requiring credit")
@@ -395,14 +409,20 @@ mod tests {
             png_local: None,
             png_width: 1,
             png_height: 1,
-            svg_key: None,
+            svg_key: Some("servier/cell.svg".into()),
             stars: 0,
             starred: false,
             taxa: Vec::new(),
             layers: Vec::new(),
+            generative_ai_used: None,
+            file_bytes: 0,
         };
         fill(doc.slides.iter_mut(), &[row]);
         assert!(missing(&doc).is_empty());
+        // The image placed from the PNG gets the SVG, to be fitted to its drawing once it loads.
+        let it = &doc.slides[0].items[0];
+        assert!(matches!(&it.kind, ItemKind::Image { source: ImageSource::Asset { svg: Some(k), .. }, .. } if k == "servier/cell.svg"));
+        assert!(!it.fitted);
         let c = collect(&doc.slides, 1);
         assert_eq!(c[0].credit, "\"Cell\", Servier");
         assert!(c[0].derived);

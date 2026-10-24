@@ -83,6 +83,7 @@
     details ol { margin: 0 0 14px; padding-left: 22px; color: var(--dim); }
     details li { margin-bottom: 4px; }
     details b { color: var(--text); font-weight: 600; }
+    details .sub { margin: 0 0 6px; font-weight: 600; font-size: 15px; }
     code { background: var(--raised); border-radius: 5px; padding: 1px 6px; font-size: 14px; }
 
     .notice {
@@ -155,6 +156,7 @@
       <details data-os="mac">
         <summary>macOS</summary>
         <ol>
+          <li>Download <code>BioCartoon-macOS.dmg</code>.</li>
           <li>Open <code>BioCartoon-macOS.dmg</code> and drag <b>BioCartoon</b> into <b>Applications</b>.</li>
           <li>Open BioCartoon from Applications. The app is signed and notarized by Apple, so it opens like any other app.</li>
         </ol>
@@ -162,16 +164,26 @@
       <details data-os="windows">
         <summary>Windows</summary>
         <ol>
-          <li>Run <code>BioCartoon-Windows-setup.exe</code>. It installs for your user account, so you don't need admin rights.</li>
+          <li>Download <code>BioCartoon-Windows-setup.exe</code>.</li>
+          <li>If your browser warns that <b>"BioCartoon-Windows-setup.exe isn't commonly downloaded"</b>, click the <b>three dots</b> &rarr; <b>Keep</b> &rarr; <b>dropdown arrow</b> &rarr; <b>Keep anyway</b>.</li>
+          <li>Open <code>BioCartoon-Windows-setup.exe</code> and follow the prompts to install. It installs for your user account, so you don't need admin rights.</li>
           <li>If Windows shows <b>"Windows protected your PC"</b>, click <b>More info</b> and then <b>Run anyway</b>.</li>
-          <li>Start BioCartoon from the Start menu.</li>
+          <li>Open BioCartoon from the Start menu.</li>
         </ol>
       </details>
       <details data-os="linux">
         <summary>Linux</summary>
+        <p class="sub">AppImage</p>
         <ol>
-          <li><b>AppImage:</b> make it executable with <code>chmod +x BioCartoon-Linux-x86_64.AppImage</code>, then run it.</li>
-          <li><b>.deb:</b> install with <code>sudo apt install ./BioCartoon-Linux-amd64.deb</code>.</li>
+          <li>Download <code>BioCartoon-Linux-x86_64.AppImage</code>.</li>
+          <li>Make it executable with <code>chmod +x BioCartoon-Linux-x86_64.AppImage</code>.</li>
+          <li>Open <code>BioCartoon-Linux-x86_64.AppImage</code>.</li>
+        </ol>
+        <p class="sub">.deb (Debian, Ubuntu)</p>
+        <ol>
+          <li>Download <code>BioCartoon-Linux-amd64.deb</code>.</li>
+          <li>Install it with <code>sudo apt install ./BioCartoon-Linux-amd64.deb</code>.</li>
+          <li>Open BioCartoon from your applications menu.</li>
         </ol>
       </details>
     </section>

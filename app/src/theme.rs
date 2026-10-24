@@ -163,12 +163,13 @@ pub fn apply(ctx: &egui::Context, dark: bool, text_scale: f32) {
 }
 
 /// The virtual database holding BioCartoon's own assets: its templates, and the uploads
-/// (source `user`) whose author is BioCartoon.
+/// (source `user`) a reviewer accepted to it, whose `source_name` is BioCartoon (or, from before
+/// authors were kept, whose author is).
 pub use biocartoon_catalog::catalog::{BIOCARTOON_AUTHOR, BIOCARTOON_SOURCE};
 
-/// The database an asset is shown under: BioCartoon's own uploads count as BioCartoon.
-pub fn asset_source<'a>(source: &'a str, author: &str) -> &'a str {
-    if source == "user" && author == BIOCARTOON_AUTHOR { BIOCARTOON_SOURCE } else { source }
+/// The database an asset is shown under: uploads accepted to BioCartoon count as BioCartoon.
+pub fn asset_source(row: &crate::catalog::AssetRow) -> &str {
+    if row.source == "user" && (row.source_name == BIOCARTOON_AUTHOR || row.author == BIOCARTOON_AUTHOR) { BIOCARTOON_SOURCE } else { &row.source }
 }
 
 /// Colour + abbreviation badge for each asset database (lower-left corner of result tiles). The

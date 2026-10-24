@@ -533,7 +533,12 @@ impl BioCartoon {
                     if current.as_deref() == Some(is.found.as_str()) {
                         self.commit();
                         if let Some(t) = text_mut(&mut self.doc, is.place) {
+                            let old = t.clone();
                             t.replace_range(is.range.clone(), &fix);
+                            // The fixed word keeps its letters' bold, colour and so on.
+                            if let Some(it) = self.doc.slides.get_mut(is.place.slide).and_then(|s| s.items.iter_mut().find(|i| i.id == is.place.item)) {
+                                it.remap_text_runs(&old);
+                            }
                         }
                     }
                 }

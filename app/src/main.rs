@@ -20,6 +20,8 @@ fn main() -> eframe::Result {
         .with_app_id("com.biocartoon.app")
         .with_inner_size([1600.0, 980.0])
         .with_min_inner_size([1100.0, 700.0]);
+    // macOS sends them as an Apple Event instead; the app collects those every frame.
+    biocartoon::platform::receive_opened_files();
     if let Some(icon) = biocartoon::icon_data() {
         viewport = viewport.with_icon(icon);
     }

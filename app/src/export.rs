@@ -8,6 +8,7 @@ use crate::assets::{fetch, Request};
 use crate::canvas::{corners, head_geom, line_paths, shape_polygons, HeadGeom};
 use crate::doc::{FontKind, Item, ItemKind, LayerStyle, Slide, TextAlign, TextFont, DPI};
 use base64::Engine;
+use egui::epaint::text::Glyph;
 use egui::{Color32, FontId, Pos2, Rect, Vec2};
 use image::RgbaImage;
 use resvg::usvg::{self, fontdb};
@@ -437,21 +438,64 @@ fn text_rows(out: &mut String, ctx: &egui::Context, text: &str, size: f32, wrap:
         TextAlign::Right => origin.x + box_w - gw,
     };
     for prow in &galley.rows {
-        let row = &prow.row;
-        let Some(g0) = row.glyphs.first() else { continue };
-        let s: String = row.glyphs.iter().map(|g| g.chr).collect();
+        let glyphs = real_glyphs(&prow.row.glyphs);
+        let Some(g0) = glyphs.first() else { continue };
+        let (s, xs) = logical_text(&glyphs, x0 + prow.pos.x);
         let x = x0 + prow.pos.x + g0.pos.x;
         let y = origin.y + prow.pos.y + g0.pos.y;
-        let _ = writeln!(out, r#"<text x="{}" y="{}">{}</text>"#, n(x), n(y), esc(&s));
+        let _ = writeln!(out, r#"<text x="{}" y="{}">{}</text>"#, n(x), n(y), row_markup(TextFont::Sans, &s, &xs));
     }
 }
 
-/// Whether `font`'s face has a glyph for each of `s`'s characters. Always true for Ubuntu, whose
-/// fallbacks are the renderer's own.
+/// Strongly right-to-left characters (Hebrew, Arabic and their neighbours).
+fn is_rtl(c: char) -> bool {
+    matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
+}
+
+/// A row's glyphs without the copies egui adds after a right-to-left run: its shaper meets the
+/// run's clusters in reverse and appends the run's characters after the first again, as
+/// zero-width "continuation" glyphs (epaint 0.36's `emit_continuation_glyphs`).
+fn real_glyphs(glyphs: &[Glyph]) -> Vec<&Glyph> {
+    let mut out: Vec<&Glyph> = Vec::with_capacity(glyphs.len());
+    let mut i = 0;
+    while i < glyphs.len() {
+        let k = glyphs[i..].iter().take_while(|g| g.advance_width == 0.0 && g.chr != '\n').count();
+        // The copies, reversed, are the glyphs just before them less the last (the run's first).
+        if k > 0 && out.len() > k && glyphs[i..i + k].iter().any(|g| is_rtl(g.chr)) && glyphs[i..i + k].iter().rev().zip(&out[out.len() - k - 1..]).all(|(a, b)| a.chr == b.chr) {
+            i += k;
+            continue;
+        }
+        out.push(&glyphs[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Glyphs as text in logical order, with each character's x (`x0` plus the glyph's): egui shapes
+/// each word of right-to-left text on its own and leaves it in the order it is drawn, which
+/// resvg would reverse a second time. A reversed word's characters all take its left edge,
+/// where its chunk starts.
+fn logical_text(glyphs: &[&Glyph], x0: f32) -> (String, Vec<f32>) {
+    let mut chars: Vec<char> = glyphs.iter().map(|g| g.chr).collect();
+    let mut xs: Vec<f32> = glyphs.iter().map(|g| x0 + g.pos.x).collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let j = i + chars[i..].iter().take_while(|c| is_rtl(**c)).count();
+        if j > i {
+            chars[i..j].reverse();
+            let left = xs[i];
+            xs[i..j].fill(left);
+        }
+        i = j.max(i + 1);
+    }
+    (chars.into_iter().collect(), xs)
+}
+
+/// Whether `font`'s face has a glyph for each of `s`'s characters.
 fn covered(font: TextFont, s: &str) -> Vec<bool> {
     let all = vec![true; s.chars().count()];
     let family = match font {
-        TextFont::Sans => return all,
+        TextFont::Sans => fonts().family.as_str(),
         TextFont::Mono => "Hack",
         f => f.embedded_name().unwrap_or_default(),
     };
@@ -465,22 +509,46 @@ fn covered(font: TextFont, s: &str) -> Vec<bool> {
     .unwrap_or(all)
 }
 
-/// A row's text for its `<text>`, with runs of characters the item's font lacks (Greek in
-/// many of the bundled fonts, say) in a `<tspan>` of Ubuntu. resvg shapes a whole text chunk
-/// with one font and, when that font lacks a character, redraws the chunk in a fallback that has
-/// them all, unlike the canvas, which falls back glyph by glyph; so every run after the first
-/// starts a chunk of its own, at the x (`xs`, one per character) where egui put it.
+/// The family to draw `c` in when a text's font lacks it: egui's own fallbacks first, as on the
+/// canvas, then any system font that has it; None when no font does.
+fn fallback_family(c: char) -> Option<String> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<char, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(f) = cache.lock().ok().and_then(|m| m.get(&c).cloned()) {
+        return f;
+    }
+    let f = fonts();
+    let has = |id: fontdb::ID| f.db.with_face_data(id, |data, index| ttf_parser::Face::parse(data, index).is_ok_and(|face| face.glyph_index(c).is_some())).unwrap_or(false);
+    // Hidden system faces are no fallback: ".LastResort" draws every character as a box.
+    let system = f.db.faces().filter(|face| !face.families.iter().any(|(n, _)| n.starts_with('.'))).map(|face| face.id);
+    let found = f.bundled.iter().copied().chain(system).find(|id| has(*id)).and_then(|id| f.db.face(id)).and_then(|face| face.families.first().map(|(n, _)| n.clone()));
+    if let Ok(mut m) = cache.lock() {
+        m.insert(c, found.clone());
+    }
+    found
+}
+
+/// A row's text for its `<text>`, with each run of characters the item's font lacks (Greek in
+/// many of the bundled fonts, emoji and CJK in all of them) in a `<tspan>` of a font that has
+/// them. resvg shapes a whole text chunk with one font and, when that font lacks a character,
+/// redraws the chunk in a fallback that has them all, unlike the canvas, which falls back glyph
+/// by glyph; so every run after the first starts a chunk of its own, at the x (`xs`, one per
+/// character) where egui put it.
 fn row_markup(font: TextFont, s: &str, xs: &[f32]) -> String {
     let mut out = String::new();
     let mut run = String::new();
     let mut run_x = None;
-    let mut run_missing = false;
-    let mut flush = |run: &mut String, x: Option<f32>, missing: bool| {
+    let mut run_family: Option<String> = None;
+    let mut flush = |run: &mut String, x: Option<f32>, family: &Option<String>| {
         if run.is_empty() {
             return;
         }
         let x = x.map(|x| format!(r#" x="{}""#, n(x))).unwrap_or_default();
-        let family = if missing { format!(r#" font-family="{}""#, esc(&font_family())) } else { String::new() };
+        let family = match family {
+            Some(f) if *f == fonts().family => format!(r#" font-family="{}""#, esc(&font_family())),
+            Some(f) => format!(r#" font-family="{}""#, esc(&format!("'{f}', {}", font_family()))),
+            None => String::new(),
+        };
         if x.is_empty() && family.is_empty() {
             out.push_str(&esc(run));
         } else {
@@ -489,42 +557,70 @@ fn row_markup(font: TextFont, s: &str, xs: &[f32]) -> String {
         run.clear();
     };
     for (i, (c, ok)) in s.chars().zip(covered(font, s)).enumerate() {
-        let missing = !ok && !c.is_whitespace();
-        if missing != run_missing && !run.is_empty() {
-            flush(&mut run, run_x, run_missing);
+        let family = (!ok && !c.is_whitespace()).then(|| fallback_family(c).unwrap_or_else(|| fonts().family.clone()));
+        if family != run_family && !run.is_empty() {
+            flush(&mut run, run_x, &run_family);
             run_x = xs.get(i).copied();
         }
-        run_missing = missing;
+        run_family = family;
         run.push(c);
     }
-    flush(&mut run, run_x, run_missing);
+    flush(&mut run, run_x, &run_family);
     out
 }
 
-/// A text item's rows, laid out as the canvas lays them out, one `<text>` each.
-fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item) {
-    let ItemKind::Text { text, italic, align, font, .. } = &it.kind else { return };
+/// A text item's rows, laid out as the canvas lays them out: a `<text>` for each stretch of a
+/// row whose characters look alike, carrying its own colour and decoration when they are not
+/// the box's (`op` is the item's opacity).
+fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item, op: f32) {
+    let ItemKind::Text { text, color, align, font, .. } = &it.kind else { return };
     let r = it.rect();
-    let job = crate::canvas::text_job(ctx, text, &it.kind, 1.0, r.width(), Color32::WHITE);
+    let job = crate::canvas::text_job(ctx, text, &it.kind, 1.0, r.width(), 1.0);
     let galley = ctx.fonts_mut(|f| f.layout_job(job));
     let o = crate::canvas::text_origin(&galley, r, &it.kind);
+    let looks = crate::doc::char_looks(&it.kind, text);
     let last = galley.rows.len().saturating_sub(1);
+    let mut first_char = 0;
     for (i, prow) in galley.rows.iter().enumerate() {
-        let row = &prow.row;
-        let (Some(g0), Some(g1)) = (row.glyphs.first(), row.glyphs.last()) else { continue };
-        let s: String = row.glyphs.iter().map(|g| g.chr).collect();
-        let xs: Vec<f32> = row.glyphs.iter().map(|g| o.x + prow.pos.x + g.pos.x).collect();
-        let x = o.x + prow.pos.x + g0.pos.x;
-        let y = o.y + prow.pos.y + g0.pos.y;
-        // Justified rows are stretched to the box, as egui stretches them.
-        let fit = if *align == TextAlign::Justify && i != last && !prow.ends_with_newline {
-            format!(r#" textLength="{}" lengthAdjust="spacing""#, n(g1.max_x() - g0.pos.x))
-        } else {
-            String::new()
-        };
-        // Slant rather than font-style="italic": the bundled font has no italic face.
-        let slant = if *italic { format!(r#" transform="translate({} {}) skewX(-12) translate({} {})""#, n(x), n(y), n(-x), n(-y)) } else { String::new() };
-        let _ = writeln!(out, r#"<text x="{}" y="{}"{fit}{slant}>{}</text>"#, n(x), n(y), row_markup(*font, &s, &xs));
+        let glyphs = real_glyphs(&prow.row.glyphs);
+        let start = first_char;
+        first_char += glyphs.len() + usize::from(prow.ends_with_newline);
+        let mut a = 0;
+        while a < glyphs.len() {
+            let look = looks.get(start + a).copied();
+            let b = a + glyphs[a..].iter().enumerate().skip(1).find(|(k, _)| looks.get(start + a + k).copied() != look).map_or(glyphs.len() - a, |(k, _)| k);
+            let seg = &glyphs[a..b];
+            let (g0, g1) = (seg[0], seg[seg.len() - 1]);
+            let (s, xs) = logical_text(seg, o.x + prow.pos.x);
+            let x = o.x + prow.pos.x + g0.pos.x;
+            let y = o.y + prow.pos.y + g0.pos.y;
+            // Justified rows are stretched to the box, as egui stretches them.
+            let fit = if *align == TextAlign::Justify && i != last && !prow.ends_with_newline {
+                format!(r#" textLength="{}" lengthAdjust="spacing""#, n(g1.max_x() - g0.pos.x))
+            } else {
+                String::new()
+            };
+            let mut style = String::new();
+            if let Some(l) = look {
+                if l.color != *color {
+                    let _ = write!(style, " {}", paint("fill", l.color, op));
+                }
+                // Bold is a thin outline in the text's colour: the bundled font has one weight.
+                if l.bold {
+                    let _ = write!(style, r#" {} stroke-width="0.6" stroke-linejoin="round""#, paint("stroke", l.color, op));
+                }
+                let deco: Vec<&str> = [(l.underline, "underline"), (l.strike, "line-through")].into_iter().filter(|d| d.0).map(|d| d.1).collect();
+                if !deco.is_empty() {
+                    let _ = write!(style, r#" text-decoration="{}""#, deco.join(" "));
+                }
+                // Slant rather than font-style="italic": the bundled font has no italic face.
+                if l.italic {
+                    let _ = write!(style, r#" transform="translate({} {}) skewX(-12) translate({} {})""#, n(x), n(y), n(-x), n(-y));
+                }
+            }
+            let _ = writeln!(out, r#"<text x="{}" y="{}"{fit}{style}>{}</text>"#, n(x), n(y), row_markup(*font, &s, &xs));
+            a = b;
+        }
     }
 }
 
@@ -682,9 +778,7 @@ pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<
                     base64::engine::general_purpose::STANDARD.encode(png)
                 );
             }
-            ItemKind::Text { size, color, bold, underline, font, .. } => {
-                let stroke = if *bold { format!(r#" {} stroke-width="0.6" stroke-linejoin="round""#, paint("stroke", *color, op)) } else { String::new() };
-                let deco = if *underline { r#" text-decoration="underline""# } else { "" };
+            ItemKind::Text { size, color, font, .. } => {
                 let family = match font {
                     TextFont::Sans => family.clone(),
                     TextFont::Mono => "Hack, Menlo, Consolas, monospace".into(),
@@ -705,13 +799,13 @@ pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<
                 };
                 let _ = writeln!(
                     s,
-                    r#"<g{} font-family="{}" font-size="{}" font-weight="300" {}{stroke}{deco} xml:space="preserve">"#,
+                    r#"<g{} font-family="{}" font-size="{}" font-weight="300" {} xml:space="preserve">"#,
                     rotate_attr(it, c),
                     esc(&family),
                     n(*size),
                     paint("fill", *color, op)
                 );
-                text_item_rows(&mut s, ctx, it);
+                text_item_rows(&mut s, ctx, it, op);
                 s.push_str("</g>\n");
             }
             ItemKind::Shape { shape, fill, stroke, stroke_width } => {
@@ -841,6 +935,8 @@ pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<
 struct Fonts {
     db: Arc<fontdb::Database>,
     family: String,
+    /// egui's fonts in the order it falls back through them.
+    bundled: Vec<fontdb::ID>,
 }
 
 /// egui's bundled fonts (so text matches the canvas), plus system fonts for missing glyphs.
@@ -851,9 +947,13 @@ fn fonts() -> &'static Fonts {
         db.load_system_fonts();
         let defs = egui::FontDefinitions::default();
         let mut family = "Ubuntu".to_string();
+        let mut bundled = Vec::new();
         for name in ["Ubuntu-Light", "Hack", "NotoEmoji-Regular", "emoji-icon-font"] {
             let Some(data) = defs.font_data.get(name) else { continue };
             let ids = db.load_font_source(fontdb::Source::Binary(Arc::new(data.font.to_vec())));
+            if name != "Hack" {
+                bundled.extend(ids.iter().copied());
+            }
             if name == "Ubuntu-Light" {
                 if let Some(f) = ids.first().and_then(|id| db.face(*id)).and_then(|f| f.families.first()) {
                     family = f.0.clone();
@@ -865,7 +965,7 @@ fn fonts() -> &'static Fonts {
         }
         alias_core_fonts(&mut db);
         db.set_sans_serif_family(&family);
-        Fonts { db: Arc::new(db), family }
+        Fonts { db: Arc::new(db), family, bundled }
     })
 }
 
@@ -1311,6 +1411,24 @@ mod tests {
         assert_eq!(row_markup(TextFont::Lato, "β-sheet", &xs), format!(r#"<tspan font-family="{}">β</tspan><tspan x="10">-sheet</tspan>"#, esc(&font_family())));
         assert_eq!(row_markup(TextFont::Lato, "a < b", &xs), "a &lt; b");
         assert_eq!(row_markup(TextFont::Sans, "β-sheet", &xs), "β-sheet");
+        // Ubuntu has no emoji: only the emoji leaves it, not the whole row.
+        assert!(row_markup(TextFont::Sans, "DNA 🧬 x", &xs).starts_with(r#"DNA <tspan x="40" font-family="#), "{}", row_markup(TextFont::Sans, "DNA 🧬 x", &xs));
+    }
+
+    /// egui lays right-to-left words out reversed and repeats their letters as zero-width
+    /// glyphs; the SVG gets each word once, in logical order.
+    #[test]
+    fn rtl_text_exports_once() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        out.textures_delta.clear();
+        let it = Item::new(1, "T", ItemKind::text("DNA עברית שלום", 32.0, [0, 0, 0, 255], TextAlign::Left, false), Pos2::ZERO, Vec2::new(900.0, 45.0));
+        let svg = build_svg(&ctx, &[&it], Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 100.0)), None, &HashMap::new());
+        let text: String = svg.lines().filter(|l| l.contains("<text")).collect();
+        assert_eq!(text.matches("עברית").count(), 1, "{text}");
+        assert_eq!(text.matches("שלום").count(), 1, "{text}");
+        assert!(!text.contains("תירבע"), "{text}");
+        assert_eq!(text.matches("<text").count(), 1, "the repeated letters split the row:\n{text}");
     }
 
     /// With only the bundled fonts (as on the web), text naming Arial still renders, via Arimo.
@@ -1461,7 +1579,14 @@ mod tests {
         img.rotation = 0.3;
         slide.items.push(img);
         slide.items.push(Item::new(2, "Tinted", ItemKind::Image { source: src.clone(), crop: [0.25, 0.25, 0.75, 0.75], overlay: [255, 0, 0, 128], layers: Vec::new() }, Pos2::new(300.0, 40.0), Vec2::splat(120.0)));
-        slide.items.push(Item::new(3, "Title", ItemKind::text("Hello BioCartoon, a fairly long title that wraps", 28.0, [20, 20, 20, 255], TextAlign::Center, true), Pos2::new(450.0, 40.0), Vec2::new(400.0, 80.0)));
+        // Some of its letters styled apart: "fairly" plain red, "long" struck, "wraps" italic underlined.
+        let mut title = ItemKind::text("Hello BioCartoon, a fairly long title that wraps", 28.0, [20, 20, 20, 255], TextAlign::Center, true);
+        crate::doc::set_flag(&mut title, Some(20..26), crate::doc::TextFlag::Bold, false);
+        crate::doc::set_color(&mut title, Some(20..26), [220, 38, 38, 255]);
+        crate::doc::set_flag(&mut title, Some(27..31), crate::doc::TextFlag::Strike, true);
+        crate::doc::set_flag(&mut title, Some(43..48), crate::doc::TextFlag::Italic, true);
+        crate::doc::set_flag(&mut title, Some(43..48), crate::doc::TextFlag::Underline, true);
+        slide.items.push(Item::new(3, "Title", title, Pos2::new(450.0, 40.0), Vec2::new(400.0, 80.0)));
         slide.items.push(Item::new(4, "Star", ItemKind::Shape { shape: ShapeKind::Star, fill: [47, 128, 237, 255], stroke: [0, 0, 0, 255], stroke_width: 2.0 }, Pos2::new(450.0, 200.0), Vec2::splat(150.0)));
         slide.items.push(Item::new(5, "Arrow", ItemKind::Line { kind: crate::doc::LineKind::BentArrow, color: [200, 50, 50, 255], width: 3.0, style: Default::default(), points: Vec::new() }, Pos2::new(100.0, 400.0), Vec2::new(300.0, 150.0)));
         slide.items.push(Item::new(6, "Inhibit", ItemKind::Line { kind: crate::doc::LineKind::Inhibitor, color: [0, 0, 0, 255], width: 2.0, style: Default::default(), points: Vec::new() }, Pos2::new(100.0, 600.0), Vec2::new(200.0, 0.0)));

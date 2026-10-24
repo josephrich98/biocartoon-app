@@ -34,6 +34,12 @@ pub struct TemplateMeta {
     pub license: String,
     pub created_at: String,
     pub thumb_key: String,
+    /// See [`crate::catalog::AssetRow::generative_ai_used`]: `None` when it isn't known.
+    pub generative_ai_used: Option<bool>,
+    /// A reviewer accepted it to the official BioCartoon library (its author unchanged); see
+    /// [`TemplateRow::source`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub official: bool,
 }
 
 /// What `template.json` holds: the metadata, the page it was designed on, and one slide.
@@ -55,16 +61,25 @@ pub struct TemplateRow {
     pub thumb_local: Option<String>,
 }
 
+impl TemplateRow {
+    /// The database it is listed under: BioCartoon for those accepted to the official library (and
+    /// BioCartoon's own, authored by it), User-generated for the rest.
+    pub fn source(&self) -> &'static str {
+        if self.meta.official || self.meta.author == crate::theme::BIOCARTOON_AUTHOR { crate::theme::BIOCARTOON_SOURCE } else { "user" }
+    }
+}
+
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, category TEXT, author TEXT,
     license TEXT, created_at TEXT, json_key TEXT NOT NULL, thumb_key TEXT,
     json_local TEXT, thumb_local TEXT,
-    tags TEXT NOT NULL DEFAULT '[]');
+    tags TEXT NOT NULL DEFAULT '[]', generative_ai_used INTEGER, official INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);";
 
-/// Whether `table` (e.g. `pub.templates`) has a `tags` column: lists made before templates had tags don't.
-fn has_tags(c: &Connection, table: &str) -> bool {
-    c.prepare(&format!("SELECT tags FROM {table} LIMIT 0")).is_ok()
+/// Whether `table` (e.g. `pub.templates`) has `column`: lists made before templates had tags
+/// (or `generative_ai_used`, or `official`) don't.
+fn has_col(c: &Connection, table: &str, column: &str) -> bool {
+    c.prepare(&format!("SELECT {column} FROM {table} LIMIT 0")).is_ok()
 }
 
 pub struct TemplateStore {
@@ -85,18 +100,53 @@ impl TemplateStore {
             }
         }
         let conn = Connection::open(path).and_then(|c| c.execute_batch(SCHEMA).map(|_| c)).and_then(|c| {
-            if !has_tags(&c, "templates") {
+            if !has_col(&c, "templates", "tags") {
                 c.execute_batch("ALTER TABLE templates ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';")?;
+            }
+            if !has_col(&c, "templates", "generative_ai_used") {
+                c.execute_batch("ALTER TABLE templates ADD COLUMN generative_ai_used INTEGER;")?;
+            }
+            if !has_col(&c, "templates", "official") {
+                c.execute_batch("ALTER TABLE templates ADD COLUMN official INTEGER NOT NULL DEFAULT 0;")?;
             }
             Ok(c)
         });
         match conn {
-            Ok(c) => Self { conn: Some(c), path: path.to_path_buf() },
+            Ok(c) => {
+                let store = Self { conn: Some(c), path: path.to_path_buf() };
+                store.repair_local_paths();
+                store
+            }
             Err(e) => {
                 log::error!("templates {}: {e}", path.display());
                 Self { conn: None, path: path.to_path_buf() }
             }
         }
+    }
+
+    /// Point rows whose local copy has moved (the data folder was renamed from `cartooncraft`) at
+    /// `<dir>/templates/<id>/`, where [`save`] keeps it next to this database.
+    fn repair_local_paths(&self) {
+        let (Some(c), Some(dir)) = (&self.conn, self.path.parent()) else { return };
+        let fixes: Vec<(String, String, String)> = self
+            .list()
+            .into_iter()
+            .filter(|r| r.json_local.as_deref().is_some_and(|p| !crate::storage::exists(Path::new(p))))
+            .filter_map(|r| {
+                let local = dir.join("templates").join(&r.meta.id);
+                let json = local.join("template.json");
+                crate::storage::exists(&json).then(|| (r.meta.id, json.display().to_string(), local.join("thumb.png").display().to_string()))
+            })
+            .collect();
+        if fixes.is_empty() {
+            return;
+        }
+        for (id, json, thumb) in &fixes {
+            if let Err(e) = c.execute("UPDATE templates SET json_local=?2, thumb_local=?3 WHERE id=?1", params![id, json, thumb]) {
+                log::warn!("template {id}: {e}");
+            }
+        }
+        self.persist();
     }
 
     /// Web build: copy the database back to storage after a change (a no-op on the desktop).
@@ -118,7 +168,7 @@ impl TemplateStore {
             let mut st = c.prepare(
                 "SELECT id, title, coalesce(description,''), coalesce(category,''), coalesce(author,''), \
                  coalesce(license,''), coalesce(created_at,''), coalesce(thumb_key,''), json_key, json_local, thumb_local, \
-                 coalesce(tags,'[]') FROM templates ORDER BY json_local IS NULL, lower(title), id",
+                 coalesce(tags,'[]'), generative_ai_used, official FROM templates ORDER BY json_local IS NULL, lower(title), id",
             )?;
             let rows = st
                 .query_map([], |r| {
@@ -133,6 +183,8 @@ impl TemplateStore {
                             license: r.get(5)?,
                             created_at: r.get(6)?,
                             thumb_key: r.get(7)?,
+                            generative_ai_used: r.get::<_, Option<i64>>(12)?.map(|v| v != 0),
+                            official: r.get::<_, i64>(13)? != 0,
                         },
                         json_key: r.get(8)?,
                         json_local: r.get(9)?,
@@ -153,7 +205,7 @@ impl TemplateStore {
         let m = &row.meta;
         c.execute(
             "INSERT OR REPLACE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, \
-             json_local, thumb_local, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             json_local, thumb_local, tags, generative_ai_used, official) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 m.id,
                 m.title,
@@ -166,7 +218,9 @@ impl TemplateStore {
                 m.thumb_key,
                 row.json_local,
                 row.thumb_local,
-                serde_json::to_string(&m.tags).map_err(|e| e.to_string())?
+                serde_json::to_string(&m.tags).map_err(|e| e.to_string())?,
+                m.generative_ai_used,
+                m.official
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -190,11 +244,13 @@ impl TemplateStore {
     pub fn merge_published(&self, downloaded: &Path, version: &str) -> Result<(), String> {
         let Some(c) = &self.conn else { return Err("template library unavailable".into()) };
         c.execute("ATTACH DATABASE ?1 AS pub", params![downloaded.display().to_string()]).map_err(|e| e.to_string())?;
-        let tags = if has_tags(c, "pub.templates") { "coalesce(tags,'[]')" } else { "'[]'" };
+        let tags = if has_col(c, "pub.templates", "tags") { "coalesce(tags,'[]')" } else { "'[]'" };
+        let ai = if has_col(c, "pub.templates", "generative_ai_used") { "generative_ai_used" } else { "NULL" };
+        let official = if has_col(c, "pub.templates", "official") { "coalesce(official,0)" } else { "0" };
         let r = c.execute_batch(&format!(
             "BEGIN; DELETE FROM templates WHERE json_local IS NULL; \
-             INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, tags) \
-             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags} FROM pub.templates; COMMIT;"
+             INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, tags, generative_ai_used, official) \
+             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags}, {ai}, {official} FROM pub.templates; COMMIT;"
         ));
         if r.is_err() {
             let _ = c.execute_batch("ROLLBACK;");
@@ -427,6 +483,7 @@ pub fn load(row: &TemplateRow, base_url: &str) -> Result<TemplateFile, String> {
     let req = match row.json_local.as_deref().map(PathBuf::from).filter(|p| crate::storage::exists(p)) {
         Some(p) => crate::assets::Request::Path(p),
         None if !base_url.is_empty() => crate::assets::Request::Url(format!("{}/{}", base_url.trim_end_matches('/'), row.json_key)),
+        None if row.json_local.is_some() => return Err(format!("its saved copy is missing ({})", row.json_local.as_deref().unwrap_or_default())),
         None => return Err("No asset URL configured.".into()),
     };
     parse(&crate::assets::fetch(&req)?)
@@ -477,7 +534,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pic = dir.join("pic.png");
         image::RgbaImage::from_pixel(40, 30, image::Rgba([200, 60, 60, 255])).save(&pic).unwrap();
-        let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), tags: vec!["test".into()], author: "tester".into(), license: "CC0-1.0".into(), email: String::new() };
+        let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), tags: vec!["test".into()], layers: Vec::new(), author: "tester".into(), license: "CC0-1.0".into(), generative_ai_used: Some(false), email: String::new(), official: false };
         let image = ItemKind::Image { source: ImageSource::file(pic.display().to_string()), crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0], layers: Vec::new() };
         let text = ItemKind::text("Step 1", 20.0, [0, 0, 0, 255], crate::doc::TextAlign::Left, true);
         let slide = Slide { name: "x".into(), items: vec![Item::new(1, "pic", image, egui::Pos2::ZERO, egui::Vec2::splat(50.0)), Item::new(2, "t", text, egui::Pos2::ZERO, egui::Vec2::splat(50.0))], comments: Vec::new(), background: None };
@@ -537,6 +594,56 @@ mod tests {
         drop(store);
         Connection::open(dir.join("templates.sqlite")).unwrap().execute_batch("ALTER TABLE templates DROP COLUMN tags;").unwrap();
         assert_eq!(TemplateStore::open(&dir.join("templates.sqlite")).list().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn official_templates_are_listed_under_biocartoon() {
+        let dir = std::env::temp_dir().join(format!("cc-templates-official-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let row = |id: &str, author: &str, official: bool| TemplateRow {
+            meta: TemplateMeta { id: id.into(), title: id.into(), author: author.into(), official, ..Default::default() },
+            json_key: format!("templates/{id}/template.json"),
+            json_local: None,
+            thumb_local: None,
+        };
+        let published = TemplateStore::open(&dir.join("pub.sqlite"));
+        published.insert(&row("accepted", "Ann", true)).unwrap();
+        published.insert(&row("community", "Bo", false)).unwrap();
+        published.insert(&row("own", crate::theme::BIOCARTOON_AUTHOR, false)).unwrap();
+        drop(published);
+        let store = TemplateStore::open(&dir.join("templates.sqlite"));
+        store.merge_published(&dir.join("pub.sqlite"), "v1").unwrap();
+        let got: Vec<(String, String, &str)> = store.list().into_iter().map(|r| (r.meta.id.clone(), r.meta.author.clone(), r.source())).collect();
+        assert_eq!(got, [("accepted".into(), "Ann".into(), "biocartoon"), ("community".into(), "Bo".into(), "user"), ("own".into(), "BioCartoon".into(), "biocartoon")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moved_local_copies_are_found() {
+        let dir = std::env::temp_dir().join(format!("cc-templates-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("templates/t")).unwrap();
+        std::fs::write(dir.join("templates/t/template.json"), "{}").unwrap();
+        let row = |id: &str| TemplateRow {
+            meta: TemplateMeta { id: id.into(), title: id.into(), ..Default::default() },
+            json_key: format!("templates/{id}/template.json"),
+            json_local: Some(format!("/old-app-dir/templates/{id}/template.json")),
+            thumb_local: Some(format!("/old-app-dir/templates/{id}/thumb.png")),
+        };
+        let store = TemplateStore::open(&dir.join("templates.sqlite"));
+        store.insert(&row("t")).unwrap();
+        store.insert(&row("gone")).unwrap();
+        drop(store);
+        let rows = TemplateStore::open(&dir.join("templates.sqlite")).list();
+        let t = rows.iter().find(|r| r.meta.id == "t").unwrap();
+        assert_eq!(t.json_local.as_deref(), Some(dir.join("templates/t/template.json").display().to_string().as_str()));
+        assert_eq!(t.thumb_local.as_deref(), Some(dir.join("templates/t/thumb.png").display().to_string().as_str()));
+        // Nothing to point it at: left alone, and loading it says why.
+        let gone = rows.iter().find(|r| r.meta.id == "gone").unwrap();
+        assert_eq!(gone.json_local, row("gone").json_local);
+        assert!(load(gone, "").unwrap_err().contains("saved copy is missing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

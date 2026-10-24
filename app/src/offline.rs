@@ -85,11 +85,11 @@ fn open_catalog(db: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// The collection a row belongs to: BioCartoon's own uploads count as BioCartoon (see
+/// The collection a row belongs to: uploads accepted to BioCartoon count as BioCartoon (see
 /// [`crate::theme::asset_source`]).
 fn source_sql() -> String {
     use crate::theme::{BIOCARTOON_AUTHOR, BIOCARTOON_SOURCE};
-    format!("CASE WHEN source = 'user' AND author = '{BIOCARTOON_AUTHOR}' THEN '{BIOCARTOON_SOURCE}' ELSE source END")
+    format!("CASE WHEN source = 'user' AND '{BIOCARTOON_AUTHOR}' IN (source_name, author) THEN '{BIOCARTOON_SOURCE}' ELSE source END")
 }
 
 /// Every collection (User-generated always listed, even when empty): BioCartoon first, then

@@ -132,6 +132,11 @@ pub struct HomeState {
 const GAP: f32 = 24.0;
 const INFO_H: f32 = 78.0;
 
+/// A size designed at the default text size, at the one chosen in Settings.
+fn sz(px: f32) -> f32 {
+    px * theme::text_scale() / theme::TextSize::default().scale()
+}
+
 impl BioCartoon {
     pub fn refresh_projects(&mut self) {
         self.home.projects = self.store.list();
@@ -226,7 +231,7 @@ impl BioCartoon {
             }
             ui.horizontal_centered(|ui| {
                 ui.add(crate::logo(ui.ctx(), 30.0));
-                ui.label(egui::RichText::new("BioCartoon").size(16.0).strong());
+                ui.label(egui::RichText::new("BioCartoon").size(sz(16.0)).strong());
                 ui.add_space(12.0);
                 let search_w = (ui.available_width() - right_w).max(160.0);
                 self.home_search(ui, search_w);
@@ -247,7 +252,7 @@ impl BioCartoon {
         egui::Frame::new().fill(theme::panel()).stroke(Stroke::new(1.0, theme::border())).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
             ui.set_width(width - 22.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).size(16.0).color(theme::text_dim()));
+                ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).size(sz(16.0)).color(theme::text_dim()));
                 ui.add(egui::TextEdit::singleline(&mut self.home.query).hint_text("Search all projects").frame(egui::Frame::NONE).desired_width(f32::INFINITY));
             });
         });
@@ -277,7 +282,7 @@ impl BioCartoon {
                     (_, true) => "Oldest first",
                     (_, false) => "Newest first",
                 };
-                if ui.add(egui::Button::new(egui::RichText::new(if asc { ph::ARROW_UP } else { ph::ARROW_DOWN }).size(16.0)).frame(false)).on_hover_text(tip).clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new(if asc { ph::ARROW_UP } else { ph::ARROW_DOWN }).size(sz(16.0))).frame(false)).on_hover_text(tip).clicked() {
                     self.settings.home_ascending = !asc;
                 }
             });
@@ -289,7 +294,7 @@ impl BioCartoon {
             ui.horizontal(|ui| {
                 for v in HomeView::ALL {
                     let sel = self.settings.home_view == v;
-                    let text = egui::RichText::new(v.icon()).size(18.0).color(if sel { theme::accent() } else { theme::text() });
+                    let text = egui::RichText::new(v.icon()).size(sz(18.0)).color(if sel { theme::accent() } else { theme::text() });
                     if ui.add(egui::Button::new(text).frame(false).selected(sel)).on_hover_text(v.label()).clicked() {
                         self.settings.home_view = v;
                     }
@@ -306,7 +311,7 @@ impl BioCartoon {
                 1 => (ph::GEAR, "Settings"),
                 _ => (ph::INFO, "About BioCartoon"),
             };
-            if ui.add(egui::Button::new(egui::RichText::new(icon).size(18.0)).frame(false)).on_hover_text(tip).clicked() {
+            if ui.add(egui::Button::new(egui::RichText::new(icon).size(sz(18.0))).frame(false)).on_hover_text(tip).clicked() {
                 match b {
                     0 => self.actions.push(Action::Open),
                     1 => self.open_settings(crate::app::SettingsTab::General),
@@ -345,7 +350,7 @@ impl BioCartoon {
             ui.set_width(ui.available_width());
             if narrow {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(ph::WARNING_CIRCLE).size(18.0).color(theme::accent()));
+                    ui.label(egui::RichText::new(ph::WARNING_CIRCLE).size(sz(18.0)).color(theme::accent()));
                     ui.add(egui::Label::new(&message).wrap());
                 });
                 ui.add_space(6.0);
@@ -356,7 +361,7 @@ impl BioCartoon {
                 return;
             }
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(ph::WARNING_CIRCLE).size(18.0).color(theme::accent()));
+                ui.label(egui::RichText::new(ph::WARNING_CIRCLE).size(sz(18.0)).color(theme::accent()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.backup_banner_buttons(ui, now, true);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
@@ -427,7 +432,7 @@ impl BioCartoon {
             let dim = |t: &str| egui::RichText::new(t).color(theme::text_dim());
             match &self.account.saved {
                 None => {
-                    ui.label(egui::RichText::new("Keep your projects online").strong().size(15.0));
+                    ui.label(egui::RichText::new("Keep your projects online").strong().size(sz(15.0)));
                     ui.add_space(4.0);
                     ui.label(dim("Optional. Sign in, and a copy of every project is kept on the BioCartoon server, so it is safe even if this browser clears its data, and comes back wherever you sign in."));
                     ui.add_space(8.0);
@@ -439,13 +444,13 @@ impl BioCartoon {
                     }
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(dim("Only your name, email and projects are stored. You can delete them any time.").size(12.0));
-                        ui.hyperlink_to(egui::RichText::new("Privacy").size(12.0), "https://biocartoon.com/privacy");
+                        ui.label(dim("Only your name, email and projects are stored. You can delete them any time.").size(sz(12.0)));
+                        ui.hyperlink_to(egui::RichText::new("Privacy").size(sz(12.0)), "https://biocartoon.com/privacy");
                     });
                 }
                 Some(s) => {
                     let who = if s.name.is_empty() { s.email.clone() } else { s.name.clone() };
-                    ui.label(egui::RichText::new(if who.is_empty() { "Signed in".to_string() } else { who }).strong().size(15.0));
+                    ui.label(egui::RichText::new(if who.is_empty() { "Signed in".to_string() } else { who }).strong().size(sz(15.0)));
                     let via = match s.provider.as_str() {
                         "google" => "Google",
                         "github" => "GitHub",
@@ -464,7 +469,7 @@ impl BioCartoon {
                     ui.label(status);
                     if self.account.quota > 0 {
                         let mb = |b: i64| b as f64 / (1024.0 * 1024.0);
-                        ui.label(dim(&format!("{:.1} MB of {:.0} MB used", mb(self.account.used), mb(self.account.quota))).size(12.0));
+                        ui.label(dim(&format!("{:.1} MB of {:.0} MB used", mb(self.account.used), mb(self.account.quota))).size(sz(12.0)));
                     }
                     ui.add_space(4.0);
                     ui.separator();
@@ -494,7 +499,7 @@ impl BioCartoon {
         let cols = (((avail + GAP) / (min_w + GAP)).floor() as usize).max(1);
         let tile_w = (avail - GAP * (cols - 1) as f32) / cols as f32;
         let thumb_h = (tile_w * 0.62).round();
-        let tile = Vec2::new(tile_w, thumb_h + INFO_H);
+        let tile = Vec2::new(tile_w, thumb_h + sz(INFO_H));
         let n = projects.len() + 1; // "+ New" first
         let rows = n.div_ceil(cols);
         let origin = ui.cursor().min;
@@ -520,10 +525,10 @@ impl BioCartoon {
         let hovered = resp.hovered();
         p.rect(rect, CornerRadius::same(8), if hovered { theme::panel_raised() } else { theme::panel() }, Stroke::new(1.5, if hovered { theme::accent() } else { theme::border() }), StrokeKind::Inside);
         let c = Rect::from_min_size(rect.min, Vec2::new(rect.width(), thumb_h)).center();
-        p.text(c, Align2::CENTER_CENTER, ph::PLUS, FontId::proportional(44.0), theme::accent());
-        let name_pos = egui::pos2(rect.min.x + 18.0, rect.min.y + thumb_h + 22.0);
-        p.text(name_pos, Align2::LEFT_CENTER, "New", FontId::proportional(18.0), theme::text());
-        p.text(name_pos + Vec2::new(0.0, 26.0), Align2::LEFT_CENTER, "Start a blank project", FontId::proportional(14.0), theme::text_dim());
+        p.text(c, Align2::CENTER_CENTER, ph::PLUS, FontId::proportional(sz(44.0)), theme::accent());
+        let name_pos = egui::pos2(rect.min.x + 18.0, rect.min.y + thumb_h + sz(22.0));
+        p.text(name_pos, Align2::LEFT_CENTER, "New", FontId::proportional(sz(18.0)), theme::text());
+        p.text(name_pos + Vec2::new(0.0, sz(26.0)), Align2::LEFT_CENTER, "Start a blank project", FontId::proportional(sz(14.0)), theme::text_dim());
         if resp.clicked() {
             self.actions.push(Action::NewDoc);
         }
@@ -563,13 +568,13 @@ impl BioCartoon {
         painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(if hovered { 1.5 } else { 1.0 }, if hovered { theme::accent() } else { theme::border() }), StrokeKind::Inside);
 
         let left = rect.min.x + 18.0;
-        let name_y = rect.min.y + thumb_h + 22.0;
+        let name_y = rect.min.y + thumb_h + sz(22.0);
         let max_w = rect.width() - 36.0;
-        let name = elide(ui, &p.name, FontId::proportional(18.0), max_w);
-        painter.text(egui::pos2(left, name_y), Align2::LEFT_CENTER, name, FontId::proportional(18.0), theme::text());
-        painter.text(egui::pos2(left, name_y + 26.0), Align2::LEFT_CENTER, self.date_label(p), FontId::proportional(14.0), theme::text_dim());
+        let name = elide(ui, &p.name, FontId::proportional(sz(18.0)), max_w);
+        painter.text(egui::pos2(left, name_y), Align2::LEFT_CENTER, name, FontId::proportional(sz(18.0)), theme::text());
+        painter.text(egui::pos2(left, name_y + sz(26.0)), Align2::LEFT_CENTER, self.date_label(p), FontId::proportional(sz(14.0)), theme::text_dim());
 
-        let dots = Rect::from_center_size(egui::pos2(rect.max.x - 28.0, name_y + 26.0), Vec2::new(32.0, 24.0));
+        let dots = Rect::from_center_size(egui::pos2(rect.max.x - 28.0, name_y + sz(26.0)), Vec2::new(sz(32.0), sz(24.0)));
         self.project_menu(ui, dots, p, &resp);
         if resp.clicked() {
             self.actions.push(Action::OpenProject(p.id.clone()));
@@ -581,17 +586,17 @@ impl BioCartoon {
 
     /// The "..." button (and the same menu on right-click of the whole tile / row).
     fn project_menu(&mut self, ui: &mut egui::Ui, dots: Rect, p: &ProjectMeta, row: &egui::Response) {
-        let btn = ui.put(dots, egui::Button::new(egui::RichText::new(ph::DOTS_THREE).size(22.0)).frame(false)).on_hover_text("More");
+        let btn = ui.put(dots, egui::Button::new(egui::RichText::new(ph::DOTS_THREE).size(sz(22.0))).frame(false)).on_hover_text("More");
         let mut cmd = None;
         let mut items = |ui: &mut egui::Ui| {
-            ui.set_min_width(210.0);
+            ui.set_min_width(sz(210.0));
             for c in ProjectCmd::MENU {
                 if c == ProjectCmd::Delete {
                     ui.separator();
                 }
-                let text = egui::RichText::new(format!("{}   {}", c.icon(), c.label())).size(15.0);
+                let text = egui::RichText::new(format!("{}   {}", c.icon(), c.label())).size(sz(15.0));
                 let text = if c == ProjectCmd::Delete { text.color(Color32::from_rgb(0xf0, 0x6a, 0x6a)) } else { text };
-                if ui.add(egui::Button::new(text).frame(false).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                if ui.add(egui::Button::new(text).frame(false).min_size(Vec2::new(0.0, sz(30.0)))).clicked() {
                     cmd = Some(c);
                     ui.close();
                 }
@@ -618,7 +623,7 @@ impl BioCartoon {
     }
 
     fn project_list(&mut self, ui: &mut egui::Ui, projects: &[ProjectMeta]) {
-        const ROW_H: f32 = 64.0;
+        let row_h = sz(64.0);
         let w = ui.available_width();
         // Date columns: all three, or on a narrow screen just the one the list is sorted by.
         let dates: &[usize] = if w >= 560.0 {
@@ -630,34 +635,34 @@ impl BioCartoon {
                 SortKey::LastOpened | SortKey::Name => &[1],
             }
         };
-        let cols: Vec<f32> = if dates.len() == 3 { vec![w * 0.40, w * 0.18, w * 0.18, w * 0.18] } else { vec![w - 96.0 - 160.0, 110.0] };
+        let cols: Vec<f32> = if dates.len() == 3 { vec![w * 0.40, w * 0.18, w * 0.18, w * 0.18] } else { vec![w - 96.0 - sz(160.0), sz(110.0)] };
         let x0 = ui.cursor().min.x;
         let x = |i: usize| x0 + 96.0 + cols[..i].iter().sum::<f32>();
         // Header
-        let (hdr, _) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::hover());
+        let (hdr, _) = ui.allocate_exact_size(Vec2::new(w, sz(28.0)), Sense::hover());
         let headers = ["Name", "Last opened", "Last modified", "Created"];
         for (i, &k) in std::iter::once(&0).chain(dates).enumerate() {
             let active = matches!((k, self.settings.home_sort), (0, SortKey::Name) | (1, SortKey::LastOpened) | (2, SortKey::LastModified) | (3, SortKey::Created));
-            ui.painter().text(egui::pos2(x(i), hdr.center().y), Align2::LEFT_CENTER, headers[k], FontId::proportional(13.0), if active { theme::text() } else { theme::text_dim() });
+            ui.painter().text(egui::pos2(x(i), hdr.center().y), Align2::LEFT_CENTER, headers[k], FontId::proportional(sz(13.0)), if active { theme::text() } else { theme::text_dim() });
         }
         ui.painter().hline(hdr.x_range(), hdr.max.y, Stroke::new(1.0, theme::border()));
 
         // "+ New" row
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, row_h), Sense::click());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if resp.hovered() {
             ui.painter().rect_filled(rect, CornerRadius::same(6), theme::panel());
         }
-        let thumb = Rect::from_min_size(rect.min + Vec2::new(8.0, 10.0), Vec2::new(72.0, ROW_H - 20.0));
+        let thumb = Rect::from_center_size(egui::pos2(rect.min.x + 44.0, rect.center().y), Vec2::new(72.0, 44.0));
         ui.painter().rect(thumb, CornerRadius::same(4), theme::panel_raised(), Stroke::new(1.0, theme::border()), StrokeKind::Inside);
-        ui.painter().text(thumb.center(), Align2::CENTER_CENTER, ph::PLUS, FontId::proportional(24.0), theme::accent());
-        ui.painter().text(egui::pos2(x(0), rect.center().y), Align2::LEFT_CENTER, "New", FontId::proportional(16.0), theme::text());
+        ui.painter().text(thumb.center(), Align2::CENTER_CENTER, ph::PLUS, FontId::proportional(sz(24.0)), theme::accent());
+        ui.painter().text(egui::pos2(x(0), rect.center().y), Align2::LEFT_CENTER, "New", FontId::proportional(sz(16.0)), theme::text());
         if resp.clicked() {
             self.actions.push(Action::NewDoc);
         }
 
         for p in projects {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, row_h), Sense::click());
             if !ui.is_rect_visible(rect) {
                 continue;
             }
@@ -666,7 +671,7 @@ impl BioCartoon {
                 ui.painter().rect_filled(rect, CornerRadius::same(6), theme::panel());
             }
             ui.painter().hline(rect.x_range(), rect.min.y, Stroke::new(1.0, theme::panel_raised()));
-            let thumb = Rect::from_min_size(rect.min + Vec2::new(8.0, 10.0), Vec2::new(72.0, ROW_H - 20.0));
+            let thumb = Rect::from_center_size(egui::pos2(rect.min.x + 44.0, rect.center().y), Vec2::new(72.0, 44.0));
             let tex = self.project_thumb(&p.id);
             let painter = ui.painter();
             painter.rect_filled(thumb, CornerRadius::same(4), Color32::WHITE);
@@ -677,14 +682,14 @@ impl BioCartoon {
                 painter.image(tex.id(), r, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
             }
             let y = rect.center().y;
-            let name = elide(ui, &p.name, FontId::proportional(16.0), cols[0] - 16.0);
+            let name = elide(ui, &p.name, FontId::proportional(sz(16.0)), cols[0] - 16.0);
             let painter = ui.painter();
-            painter.text(egui::pos2(x(0), y), Align2::LEFT_CENTER, name, FontId::proportional(16.0), theme::text());
+            painter.text(egui::pos2(x(0), y), Align2::LEFT_CENTER, name, FontId::proportional(sz(16.0)), theme::text());
             let times = [p.opened, p.modified, p.created];
             for (i, &k) in dates.iter().enumerate() {
-                painter.text(egui::pos2(x(i + 1), y), Align2::LEFT_CENTER, format_date(times[k - 1]), FontId::proportional(14.0), theme::text_dim());
+                painter.text(egui::pos2(x(i + 1), y), Align2::LEFT_CENTER, format_date(times[k - 1]), FontId::proportional(sz(14.0)), theme::text_dim());
             }
-            let dots = Rect::from_center_size(egui::pos2(rect.max.x - 28.0, y), Vec2::new(32.0, 24.0));
+            let dots = Rect::from_center_size(egui::pos2(rect.max.x - 28.0, y), Vec2::new(sz(32.0), sz(24.0)));
             self.project_menu(ui, dots, p, &resp);
             if resp.clicked() {
                 self.actions.push(Action::OpenProject(p.id.clone()));
@@ -814,7 +819,7 @@ impl BioCartoon {
             ui.horizontal(|ui| {
                 ui.heading(format!("Version history: {}", h.name));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(sz(16.0))).frame(false)).clicked() {
                         close = true;
                     }
                 });
@@ -850,11 +855,11 @@ impl BioCartoon {
                             ui.painter().image(tex.id(), r, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
                         }
                         None if h.selected.is_some() => {
-                            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Rendering preview...", FontId::proportional(14.0), Color32::GRAY);
+                            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Rendering preview...", FontId::proportional(sz(14.0)), Color32::GRAY);
                         }
                         None => {}
                     }
-                    ui.label(egui::RichText::new("Preview of the first slide").color(theme::text_dim()).size(12.0));
+                    ui.label(egui::RichText::new("Preview of the first slide").color(theme::text_dim()).size(sz(12.0)));
                     ui.add_space(6.0);
                     let is_current = h.selected.is_some() && h.selected == h.versions.first().map(|v| v.time);
                     ui.horizontal(|ui| {

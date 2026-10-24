@@ -3,7 +3,7 @@
 //! [`biocartoon_catalog::catalog::Worker`], shared with the command line.
 
 pub use biocartoon_catalog::catalog::{
-    check_tags, parse_tags, tags_from_json, AssetRow, MAX_TAGS, MAX_TAG_CHARS, CategoryInfo, Facets, Filter, IconSort, SourceInfo, StarUpdate, TaxonCount, Worker, FORMAT_PNG, FORMAT_SVG,
+    check_tags, parse_tags, tags_from_json, AssetLayer, AssetRow, MAX_TAGS, MAX_TAG_CHARS, CategoryInfo, Facets, Filter, IconSort, SourceInfo, StarUpdate, TaxonCount, Worker, FORMAT_PNG, FORMAT_SVG,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

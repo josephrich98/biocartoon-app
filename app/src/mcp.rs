@@ -75,6 +75,7 @@ fn style_props() -> Map<String, Value> {
         "bold": bool_prop("Text: bold."),
         "italic": bool_prop("Text: italic."),
         "underline": bool_prop("Text: underlined."),
+        "strikethrough": bool_prop("Text: struck through."),
         "font": str_prop(&font_help()),
         "line_spacing": num_prop("Text: multiple of the natural line height (1, 1.15, 1.5, 2...)."),
         "align": str_prop("Text: left, center, right or justify."),

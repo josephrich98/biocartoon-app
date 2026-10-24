@@ -2,12 +2,12 @@
 //! BioCartoon's own templates, user-generated assets, uploads), and the rail on the right with
 //! its panel (Text / Lines / Shapes / Table / Edit / Slides / Page).
 
-use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, GeneratedImage, IconsMode, Include, RailTab, SettingsTab, UploadTarget, GRID_PRESETS, PRESETS};
+use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, GeneratedImage, IconsMode, Include, RailTab, SearchFilter, SettingsTab, UploadTarget, GRID_PRESETS, PRESETS};
 use crate::templates::TemplateRow;
 use crate::assets::ImgState;
 use crate::canvas::{draw_slide, tool_button, Xform};
-use crate::catalog::{AssetRow, IconSort};
-use crate::doc::{c32, c4, CodeLang, CodeTheme, ImageSource, Item, ItemKind, LayerStyle, LineFamily, LineKind, LineStyle, ShapeKind, TextAlign, TextFont, TextVAlign, Unit};
+use crate::catalog::{AssetRow, Facets, IconSort};
+use crate::doc::{c32, c4, CodeLang, CodeTheme, ImageSource, Item, ItemKind, LayerStyle, LineFamily, LineKind, LineStyle, ShapeKind, TextAlign, TextFlag, TextFont, TextVAlign, Unit};
 use crate::stars::format_stars;
 use crate::theme;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
@@ -97,8 +97,8 @@ impl BioCartoon {
                 ui.set_min_height(ui.available_height());
                 ui.set_width(ui.available_width());
                 let (title, back) = match self.icons.mode {
-                    IconsMode::Home => ("Icons".to_string(), false),
-                    IconsMode::Search => ("Search icons and templates".into(), true),
+                    IconsMode::Home => ("Artwork".to_string(), false),
+                    IconsMode::Search => ("Search artwork".into(), true),
                     IconsMode::Generate => ("Generate with AI".into(), true),
                     IconsMode::Uploads => ("Uploads".into(), true),
                     IconsMode::Contribute if self.contribute.share => ("Add to BioCartoon library".into(), true),
@@ -116,7 +116,7 @@ impl BioCartoon {
                         self.icons.scroll_to = Some(egui::Align::Min);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(ph::X).frame(false)).on_hover_text("Hide the Icons panel").clicked() {
+                        if ui.add(egui::Button::new(ph::X).frame(false)).on_hover_text("Hide the Artwork panel").clicked() {
                             self.settings.show_icons = false;
                         }
                     });
@@ -135,6 +135,15 @@ impl BioCartoon {
                 // The search box stays put above the results, so a new search is always at hand.
                 if self.icons.mode == IconsMode::Search {
                     self.search_box(ui);
+                    ui.add_space(4.0);
+                }
+                let mine = match self.icons.mode {
+                    IconsMode::Favorites if !self.settings.favorites.is_empty() => Some("Search favorites"),
+                    IconsMode::Library => Some("Search your library"),
+                    _ => None,
+                };
+                if let Some(hint) = mine {
+                    self.mine_search_box(ui, hint);
                     ui.add_space(4.0);
                 }
                 let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(ui.available_width());
@@ -260,6 +269,12 @@ impl BioCartoon {
 
     /// The saved templates a browse or search shows next to the icons, for the current menu.
     fn matching_templates(&self) -> Vec<TemplateRow> {
+        self.templates_matching(false)
+    }
+
+    /// `matching_templates`, but with `any_source` whichever databases are picked (for the
+    /// database filter's count, which like the icons' counts leaves its own pick out).
+    fn templates_matching(&self, any_source: bool) -> Vec<TemplateRow> {
         if !self.icons.include.templates() {
             return Vec::new();
         }
@@ -267,9 +282,8 @@ impl BioCartoon {
         match self.icons.mode {
             IconsMode::Search => {
                 let f = &self.icons.filter;
-                // Templates belong to BioCartoon: another database's filter leaves them out. They
-                // are slides, not image files, so a file type leaves them out too.
-                if (!f.sources.is_empty() && !f.sources.iter().any(|s| s == theme::BIOCARTOON_SOURCE)) || !f.formats.is_empty() {
+                // Templates are slides, not image files, so a file type leaves them out.
+                if !f.formats.is_empty() {
                     return Vec::new();
                 }
                 let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
@@ -278,18 +292,34 @@ impl BioCartoon {
                 let tags = f.tags();
                 // A template's category is free text: it matches a picked category or subcategory by name.
                 let places: Vec<&str> = f.cats.iter().map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
-                rows.filter(|r| q.is_empty() || [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q)) || r.meta.tags.iter().any(|t| t.to_lowercase().contains(&q)))
+                // Each is in BioCartoon or User-generated: another database's filter leaves it out.
+                rows.filter(|r| any_source || f.sources.is_empty() || f.sources.iter().any(|s| s == r.source()))
+                    .filter(|r| q.is_empty() || [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q)) || r.meta.tags.iter().any(|t| t.to_lowercase().contains(&q)))
                     .filter(|r| authors.is_empty() || authors.iter().any(|a| r.meta.author.to_lowercase().contains(a)))
                     .filter(|r| tags.is_empty() || tags.iter().any(|t| r.meta.tags.iter().any(|x| eq(x, t))))
                     .filter(|r| f.licenses.is_empty() || f.licenses.iter().any(|l| eq(l, &r.meta.license)))
                     .filter(|r| places.is_empty() || places.iter().any(|p| eq(p, &r.meta.category)))
-                    // Their categories are BioCartoon's own database categories.
-                    .filter(|r| f.db_cats.is_empty() || f.db_cats.iter().any(|(s, c)| s == theme::BIOCARTOON_SOURCE && eq(c, &r.meta.category)))
+                    // Their categories are their database's own categories.
+                    .filter(|r| f.db_cats.is_empty() || f.db_cats.iter().any(|(s, c)| s == r.source() && eq(c, &r.meta.category)))
                     .cloned()
                     .collect()
             }
-            // The user's own: templates saved on this computer.
-            IconsMode::Library => rows.filter(|r| r.json_local.is_some()).cloned().collect(),
+            // The user's own: templates saved on this computer, under the library's search box.
+            IconsMode::Library => {
+                let f = &self.icons.mine_filter;
+                // Slides, not image files: a file type leaves them out.
+                if !f.formats.is_empty() {
+                    return Vec::new();
+                }
+                let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+                let places: Vec<&str> = f.cats.iter().map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
+                let q = self.icons.mine_query.trim().to_lowercase();
+                rows.filter(|r| r.json_local.is_some())
+                    .filter(|r| places.is_empty() || places.iter().any(|p| eq(p, &r.meta.category)))
+                    .filter(|r| q.is_empty() || [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q)) || r.meta.tags.iter().any(|t| t.to_lowercase().contains(&q)))
+                    .cloned()
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -300,33 +330,50 @@ impl BioCartoon {
         i.results.clear();
         i.total = None;
         i.browse_offset = 0;
+        i.mine_query.clear();
+        i.mine_filter = SearchFilter::default();
+        i.mine_show_filters = false;
         i.mode = IconsMode::Home;
     }
 
     /// The filters under the search box: database, author, category, subcategory, license, file type and tags.
-    /// The search re-runs once one changes (see `last_sent_filter`).
-    fn filters_panel(&mut self, ui: &mut egui::Ui) {
-        if self.icons.facets_for.as_ref().is_none_or(|(q, f)| q != self.icons.query.trim() || *f != self.icons.filter) {
-            self.request_facets();
-        }
+    /// The search re-runs once one changes (see `last_sent_filter`). With `mine`, Favorites' or
+    /// Your library's filters instead, over what is loaded (Your library's just category,
+    /// subcategory and file type: its icons are all the user's own).
+    fn filters_panel(&mut self, ui: &mut egui::Ui, mine: bool) {
         // Each dropdown lists the choices that find icons under the query and the other filters, with
         // how many; the picked ones stay listed so they can be taken out. Until the counts arrive, all of them.
-        let facets = self.icons.facets.clone();
+        let facets = if mine {
+            Some(local_facets(&self.icons.results, &self.icons.mine_query.trim().to_lowercase(), &self.icons.mine_filter))
+        } else {
+            if self.icons.facets_for.as_ref().is_none_or(|(q, f)| q != self.icons.query.trim() || *f != self.icons.filter) {
+                self.request_facets();
+            }
+            self.icons.facets.clone()
+        };
+        let all = !(mine && self.icons.mode == IconsMode::Library);
         let label = |name: &str, n: Option<i64>| match n {
             Some(n) => format!("{name} ({})", thousands(n)),
             None => name.to_string(),
         };
-        let f = &self.icons.filter;
+        let f = if mine { &self.icons.mine_filter } else { &self.icons.filter };
         let in_facet = |list: &[(String, i64)], v: &str| facets.as_ref().map(|_| list.iter().find(|(k, _)| k == v).map_or(0, |(_, n)| *n));
+        // The templates under the query and the other filters (Favorites are icons only).
+        let templates = if mine { Vec::new() } else { self.templates_matching(true) };
         let dbs: Vec<(String, String)> = self
             .databases()
             .into_iter()
             .filter_map(|(s, _, name)| {
                 let name = if s == "user" { "Community and user-generated".to_string() } else { name };
                 let n = in_facet(facets.as_ref().map_or(&[][..], |fc| &fc.sources), &s);
-                // BioCartoon's templates are in it even when none of its icons are.
-                let keep = n != Some(0) || f.sources.contains(&s) || (s == theme::BIOCARTOON_SOURCE && !self.template_rows.is_empty());
-                keep.then(|| (s, label(&name, n)))
+                let t = templates.iter().filter(|r| r.source() == s).count() as i64;
+                // A database's templates are in it even when none of its icons are.
+                let keep = n != Some(0) || f.sources.contains(&s) || (!mine && self.template_rows.iter().any(|r| r.source() == s));
+                // "BioCartoon (1 icon, 6 templates)": templates only when there are some.
+                let parts: Vec<String> =
+                    n.map(|n| counted(n, "icon")).into_iter().chain((t > 0).then(|| counted(t, "template"))).collect();
+                let l = if parts.is_empty() { name } else { format!("{name} ({})", parts.join(", ")) };
+                keep.then(|| (s, l))
             })
             .collect();
         let mut licenses: Vec<String> = match &facets {
@@ -361,13 +408,15 @@ impl BioCartoon {
             }
         }
         // Each database's own categories, "BA: Viruses", in the order of the databases. BioCartoon's
-        // include its templates' categories.
+        // and User-generated's include their templates' categories.
         let mut own: Vec<(String, String, Option<i64>)> = facets.as_ref().map_or(Vec::new(), |fc| fc.db_cats.iter().map(|(s, c, n)| (s.clone(), c.clone(), Some(*n))).collect());
-        if f.sources.is_empty() || f.sources.iter().any(|s| s == theme::BIOCARTOON_SOURCE) {
-            for c in self.template_rows.iter().map(|r| r.meta.category.trim()).filter(|c| !c.is_empty()) {
-                match own.iter_mut().find(|(s, k, _)| s == theme::BIOCARTOON_SOURCE && k.eq_ignore_ascii_case(c)) {
+        // (Favorites are icons only.)
+        if !mine {
+            let picked = |src: &str| f.sources.is_empty() || f.sources.iter().any(|s| s == src);
+            for (src, c) in self.template_rows.iter().map(|r| (r.source(), r.meta.category.trim())).filter(|(src, c)| !c.is_empty() && picked(src)) {
+                match own.iter_mut().find(|(s, k, _)| s == src && k.eq_ignore_ascii_case(c)) {
                     Some((_, _, n)) => *n = Some(n.unwrap_or(0) + 1),
-                    None => own.push((theme::BIOCARTOON_SOURCE.into(), c.to_string(), Some(1))),
+                    None => own.push((src.into(), c.to_string(), Some(1))),
                 }
             }
         }
@@ -385,26 +434,28 @@ impl BioCartoon {
                 ((s, c), l)
             })
             .collect();
-        let f = &mut self.icons.filter;
+        let f = if mine { &mut self.icons.mine_filter } else { &mut self.icons.filter };
         egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).inner_margin(8).show(ui, |ui| {
             ui.set_width(ui.available_width());
             // The second column takes what the labels leave; any wider and the grid would push the
             // panel out (it grows to fit), a little more each frame.
             let font = egui::TextStyle::Body.resolve(ui.style());
-            let labels = ["Database", "Author", "Category", "Subcategory", "Database category", "License", "File type", "Tags"];
+            let labels: &[&str] = if all { &["Database", "Author", "Category", "Subcategory", "Database category", "License", "File type", "Tags"] } else { &["Category", "Subcategory", "File type"] };
             let label_w = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), Color32::WHITE).size().x).fold(0.0, f32::max);
             let w = (ui.available_width() - label_w - 8.0).max(60.0);
             egui::Grid::new("search_filters").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label("Database");
-                if multi_select(ui, "filter_db", w, &mut f.sources, &dbs) && !f.sources.is_empty() {
-                    // Another database's own categories would find nothing.
-                    let sources = f.sources.clone();
-                    f.db_cats.retain(|(s, _)| sources.contains(s));
+                if all {
+                    ui.label("Database");
+                    if multi_select(ui, "filter_db", w, &mut f.sources, &dbs) && !f.sources.is_empty() {
+                        // Another database's own categories would find nothing.
+                        let sources = f.sources.clone();
+                        f.db_cats.retain(|(s, _)| sources.contains(s));
+                    }
+                    ui.end_row();
+                    ui.label("Author");
+                    ui.add(egui::TextEdit::singleline(&mut f.authors).hint_text("Any (commas for several)").desired_width(w));
+                    ui.end_row();
                 }
-                ui.end_row();
-                ui.label("Author");
-                ui.add(egui::TextEdit::singleline(&mut f.authors).hint_text("Any (commas for several)").desired_width(w));
-                ui.end_row();
                 ui.label("Category");
                 let before = f.cats.clone();
                 if multi_select(ui, "filter_cat", w, &mut f.cats, &cats) {
@@ -415,18 +466,22 @@ impl BioCartoon {
                 ui.label("Subcategory");
                 multi_select(ui, "filter_sub", w, &mut f.subs, &subs);
                 ui.end_row();
-                ui.label("Database category");
-                multi_select(ui, "filter_dbcat", w, &mut f.db_cats, &db_cats);
-                ui.end_row();
-                ui.label("License");
-                multi_select(ui, "filter_license", w, &mut f.licenses, &licenses);
-                ui.end_row();
+                if all {
+                    ui.label("Database category");
+                    multi_select(ui, "filter_dbcat", w, &mut f.db_cats, &db_cats);
+                    ui.end_row();
+                    ui.label("License");
+                    multi_select(ui, "filter_license", w, &mut f.licenses, &licenses);
+                    ui.end_row();
+                }
                 ui.label("File type").on_hover_text("SVG: the source publishes a vector version. PNG: an image only");
                 multi_select(ui, "filter_format", w, &mut f.formats, &formats);
                 ui.end_row();
-                ui.label("Tags").on_hover_text("Icons and templates with one of these as a whole tag, any case");
-                ui.add(egui::TextEdit::singleline(&mut f.tags).hint_text("Any (commas for several)").desired_width(w));
-                ui.end_row();
+                if all {
+                    ui.label("Tags").on_hover_text("Icons and templates with one of these as a whole tag, any case");
+                    ui.add(egui::TextEdit::singleline(&mut f.tags).hint_text("Any (commas for several)").desired_width(w));
+                    ui.end_row();
+                }
             });
             if f.active() > 0 {
                 ui.add_space(2.0);
@@ -438,9 +493,10 @@ impl BioCartoon {
         ui.add_space(4.0);
     }
 
-    /// The set filters in a line: "Bioicons, OpenMoji · by Ann · Cells · CC0-1.0".
-    fn filter_summary(&self) -> String {
-        let f = &self.icons.filter;
+    /// The set filters (the search's, or with `mine` Favorites' or Your library's) in a line:
+    /// "Bioicons, OpenMoji · by Ann · Cells · CC0-1.0".
+    fn filter_summary(&self, mine: bool) -> String {
+        let f = if mine { &self.icons.mine_filter } else { &self.icons.filter };
         let mut parts: Vec<String> = Vec::new();
         if !f.sources.is_empty() {
             parts.push(f.sources.iter().map(|s| self.source_name(s)).collect::<Vec<_>>().join(", "));
@@ -515,6 +571,59 @@ impl BioCartoon {
         }
     }
 
+    /// The box above Favorites and Your library that narrows them to what has the typed words in its
+    /// title, description, category or tags.
+    fn mine_search_box(&mut self, ui: &mut egui::Ui, hint: &str) {
+        let r = egui::Frame::new().fill(theme::panel_raised()).corner_radius(8).stroke(Stroke::new(1.0, theme::border())).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).color(theme::text_dim()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let n = self.icons.mine_filter.active();
+                    let (text, color) = match n {
+                        0 => (ph::FUNNEL.to_string(), if self.icons.mine_show_filters { theme::text() } else { theme::text_dim() }),
+                        n => (format!("{} {n}", ph::FUNNEL), theme::accent()),
+                    };
+                    let tip = match (self.icons.mine_show_filters, &self.icons.mode) {
+                        (true, _) => "Hide the filters",
+                        (false, IconsMode::Library) => "Filter by category or file type",
+                        (false, _) => "Filter by database, author, category, license or tags",
+                    };
+                    if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
+                        self.icons.mine_show_filters = !self.icons.mine_show_filters;
+                    }
+                    if !self.icons.mine_query.is_empty() && ui.add(egui::Button::new(egui::RichText::new(ph::X).color(theme::text_dim())).frame(false)).on_hover_text("Clear").clicked() {
+                        self.icons.mine_query.clear();
+                        self.icons.typed_at = f64::NEG_INFINITY;
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.icons.mine_query).hint_text(hint).frame(egui::Frame::NONE).desired_width(ui.available_width()))
+                })
+                .inner
+            })
+            .inner
+        });
+        let r = r.inner;
+        if r.changed() {
+            self.icons.typed_at = ui.input(|i| i.time);
+        }
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.icons.typed_at = f64::NEG_INFINITY;
+        }
+    }
+
+    /// Favorites' or Your library's filters when open, else what they keep, as the search's are.
+    fn mine_filters(&mut self, ui: &mut egui::Ui) {
+        if self.icons.mine_show_filters {
+            self.filters_panel(ui, true);
+        } else if self.icons.mine_filter.active() > 0 {
+            let summary = self.filter_summary(true);
+            let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
+            if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.icons.mine_show_filters = true;
+            }
+        }
+    }
+
     fn icons_panel(&mut self, ui: &mut egui::Ui) {
         if !self.catalog.ok && self.icons.sources.is_empty() {
             egui::Frame::new().fill(theme::panel_raised()).corner_radius(6).inner_margin(8).show(ui, |ui| {
@@ -544,7 +653,7 @@ impl BioCartoon {
         match self.icons.mode {
             IconsMode::Home => {
                 self.home_row_buttons(ui, &[
-                    (ph::MAGNIFYING_GLASS, "Search icons and templates", IconsMode::Search),
+                    (ph::MAGNIFYING_GLASS, "Search artwork", IconsMode::Search),
                     (ph::SPARKLE, "Generate with AI", IconsMode::Generate),
                 ]);
                 ui.add_space(8.0);
@@ -583,9 +692,10 @@ impl BioCartoon {
                 ui.horizontal_wrapped(|ui| {
                     for (source, abbr, name) in self.databases() {
                         let col = theme::source_badge(&source).1;
+                        let tn = self.template_rows.iter().filter(|r| r.source() == source).count();
                         let hover = match sources.iter().find(|s| s.source == source) {
-                            Some(s) if source == theme::BIOCARTOON_SOURCE => format!("{name}: {} icons, {} templates", thousands(s.icons), self.template_rows.len()),
-                            _ if source == theme::BIOCARTOON_SOURCE => format!("{name}: {} templates", self.template_rows.len()),
+                            Some(s) if tn > 0 || source == theme::BIOCARTOON_SOURCE => format!("{name}: {} icons, {tn} templates", thousands(s.icons)),
+                            _ if tn > 0 || source == theme::BIOCARTOON_SOURCE => format!("{name}: {tn} templates"),
                             Some(s) => format!("{name}: {} icons ({} images), {}", thousands(s.icons), thousands(s.count), s.licenses),
                             None => name.clone(),
                         };
@@ -599,10 +709,10 @@ impl BioCartoon {
             IconsMode::Search => {
                 // The search box is above the scroll area, in `left_panel`.
                 if self.icons.show_filters {
-                    self.filters_panel(ui);
+                    self.filters_panel(ui, false);
                 } else if self.icons.filter.active() > 0 {
                     // What the closed filters keep, as a reminder; clicking opens them.
-                    let summary = self.filter_summary();
+                    let summary = self.filter_summary(false);
                     let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
                     if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         self.icons.show_filters = true;
@@ -618,10 +728,12 @@ impl BioCartoon {
                 if self.settings.favorites.is_empty() {
                     ui.label(egui::RichText::new("No favorites yet. Right-click an icon and pick Favorite.").color(theme::text_dim()));
                 } else {
+                    self.mine_filters(ui);
                     self.results_grid(ui);
                 }
             }
             IconsMode::Library => {
+                self.mine_filters(ui);
                 if self.icons.results.is_empty() && !self.icons.loading && self.matching_templates().is_empty() {
                     ui.label(egui::RichText::new("Nothing here yet. Images you add to your library (generated with AI, or from Uploads) and slides you save as templates appear here.").color(theme::text_dim()));
                 }
@@ -640,6 +752,9 @@ impl BioCartoon {
                 self.icons.results.clear();
                 self.icons.total = None;
                 self.icons.browse_offset = 0;
+                self.icons.mine_query.clear();
+                self.icons.mine_filter = SearchFilter::default();
+                self.icons.mine_show_filters = false;
                 match mode {
                     IconsMode::Search => self.request_search(),
                     IconsMode::Library | IconsMode::Favorites => self.request_browse(),
@@ -651,6 +766,16 @@ impl BioCartoon {
 
     fn results_grid(&mut self, ui: &mut egui::Ui) {
         let templates = self.matching_templates();
+        // Favorites and Your library are loaded whole, so their box and filters narrow them here.
+        let mine = matches!(self.icons.mode, IconsMode::Favorites | IconsMode::Library)
+            && (!self.icons.mine_query.trim().is_empty() || self.icons.mine_filter.active() > 0);
+        let shown: Vec<AssetRow> = if mine {
+            let q = self.icons.mine_query.trim().to_lowercase();
+            self.icons.results.iter().filter(|r| local_match(r, &q, &self.icons.mine_filter, None)).cloned().collect()
+        } else {
+            self.icons.results.clone()
+        };
+        let shown_total = if mine { Some(shown.len() as i64) } else { self.icons.total };
         if let Some(e) = &self.icons.error {
             ui.label(egui::RichText::new(e).color(Color32::from_rgb(230, 120, 120)));
         }
@@ -681,7 +806,7 @@ impl BioCartoon {
             });
         });
         ui.horizontal(|ui| {
-            if let Some(n) = self.icons.total.filter(|_| self.icons.include.icons() && !(self.icons.loading && self.icons.results.is_empty())) {
+            if let Some(n) = shown_total.filter(|_| self.icons.include.icons() && !(self.icons.loading && self.icons.results.is_empty())) {
                 let text = format!("{} {}", thousands(n), if n == 1 { "icon" } else { "icons" });
                 ui.label(egui::RichText::new(text).small().color(theme::text_dim()));
             }
@@ -694,13 +819,16 @@ impl BioCartoon {
             ui.label(egui::RichText::new("No templates here").color(theme::text_dim()));
             return;
         }
-        let rows = if icons { self.icons.results.clone() } else { Vec::new() };
+        let rows = if icons { shown } else { Vec::new() };
         if rows.is_empty() && templates.is_empty() && !self.icons.loading && self.icons.mode == IconsMode::Search && !self.icons.query.trim().is_empty() {
             ui.label(egui::RichText::new("No results").color(theme::text_dim()));
         }
+        if rows.is_empty() && templates.is_empty() && !self.icons.loading && mine {
+            ui.label(egui::RichText::new("Nothing matches").color(theme::text_dim()));
+        }
         let sort = if self.icons.mode == IconsMode::Search { self.settings.search_sort } else { self.settings.icon_sort };
         let more = icons && self.icons.more;
-        let total = self.icons.total.filter(|_| icons).map_or(rows.len(), |n| n.max(0) as usize);
+        let total = shown_total.filter(|_| icons).map_or(rows.len(), |n| n.max(0) as usize);
         let tiles = mix_templates(&rows, &templates, sort, more, total);
         let mut picked: Option<AssetRow> = None;
         let (per_row, size) = self.icon_grid(ui);
@@ -730,6 +858,7 @@ impl BioCartoon {
                 let (r, act) = asset_tile(ui, size, row, row.png_local.as_deref(), &mut self.images, hold, colors, marks, &mut unsent);
                 match act {
                     Some(TileAct::Remove) => self.actions.push(Action::RemoveUserAsset(row.clone())),
+                    Some(TileAct::RequestRemoval) => self.actions.push(Action::OpenRemovalRequest(row.clone())),
                     Some(TileAct::Share) => self.actions.push(Action::OpenUploadDialog(UploadTarget::Library(Box::new(row.clone())), true)),
                     Some(TileAct::Favorite) => self.actions.push(Action::ToggleFavorite(row.id.clone())),
                     None if r.clicked() => picked = Some(row.clone()),
@@ -920,7 +1049,7 @@ impl BioCartoon {
     /// One template's thumbnail in the results grid; clicking it adds its slide.
     fn template_tile(&mut self, ui: &mut egui::Ui, size: f32, row: &TemplateRow) {
         let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
-        let (abbr, col, _) = theme::source_badge(theme::BIOCARTOON_SOURCE);
+        let (abbr, col, _) = theme::source_badge(row.source());
         let r = tile(ui, size, &row.meta.title, state, self.settings.tile_database.then_some((abbr, col, "Template")));
         let info = |ui: &mut egui::Ui| {
             ui.label(egui::RichText::new(&row.meta.title).strong());
@@ -930,7 +1059,8 @@ impl BioCartoon {
             if !row.meta.category.is_empty() {
                 ui.label(format!("Database category: {}", row.meta.category));
             }
-            ui.label(egui::RichText::new(format!("Template  ·  {}  ·  {}", row.meta.author, row.meta.license)).small().color(theme::text_dim()));
+            let line = ["Template", row.meta.author.as_str(), row.meta.license.as_str(), ai_label(row.meta.generative_ai_used)];
+            ui.label(egui::RichText::new(line.iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  ")).small().color(theme::text_dim()));
         };
         // A long press opens the context menu when there is one, so the info goes there.
         let r = if row.json_local.is_some() { r.on_hover_ui(info) } else { info_ui(r, info) };
@@ -1223,9 +1353,9 @@ impl BioCartoon {
             if ui.add(egui::Button::new(label).selected(self.drawing)).on_hover_text("Drag on the canvas to draw a line by hand; Esc to stop").clicked() {
                 self.actions.push(Action::ArmDraw(!self.drawing));
             }
-            let mut col = c32(self.pen_color);
-            if ui.color_edit_button_srgba(&mut col).on_hover_text("Pen color").changed() {
-                self.pen_color = c4(col);
+            let mut col = self.pen_color;
+            if crate::color::edit_button(ui, &mut col).on_hover_text("Pen color").changed() {
+                self.pen_color = col;
             }
             ui.add(egui::DragValue::new(&mut self.pen_width).range(0.5..=40.0).speed(0.5).suffix(" px")).on_hover_text("Pen thickness");
         });
@@ -1439,21 +1569,12 @@ impl BioCartoon {
         let Some(vector) = self.images.vector(&source.cache_key()) else { return Vec::new() };
         if let ImageSource::Asset { id, .. } = source {
             let Some(row) = self.variants.iter().find(|r| &r.id == id) else { return Vec::new() };
-            let hex = |c: &str| -> Option<[u8; 3]> {
-                let h = c.strip_prefix('#').filter(|h| h.len() == 6)?;
-                let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
-                Some([b(0)?, b(2)?, b(4)?])
-            };
-            let named: Vec<_> = row.layers.iter().map(|l| (l.name.clone(), l.colors.iter().filter_map(|c| hex(c)).collect::<Vec<_>>())).filter(|(_, c)| !c.is_empty()).collect();
+            let named = named_layers(&row.layers);
             if !named.is_empty() {
                 return named;
             }
         }
-        let colors = vector.colors();
-        if colors.len() < 2 {
-            return Vec::new();
-        }
-        colors.iter().take(MAX_COLOR_LAYERS).map(|c| (format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]), vec![*c])).collect()
+        color_layers(vector.colors())
     }
 
     /// Layers: a colour and an opacity for each of [`image_layers`](Self::image_layers), kept in
@@ -1475,52 +1596,16 @@ impl BioCartoon {
                 });
             }
         });
-        egui::Grid::new("image_layers").num_columns(5).spacing([6.0, 4.0]).show(ui, |ui| {
-            for (name, colors) in &offered {
-                let i = layers.iter().position(|l| &l.colors == colors);
-                let before = i.map(|i| layers[i].clone()).unwrap_or(LayerStyle { colors: colors.clone(), color: None, opacity: 1.0 });
-                let mut style = before.clone();
-                ui.horizontal(|ui| {
-                    // Its own colours, side by side.
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-                    let w = rect.width() / colors.len() as f32;
-                    for (k, c) in colors.iter().enumerate() {
-                        let r = Rect::from_min_size(rect.min + Vec2::new(w * k as f32, 0.0), Vec2::new(w, rect.height()));
-                        ui.painter().rect_filled(r, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
-                    }
-                    ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
-                    ui.label(name.as_str());
-                });
-                let mut rgb = style.color.unwrap_or(colors[0]);
-                if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Color").changed() {
-                    style.color = Some(rgb);
-                }
-                let mut op = style.opacity * 100.0;
-                if ui.add(egui::DragValue::new(&mut op).speed(1.0).range(0.0..=100.0).suffix("%")).on_hover_text("Opacity").changed() {
-                    style.opacity = op / 100.0;
-                }
-                let hidden = style.opacity <= 0.0;
-                if ui.small_button(if hidden { ph::EYE_SLASH } else { ph::EYE }).on_hover_text(if hidden { "Show" } else { "Hide" }).clicked() {
-                    style.opacity = if hidden { 1.0 } else { 0.0 };
-                }
-                if before.is_plain() {
-                    ui.label("");
-                } else if ui.small_button(ph::ARROW_COUNTER_CLOCKWISE).on_hover_text("Its own color").clicked() {
-                    style.color = None;
-                    style.opacity = 1.0;
-                }
-                ui.end_row();
-                if style != before {
-                    changed = true;
-                    match i {
-                        Some(i) => layers[i] = style,
-                        None => layers.push(style),
-                    }
-                }
-            }
-        });
-        if changed {
-            layers.retain(|l| !l.is_plain());
+        let mut rows: Vec<EditLayer> = offered
+            .into_iter()
+            .map(|(name, colors)| {
+                let style = layers.iter().find(|l| l.colors == colors).cloned().unwrap_or(LayerStyle { colors, color: None, opacity: 1.0 });
+                EditLayer { name, style }
+            })
+            .collect();
+        if layer_grid(ui, "image_layers", &mut rows, false) {
+            changed = true;
+            *layers = rows.into_iter().map(|r| r.style).filter(|l| !l.is_plain()).collect();
         }
         changed
     }
@@ -1626,11 +1711,9 @@ impl BioCartoon {
                 ui.label(egui::RichText::new("Style").strong());
                 ui.horizontal(|ui| {
                     ui.label("Color overlay");
-                    let mut col = Color32::from_rgb(overlay[0], overlay[1], overlay[2]);
-                    if ui.color_edit_button_srgba(&mut col).changed() {
-                        overlay[0] = col.r();
-                        overlay[1] = col.g();
-                        overlay[2] = col.b();
+                    let mut rgb = [overlay[0], overlay[1], overlay[2]];
+                    if crate::color::edit_button_rgb(ui, &mut rgb).changed() {
+                        overlay[..3].copy_from_slice(&rgb);
                         if overlay[3] == 0 { overlay[3] = 255; }
                         changed = true;
                     }
@@ -1667,8 +1750,12 @@ impl BioCartoon {
                     }
                 }
             }
-            ItemKind::Text { text, size, color, align, bold, italic, underline, font, line_spacing, valign } => {
-                changed |= text_style_ui(ui, text, size, color, align, bold, italic, underline, font, line_spacing, valign);
+            ItemKind::Text { .. } => {
+                let sel = self.text_selection(it.id);
+                let styled = text_style_ui(ui, &mut edited.kind, sel.clone());
+                // Back to typing, with the letters just styled still selected.
+                self.text_edit_focus |= styled && sel.is_some();
+                changed |= styled;
             }
             ItemKind::Shape { shape, fill, stroke, stroke_width } => {
                 ui.label(egui::RichText::new("Shape").strong());
@@ -1677,12 +1764,19 @@ impl BioCartoon {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Fill");
-                    let mut col = c32(*fill);
-                    if ui.color_edit_button_srgba(&mut col).changed() { *fill = c4(col); changed = true; }
+                    let mut col = *fill;
+                    if crate::color::edit_button(ui, &mut col).changed() { *fill = col; changed = true; }
                     ui.label("Stroke");
-                    let mut col = c32(*stroke);
-                    if ui.color_edit_button_srgba(&mut col).changed() { *stroke = c4(col); changed = true; }
+                    let mut col = *stroke;
+                    if crate::color::edit_button(ui, &mut col).changed() { *stroke = col; changed = true; }
                     changed |= ui.add(egui::DragValue::new(stroke_width).range(0.0..=40.0).speed(0.5)).changed();
+                });
+                egui::Grid::new("shape_presets").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    for (label, c) in [("Fill presets", fill), ("Stroke presets", stroke)] {
+                        ui.label(label);
+                        if let Some(p) = color_presets(ui, *c) { *c = p; changed = true; }
+                        ui.end_row();
+                    }
                 });
             }
             ItemKind::Line { kind, color, width, style, .. } => {
@@ -1707,8 +1801,8 @@ impl BioCartoon {
                 }
                 egui::Grid::new("line_props").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("Color");
-                    let mut col = c32(*color);
-                    if ui.color_edit_button_srgba(&mut col).changed() { *color = c4(col); changed = true; }
+                    let mut col = *color;
+                    if crate::color::edit_button(ui, &mut col).changed() { *color = col; changed = true; }
                     ui.end_row();
                     ui.label("Thickness");
                     changed |= ui.add(egui::DragValue::new(width).range(0.5..=40.0).speed(0.5)).changed();
@@ -1747,19 +1841,19 @@ impl BioCartoon {
                     ui.label("Font");
                     changed |= ui.add(egui::DragValue::new(font_size).range(4.0..=100.0)).changed();
                     ui.label("Text");
-                    let mut col = c32(*text_color);
-                    if ui.color_edit_button_srgba(&mut col).changed() { *text_color = c4(col); changed = true; }
+                    let mut col = *text_color;
+                    if crate::color::edit_button(ui, &mut col).changed() { *text_color = col; changed = true; }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Fill");
-                    let mut col = c32(*fill);
-                    if ui.color_edit_button_srgba(&mut col).changed() { *fill = c4(col); changed = true; }
+                    let mut col = *fill;
+                    if crate::color::edit_button(ui, &mut col).changed() { *fill = col; changed = true; }
                     ui.label("Header");
-                    let mut col = c32(*header_fill);
-                    if ui.color_edit_button_srgba(&mut col).changed() { *header_fill = c4(col); changed = true; }
+                    let mut col = *header_fill;
+                    if crate::color::edit_button(ui, &mut col).changed() { *header_fill = col; changed = true; }
                     ui.label("Border");
-                    let mut col = c32(*border);
-                    if ui.color_edit_button_srgba(&mut col).changed() { *border = c4(col); changed = true; }
+                    let mut col = *border;
+                    if crate::color::edit_button(ui, &mut col).changed() { *border = col; changed = true; }
                 });
                 ui.label(egui::RichText::new("Double-click a cell on the canvas to type in it; Tab moves to the next cell.").small().color(theme::text_dim()));
             }
@@ -1850,9 +1944,9 @@ impl BioCartoon {
         ui.label(egui::RichText::new("Color").strong());
         let mut apply_all = false;
         ui.horizontal(|ui| {
-            let mut col = c32(self.doc.background_of(self.slide()));
-            if ui.color_edit_button_srgba(&mut col).changed() {
-                self.slide_mut().background = Some(col.to_srgba_unmultiplied());
+            let mut col = self.doc.background_of(self.slide());
+            if crate::color::edit_button(ui, &mut col).changed() {
+                self.slide_mut().background = Some(col);
             }
             ui.label("Page color");
             let first = self.doc.background_of(&self.doc.slides[0]);
@@ -2192,6 +2286,11 @@ fn form_encode(s: &str) -> String {
     out
 }
 
+/// "1 icon", "2,789 icons".
+fn counted(n: i64, what: &str) -> String {
+    format!("{} {what}{}", thousands(n), if n == 1 { "" } else { "s" })
+}
+
 /// `n` with thousands separators: 13,076.
 fn thousands(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
@@ -2345,8 +2444,10 @@ const GOLD: Color32 = Color32::from_rgb(0xf5, 0xb3, 0x01);
 enum TileAct {
     /// Star / unstar it, i.e. Favorite / Unfavorite (the star count, or the right-click menu).
     Favorite,
-    /// Remove from library, on one of the user's own uploads.
+    /// Remove from your library, on one of the user's own uploads.
     Remove,
+    /// Request removal from BioCartoon library, on a published (or submitted) community icon.
+    RequestRemoval,
     /// Add to BioCartoon library, on one of the user's own uploads.
     Share,
 }
@@ -2371,12 +2472,21 @@ struct TileMarks {
 /// `unsent` says whether one of the user's own icons can still go to the BioCartoon library
 /// (asked only when its menu is open).
 #[allow(clippy::too_many_arguments)]
+/// Whether generative AI made an asset, for its hover text (`None`: nobody said).
+fn ai_label(used: Option<bool>) -> &'static str {
+    match used {
+        Some(true) => "AI",
+        Some(false) => "No AI",
+        None => "AI unknown",
+    }
+}
+
 fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>, images: &mut crate::assets::ImageCache, hold: bool, colors: usize, marks: TileMarks, unsent: &mut dyn FnMut() -> bool) -> (egui::Response, Option<TileAct>) {
     let fav = marks.fav;
     let state = images.asset(&row.png_key, local);
     let loading = ImgState::Loading;
     let state = if hold { &loading } else { state };
-    let (abbr, col, name) = theme::source_badge(theme::asset_source(&row.source, &row.author));
+    let (abbr, col, name) = theme::source_badge(theme::asset_source(row));
     let r = tile(ui, size, &row.title, state, marks.database.then_some((abbr, col, name)));
     if marks.colors > 1 {
         color_wheel(ui.painter(), r.rect.right_bottom() - Vec2::new(13.0, 13.0), 7.0);
@@ -2399,12 +2509,15 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
         if !row.category.is_empty() {
             ui.label(format!("Database category: {}", row.category));
         }
-        let format = if row.svg_key.is_some() { crate::catalog::FORMAT_SVG } else { crate::catalog::FORMAT_PNG };
-        let mut last = format!("{name}  ·  {}  ·  {format}", row.license);
+        ui.label([name, row.license.as_str(), ai_label(row.generative_ai_used)].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  "));
+        let mut file = (if row.svg_key.is_some() { crate::catalog::FORMAT_SVG } else { crate::catalog::FORMAT_PNG }).to_string();
         if row.png_width > 0 && row.png_height > 0 {
-            last += &format!("  ·  {} × {} px", row.png_width, row.png_height);
+            file += &format!("  ·  {} × {} px", row.png_width, row.png_height);
         }
-        ui.label(last);
+        if row.file_bytes > 0 {
+            file += &format!("  ·  {}", crate::offline::human_bytes(row.file_bytes));
+        }
+        ui.label(file);
         ui.label(egui::RichText::new(&row.credit).small().color(theme::text_dim()));
     };
     // A long press opens the context menu too, so the info goes there for touch screens.
@@ -2425,15 +2538,27 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
             ui.close();
         }
         // The user's own uploads (published ones have no local copy) can be taken out again.
-        if row.source == "user" && row.png_local.is_some() {
+        // Anyone can ask for a published community icon, or one they submitted, to come out of
+        // the BioCartoon library; a reviewer decides.
+        if row.source == "user" {
             ui.separator();
-            let b = ui.add_enabled(unsent(), egui::Button::new(format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP)));
-            if b.on_disabled_hover_text(crate::app::ALREADY_SUBMITTED).clicked() {
-                act = Some(TileAct::Share);
-                ui.close();
-            }
-            if ui.button(format!("{}  Remove from library", ph::TRASH)).clicked() {
-                act = Some(TileAct::Remove);
+            let sent = if row.png_local.is_some() {
+                let unsent = unsent();
+                let b = ui.add_enabled(unsent, egui::Button::new(format!("{}  Add to BioCartoon library...", ph::CLOUD_ARROW_UP)));
+                if b.on_disabled_hover_text(crate::app::ALREADY_SUBMITTED).clicked() {
+                    act = Some(TileAct::Share);
+                    ui.close();
+                }
+                if ui.button(format!("{}  Remove from your library", ph::TRASH)).clicked() {
+                    act = Some(TileAct::Remove);
+                    ui.close();
+                }
+                !unsent
+            } else {
+                true
+            };
+            if sent && ui.button(format!("{}  Request removal from BioCartoon library...", ph::FLAG)).clicked() {
+                act = Some(TileAct::RequestRemoval);
                 ui.close();
             }
         }
@@ -2530,30 +2655,26 @@ fn code_editor(ui: &mut egui::Ui, code: &mut String, language: CodeLang, theme: 
 }
 
 /// The Edit panel's Text section: font, size, colour, line spacing, alignment, lists and
-/// decoration, one labelled row each.
-#[allow(clippy::too_many_arguments)]
-fn text_style_ui(
-    ui: &mut egui::Ui,
-    text: &mut String,
-    size: &mut f32,
-    color: &mut [u8; 4],
-    align: &mut TextAlign,
-    bold: &mut bool,
-    italic: &mut bool,
-    underline: &mut bool,
-    font: &mut TextFont,
-    line_spacing: &mut f32,
-    valign: &mut TextVAlign,
-) -> bool {
+/// decoration, one labelled row each. Colour and decoration go to the characters `sel` (char
+/// indices) when letters are selected in the box, and to the whole box otherwise.
+fn text_style_ui(ui: &mut egui::Ui, kind: &mut ItemKind, sel: Option<std::ops::Range<usize>>) -> bool {
+    let mut color = crate::doc::color_at(kind, sel.clone());
+    let flags = [TextFlag::Bold, TextFlag::Italic, TextFlag::Underline, TextFlag::Strike].map(|f| crate::doc::flag_all(kind, sel.clone(), f));
+    let (mut new_color, mut toggled) = (None, None);
+    let ItemKind::Text { text, size, align, font, line_spacing, valign, .. } = kind else { return false };
+    let color = &mut color;
     let mut changed = false;
     ui.label(egui::RichText::new("Text").strong());
+    if sel.is_some() {
+        ui.label(egui::RichText::new("Color and decoration go to the selected letters.").small().color(theme::text_dim()));
+    }
     // Each font's name is written in that font.
     let px = egui::TextStyle::Body.resolve(ui.style()).size;
     let in_font = |f: TextFont| egui::RichText::new(f.label()).font(f.font_id(px));
     let text_w = |ui: &egui::Ui, t: egui::WidgetText| t.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x;
     // The fields fill the column beside the labels, and are never narrower than the font
     // dropdown needs for its longest name, so every row lines up with it.
-    let labels = ["Font", "Size", "Color", "Line spacing", "Horizontal align", "Vertical align", "List style", "Decoration"];
+    let labels = ["Font", "Size", "Color", "Presets", "Line spacing", "Horizontal align", "Vertical align", "List style", "Decoration"];
     let label_w = labels.iter().map(|l| text_w(ui, (*l).into())).fold(0.0, f32::max);
     let sp = ui.spacing();
     let combo_extra = sp.icon_spacing + sp.icon_width + 2.0 * sp.button_padding.x;
@@ -2584,10 +2705,9 @@ fn text_style_ui(
 
         ui.label("Color");
         ui.horizontal(|ui| {
-            let mut col = c32(*color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
-                *color = c4(col);
-                changed = true;
+            let mut col = *color;
+            if crate::color::edit_button(ui, &mut col).changed() {
+                new_color = Some(col);
             }
             // Keep what is being typed while the field has focus; show the colour otherwise.
             let id = ui.make_persistent_id("text_hex");
@@ -2596,8 +2716,7 @@ fn text_style_ui(
             let r = ui.add(egui::TextEdit::singleline(&mut hex).id(id.with("edit")).desired_width(ui.available_width().min(w - 48.0)).char_limit(7));
             if r.changed() {
                 if let Some(c) = parse_hex(&hex) {
-                    *color = [c[0], c[1], c[2], color[3]];
-                    changed = true;
+                    new_color = Some([c[0], c[1], c[2], color[3]]);
                 }
             }
             let focused = r.has_focus();
@@ -2609,6 +2728,10 @@ fn text_style_ui(
                 }
             });
         });
+        ui.end_row();
+
+        ui.label("Presets");
+        new_color = color_presets(ui, *color).or(new_color);
         ui.end_row();
 
         ui.label("Line spacing");
@@ -2664,17 +2787,58 @@ fn text_style_ui(
         ui.end_row();
 
         ui.label("Decoration");
-        segmented(ui, w, 3, |ui, cell| {
-            for (v, icon, tip) in [(bold, ph::TEXT_B, "Bold"), (italic, ph::TEXT_ITALIC, "Italic"), (underline, ph::TEXT_UNDERLINE, "Underline")] {
-                if seg_toggle(ui, cell, icon, *v, tip).clicked() {
-                    *v = !*v;
-                    changed = true;
+        segmented(ui, w, 4, |ui, cell| {
+            let tips = [(ph::TEXT_B, "Bold (⌘/Ctrl+B)"), (ph::TEXT_ITALIC, "Italic (⌘/Ctrl+I)"), (ph::TEXT_UNDERLINE, "Underline (⌘/Ctrl+U)"), (ph::TEXT_STRIKETHROUGH, "Strikethrough")];
+            for (i, (icon, tip)) in tips.into_iter().enumerate() {
+                if seg_toggle(ui, cell, icon, flags[i], tip).clicked() {
+                    toggled = Some(i);
                 }
             }
         });
         ui.end_row();
     });
+    if let Some(c) = new_color.filter(|c| *c != *color) {
+        crate::doc::set_color(kind, sel.clone(), c);
+        changed = true;
+    }
+    if let Some(i) = toggled {
+        let flag = [TextFlag::Bold, TextFlag::Italic, TextFlag::Underline, TextFlag::Strike][i];
+        crate::doc::set_flag(kind, sel, flag, !flags[i]);
+        changed = true;
+    }
     changed
+}
+
+/// The common colours as a row of swatches, the one matching `current` ringed; the one clicked.
+pub(crate) fn color_presets(ui: &mut egui::Ui, current: [u8; 4]) -> Option<[u8; 4]> {
+    const PRESETS: [(&str, [u8; 3]); 11] = [
+        ("White", [255, 255, 255]),
+        ("Pink", [244, 143, 177]),
+        ("Red", [220, 38, 38]),
+        ("Orange", [249, 115, 22]),
+        ("Yellow", [250, 204, 21]),
+        ("Green", [22, 163, 74]),
+        ("Cyan", [6, 182, 212]),
+        ("Blue", [37, 99, 235]),
+        ("Purple", [147, 51, 234]),
+        ("Brown", [133, 77, 14]),
+        ("Black", [0, 0, 0]),
+    ];
+    let mut picked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+        for (name, [r, g, b]) in PRESETS {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+            let on = current[..3] == [r, g, b];
+            let ring = if on { Stroke::new(2.0, theme::accent()) } else if resp.hovered() { Stroke::new(1.5, theme::text()) } else { Stroke::new(1.0, theme::border()) };
+            ui.painter().rect(rect, 4.0, Color32::from_rgb(r, g, b), ring, StrokeKind::Inside);
+            if resp.on_hover_text(name).clicked() {
+                // Keep the colour's transparency.
+                picked = Some([r, g, b, if current[3] == 0 { 255 } else { current[3] }]);
+            }
+        }
+    });
+    picked
 }
 
 /// A bordered row of `n` equal cells, `width` wide, like a segmented control. `add` gets each
@@ -2795,9 +2959,213 @@ fn indent(text: &mut String, more: bool) {
         .join("\n");
 }
 
+/// One of the filters, for counting a filter's choices under all the others (see [`local_facets`]).
+#[derive(Clone, Copy, PartialEq)]
+enum Dim {
+    Source,
+    Taxa,
+    DbCat,
+    License,
+    Format,
+}
+
+/// Whether a loaded asset passes Favorites' or Your library's box (`q`, lowercase: in its title,
+/// description, category or tags) and filters, as the catalog's search would, leaving out `skip`.
+fn local_match(row: &AssetRow, q: &str, f: &SearchFilter, skip: Option<Dim>) -> bool {
+    let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    let shown = theme::asset_source(row);
+    let text = q.is_empty() || [&row.title, &row.description, &row.category].iter().any(|t| t.to_lowercase().contains(q)) || row.tags.iter().any(|t| t.to_lowercase().contains(q));
+    let authors = f.authors();
+    let tags = f.tags();
+    let taxa = f.catalog().taxa;
+    text && (skip == Some(Dim::Source) || f.sources.is_empty() || f.sources.iter().any(|s| s == shown))
+        && (authors.is_empty() || authors.iter().any(|a| row.author.to_lowercase().contains(a)))
+        && (skip == Some(Dim::Taxa) || taxa.is_empty() || taxa.iter().any(|(c, s)| row.taxa.iter().any(|(rc, rs)| rc == c && (s.is_empty() || rs == s))))
+        && (skip == Some(Dim::DbCat) || f.db_cats.is_empty() || f.db_cats.iter().any(|(s, c)| s == shown && row.category.split(", ").any(|rc| eq(rc, c))))
+        && (skip == Some(Dim::License) || f.licenses.is_empty() || f.licenses.iter().any(|l| l == &row.license))
+        && (skip == Some(Dim::Format) || f.formats.is_empty() || f.formats.iter().any(|x| x == asset_format(row)))
+        && (tags.is_empty() || tags.iter().any(|t| row.tags.iter().any(|x| eq(x, t))))
+}
+
+/// `catalog::FORMAT_SVG` when the asset has an SVG, else `catalog::FORMAT_PNG`.
+fn asset_format(row: &AssetRow) -> &'static str {
+    if row.svg_key.is_some() { crate::catalog::FORMAT_SVG } else { crate::catalog::FORMAT_PNG }
+}
+
+/// The filters' choices among loaded assets (Favorites, Your library), each counted under the
+/// box and the other filters, as the catalog's facets are.
+fn local_facets(rows: &[AssetRow], q: &str, f: &SearchFilter) -> Facets {
+    fn tally(counts: &mut Vec<(String, i64)>, v: &str) {
+        match counts.iter_mut().find(|(k, _)| k == v) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((v.to_string(), 1)),
+        }
+    }
+    let under = |dim: Dim| rows.iter().filter(move |r| local_match(r, q, f, Some(dim)));
+    let mut fc = Facets { sources: Vec::new(), licenses: Vec::new(), taxa: Vec::new(), db_cats: Vec::new(), formats: Vec::new() };
+    for r in under(Dim::Source) {
+        tally(&mut fc.sources, theme::asset_source(r));
+    }
+    for r in under(Dim::License).filter(|r| !r.license.is_empty()) {
+        tally(&mut fc.licenses, &r.license);
+    }
+    for r in under(Dim::Format) {
+        tally(&mut fc.formats, asset_format(r));
+    }
+    let mut taxa: Vec<(String, i64)> = Vec::new();
+    for r in under(Dim::Taxa) {
+        // Once per category, however many of its subcategories the asset is in.
+        let mut cats: Vec<&str> = r.taxa.iter().map(|(c, _)| *c).collect();
+        cats.sort();
+        cats.dedup();
+        for c in cats {
+            tally(&mut taxa, &format!("{c}\u{0}"));
+        }
+        for (c, s) in &r.taxa {
+            tally(&mut taxa, &format!("{c}\u{0}{s}"));
+        }
+    }
+    fc.taxa = taxa
+        .into_iter()
+        .map(|(k, count)| {
+            let (cat, sub) = k.split_once('\u{0}').unwrap_or((&k, ""));
+            crate::catalog::TaxonCount { cat: cat.to_string(), sub: sub.to_string(), count }
+        })
+        .collect();
+    for r in under(Dim::DbCat) {
+        let shown = theme::asset_source(r);
+        for c in r.category.split(", ").map(str::trim).filter(|c| !c.is_empty()) {
+            match fc.db_cats.iter_mut().find(|(s, k, _)| s == shown && k == c) {
+                Some((_, _, n)) => *n += 1,
+                None => fc.db_cats.push((shown.to_string(), c.to_string(), 1)),
+            }
+        }
+    }
+    fc
+}
+
+
+/// One layer as [`layer_grid`] shows it: its name, and its colours restyled (or not).
+pub struct EditLayer {
+    pub name: String,
+    pub style: LayerStyle,
+}
+
+/// The catalog's named layers with their colours read, leaving out any with none.
+pub fn named_layers(layers: &[crate::catalog::AssetLayer]) -> Vec<(String, Vec<[u8; 3]>)> {
+    let hex = |c: &str| -> Option<[u8; 3]> {
+        let h = c.strip_prefix('#').filter(|h| h.len() == 6)?;
+        let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+        Some([b(0)?, b(2)?, b(4)?])
+    };
+    layers.iter().map(|l| (l.name.clone(), l.colors.iter().filter_map(|c| hex(c)).collect::<Vec<_>>())).filter(|(_, c)| !c.is_empty()).collect()
+}
+
+/// A drawing's own colours as layers, the [`MAX_COLOR_LAYERS`] most used, named Layer 1, 2...
+/// None when it has fewer than two.
+pub fn color_layers(colors: &[[u8; 3]]) -> Vec<(String, Vec<[u8; 3]>)> {
+    if colors.len() < 2 {
+        return Vec::new();
+    }
+    colors.iter().take(MAX_COLOR_LAYERS).enumerate().map(|(i, c)| (format!("Layer {}", i + 1), vec![*c])).collect()
+}
+
+/// One row per layer, as the Layers editor and the library dialog show them: `Name:` (a text
+/// box with `edit_names`), a colour box, the opacity and an eye, and a button back to its own
+/// colour once it is restyled. Whether a style changed (not a name).
+pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut [EditLayer], edit_names: bool) -> bool {
+    let mut changed = false;
+    egui::Grid::new(id_salt).num_columns(5).spacing([6.0, 4.0]).show(ui, |ui| {
+        for row in rows.iter_mut() {
+            let style = &mut row.style;
+            let before = style.clone();
+            if edit_names {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add(egui::TextEdit::singleline(&mut row.name).char_limit(40).desired_width(110.0));
+                    ui.label(":");
+                });
+            } else {
+                ui.label(format!("{}:", row.name));
+            }
+            let mut rgb = style.color.unwrap_or(style.colors[0]);
+            if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Color").changed() {
+                style.color = Some(rgb);
+            }
+            let mut op = style.opacity * 100.0;
+            if ui.add(egui::DragValue::new(&mut op).speed(1.0).range(0.0..=100.0).suffix("%")).on_hover_text("Opacity").changed() {
+                style.opacity = op / 100.0;
+            }
+            let hidden = style.opacity <= 0.0;
+            if ui.small_button(if hidden { ph::EYE_SLASH } else { ph::EYE }).on_hover_text(if hidden { "Show" } else { "Hide" }).clicked() {
+                style.opacity = if hidden { 1.0 } else { 0.0 };
+            }
+            if before.is_plain() {
+                ui.label("");
+            } else if ui.small_button(ph::ARROW_COUNTER_CLOCKWISE).on_hover_text("Its own color").clicked() {
+                style.color = None;
+                style.opacity = 1.0;
+            }
+            ui.end_row();
+            changed |= *style != before;
+        }
+    });
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fav(id: &str, title: &str, source: &str, svg: bool, taxa: Vec<crate::taxonomy::Taxon>, tags: &[&str]) -> AssetRow {
+        AssetRow {
+            id: id.into(),
+            source: source.into(),
+            source_name: String::new(),
+            title: title.into(),
+            variant: String::new(),
+            category: "Viruses, Cells".into(),
+            description: String::new(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            license: "CC0-1.0".into(),
+            credit: String::new(),
+            author: "Ann Smith".into(),
+            png_key: String::new(),
+            png_local: None,
+            png_width: 1,
+            png_height: 1,
+            svg_key: svg.then(|| "x.svg".into()),
+            stars: 0,
+            starred: false,
+            taxa,
+            layers: Vec::new(),
+            generative_ai_used: None,
+            file_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn filters_loaded_favorites() {
+        let rows = vec![
+            fav("a", "Neuron", "bioicons", true, vec![("Cells", "Cell types")], &["brain"]),
+            fav("b", "Mitochondrion", "servier", false, vec![("Cells", "Organelles and cell components")], &[]),
+        ];
+        let ids = |q: &str, f: &SearchFilter| rows.iter().filter(|r| local_match(r, q, f, None)).map(|r| r.id.as_str()).collect::<Vec<_>>();
+        let none = SearchFilter::default();
+        assert_eq!(ids("", &none), ["a", "b"]);
+        assert_eq!(ids("mito", &none), ["b"]);
+        assert_eq!(ids("brain", &none), ["a"]);
+        assert_eq!(ids("", &SearchFilter { formats: vec![crate::catalog::FORMAT_PNG.into()], ..none.clone() }), ["b"]);
+        assert_eq!(ids("", &SearchFilter { cats: vec!["Cells".into()], subs: vec![("Cells".into(), "Cell types".into())], ..none.clone() }), ["a"]);
+        assert_eq!(ids("", &SearchFilter { sources: vec!["servier".into()], ..none.clone() }), ["b"]);
+        assert_eq!(ids("", &SearchFilter { db_cats: vec![("bioicons".into(), "cells".into())], ..none.clone() }), ["a"]);
+        assert_eq!(ids("", &SearchFilter { authors: "smith".into(), tags: "Brain".into(), ..none.clone() }), ["a"]);
+        // Each choice is counted under the other filters, not its own.
+        let fc = local_facets(&rows, "", &SearchFilter { sources: vec!["servier".into()], ..none.clone() });
+        assert_eq!(fc.sources, [("bioicons".to_string(), 1), ("servier".to_string(), 1)]);
+        assert_eq!(fc.formats, [("PNG".to_string(), 1)]);
+        assert!(fc.taxa.iter().any(|t| t.cat == "Cells" && t.sub.is_empty() && t.count == 1));
+    }
 
     #[test]
     fn lists_and_indents() {

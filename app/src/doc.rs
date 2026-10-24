@@ -712,12 +712,17 @@ pub enum ItemKind {
         #[serde(default)]
         underline: bool,
         #[serde(default)]
+        strike: bool,
+        #[serde(default)]
         font: TextFont,
         /// Multiple of the font's natural row height.
         #[serde(default = "one")]
         line_spacing: f32,
         #[serde(default)]
         valign: TextVAlign,
+        /// Characters styled apart from the rest of the box (see [`TextRun`]).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        runs: Vec<TextRun>,
     },
     Shape {
         shape: ShapeKind,
@@ -765,7 +770,244 @@ pub enum ItemKind {
 impl ItemKind {
     /// A plain text box: upright, sans, single-spaced, top-aligned.
     pub fn text(text: impl Into<String>, size: f32, color: [u8; 4], align: TextAlign, bold: bool) -> Self {
-        ItemKind::Text { text: text.into(), size, color, align, bold, italic: false, underline: false, font: TextFont::Sans, line_spacing: 1.0, valign: TextVAlign::Top }
+        ItemKind::Text { text: text.into(), size, color, align, bold, italic: false, underline: false, strike: false, font: TextFont::Sans, line_spacing: 1.0, valign: TextVAlign::Top, runs: Vec::new() }
+    }
+}
+
+/// What some of a text box's characters set over the box's own bold, italic, underline,
+/// strikethrough and colour; `None` keeps the box's.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct RunStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strike: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 4]>,
+}
+
+/// Characters `start..end` (counted in chars, not bytes) of a text box, styled by `style`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TextRun {
+    pub start: usize,
+    pub end: usize,
+    #[serde(flatten)]
+    pub style: RunStyle,
+}
+
+/// How a character of a text box is drawn: the box's style with its run's on top.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharLook {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    pub color: [u8; 4],
+}
+
+/// One style per character of a `len`-character text from its runs.
+pub fn expand_runs(runs: &[TextRun], len: usize) -> Vec<RunStyle> {
+    let mut out = vec![RunStyle::default(); len];
+    for r in runs {
+        for s in out.iter_mut().take(r.end.min(len)).skip(r.start) {
+            *s = r.style;
+        }
+    }
+    out
+}
+
+/// Per-character styles packed back into runs, leaving out unstyled characters.
+pub fn pack_runs(styles: &[RunStyle]) -> Vec<TextRun> {
+    let mut out: Vec<TextRun> = Vec::new();
+    for (i, s) in styles.iter().enumerate() {
+        if *s == RunStyle::default() {
+            continue;
+        }
+        match out.last_mut() {
+            Some(r) if r.end == i && r.style == *s => r.end = i + 1,
+            _ => out.push(TextRun { start: i, end: i + 1, style: *s }),
+        }
+    }
+    out
+}
+
+/// `runs` for `old` moved onto `new`, an edit of it: the characters both keep at the start and
+/// end keep their styles, and typed ones take the style of the first character they replaced
+/// or, failing that, the one before them.
+pub fn remap_runs(runs: &[TextRun], old: &str, new: &str) -> Vec<TextRun> {
+    if runs.is_empty() || old == new {
+        return runs.to_vec();
+    }
+    let (a, b): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let max_suf = a.len().min(b.len()) - pre;
+    let suf = a.iter().rev().zip(b.iter().rev()).take(max_suf).take_while(|(x, y)| x == y).count();
+    let styles = expand_runs(runs, a.len());
+    let typed = if a.len() - suf > pre { styles.get(pre) } else { pre.checked_sub(1).and_then(|i| styles.get(i)) }.copied().unwrap_or_default();
+    let mut out = styles[..pre].to_vec();
+    out.extend(std::iter::repeat_n(typed, b.len() - suf - pre));
+    out.extend_from_slice(&styles[a.len() - suf..]);
+    pack_runs(&out)
+}
+
+/// Every character's look in a text box (`kind`, a text item), its runs taken as styling `text`.
+pub fn char_looks(kind: &ItemKind, text: &str) -> Vec<CharLook> {
+    let ItemKind::Text { text: own, color, bold, italic, underline, strike, runs, .. } = kind else { return Vec::new() };
+    let runs = if own == text { runs.clone() } else { remap_runs(runs, own, text) };
+    let base = CharLook { bold: *bold, italic: *italic, underline: *underline, strike: *strike, color: *color };
+    expand_runs(&runs, text.chars().count())
+        .into_iter()
+        .map(|s| CharLook {
+            bold: s.bold.unwrap_or(base.bold),
+            italic: s.italic.unwrap_or(base.italic),
+            underline: s.underline.unwrap_or(base.underline),
+            strike: s.strike.unwrap_or(base.strike),
+            color: s.color.unwrap_or(base.color),
+        })
+        .collect()
+}
+
+/// A text box's text split where its look changes: byte ranges and their looks. Never empty: an
+/// empty box is one empty section in its own look.
+pub fn text_sections(kind: &ItemKind, text: &str) -> Vec<(std::ops::Range<usize>, CharLook)> {
+    let ItemKind::Text { color, bold, italic, underline, strike, .. } = kind else { return Vec::new() };
+    let mut out: Vec<(std::ops::Range<usize>, CharLook)> = Vec::new();
+    for ((b, c), look) in text.char_indices().zip(char_looks(kind, text)) {
+        match out.last_mut() {
+            Some((r, l)) if *l == look => r.end = b + c.len_utf8(),
+            _ => out.push((b..b + c.len_utf8(), look)),
+        }
+    }
+    if out.is_empty() {
+        out.push((0..0, CharLook { bold: *bold, italic: *italic, underline: *underline, strike: *strike, color: *color }));
+    }
+    out
+}
+
+/// A text style that is on or off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextFlag {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+}
+
+impl TextFlag {
+    fn of(self, l: &CharLook) -> bool {
+        match self {
+            TextFlag::Bold => l.bold,
+            TextFlag::Italic => l.italic,
+            TextFlag::Underline => l.underline,
+            TextFlag::Strike => l.strike,
+        }
+    }
+
+    fn slot(self, s: &mut RunStyle) -> &mut Option<bool> {
+        match self {
+            TextFlag::Bold => &mut s.bold,
+            TextFlag::Italic => &mut s.italic,
+            TextFlag::Underline => &mut s.underline,
+            TextFlag::Strike => &mut s.strike,
+        }
+    }
+}
+
+/// The characters (`range`, in chars) of a text box a style change goes to: all of them for `None`.
+fn looks_in(kind: &ItemKind, range: Option<std::ops::Range<usize>>) -> Vec<CharLook> {
+    let ItemKind::Text { text, .. } = kind else { return Vec::new() };
+    let looks = char_looks(kind, text);
+    match range {
+        Some(r) => looks.get(r.start.min(looks.len())..r.end.min(looks.len())).unwrap_or_default().to_vec(),
+        None => looks,
+    }
+}
+
+/// Whether every character of `range` (the whole box for `None`) of text box `kind` has `flag`;
+/// an empty box answers for itself.
+pub fn flag_all(kind: &ItemKind, range: Option<std::ops::Range<usize>>, flag: TextFlag) -> bool {
+    let looks = looks_in(kind, range);
+    if looks.is_empty() {
+        return text_sections(kind, "").first().is_some_and(|(_, l)| flag.of(l));
+    }
+    looks.iter().all(|l| flag.of(l))
+}
+
+/// The colour of the first character of `range` (the box's own for `None` or an empty range).
+pub fn color_at(kind: &ItemKind, range: Option<std::ops::Range<usize>>) -> [u8; 4] {
+    match looks_in(kind, range.clone()).first() {
+        Some(l) if range.is_some() => l.color,
+        _ => match kind {
+            ItemKind::Text { color, .. } => *color,
+            _ => [0; 4],
+        },
+    }
+}
+
+/// Change the style of the characters in `range` of text box `kind` with `f`, which gets the
+/// box's look so it can leave out what matches it. With `None` the box's own style changes
+/// instead (`whole`) and `f` clears every run's say over it.
+fn restyle(kind: &mut ItemKind, range: Option<std::ops::Range<usize>>, whole: impl FnOnce(&mut ItemKind), f: impl Fn(&mut RunStyle, &CharLook)) {
+    let base = text_sections(kind, "").first().map(|s| s.1);
+    let Some(base) = base else { return };
+    let ItemKind::Text { text, runs, .. } = kind else { return };
+    let n = text.chars().count();
+    let mut styles = expand_runs(runs, n);
+    let r = range.clone().unwrap_or(0..n);
+    for s in styles.iter_mut().take(r.end.min(n)).skip(r.start) {
+        f(s, &base);
+    }
+    *runs = pack_runs(&styles);
+    if range.is_none() {
+        whole(kind);
+    }
+}
+
+/// Turn `flag` on or off for the characters in `range` (the whole box for `None`).
+pub fn set_flag(kind: &mut ItemKind, range: Option<std::ops::Range<usize>>, flag: TextFlag, on: bool) {
+    let whole = range.is_none();
+    restyle(
+        kind,
+        range,
+        |k| {
+            if let ItemKind::Text { bold, italic, underline, strike, .. } = k {
+                *match flag {
+                    TextFlag::Bold => bold,
+                    TextFlag::Italic => italic,
+                    TextFlag::Underline => underline,
+                    TextFlag::Strike => strike,
+                } = on;
+            }
+        },
+        |s, base| *flag.slot(s) = (!whole && flag.of(base) != on).then_some(on),
+    );
+}
+
+/// Colour the characters in `range` (the whole box for `None`).
+pub fn set_color(kind: &mut ItemKind, range: Option<std::ops::Range<usize>>, c: [u8; 4]) {
+    let whole = range.is_none();
+    restyle(
+        kind,
+        range,
+        |k| {
+            if let ItemKind::Text { color, .. } = k {
+                *color = c;
+            }
+        },
+        |s, base| s.color = (!whole && base.color != c).then_some(c),
+    );
+}
+
+impl Item {
+    /// After this text box's text was changed from `old`, move its runs onto the new text.
+    pub fn remap_text_runs(&mut self, old: &str) {
+        if let ItemKind::Text { text, runs, .. } = &mut self.kind {
+            *runs = remap_runs(runs, old, text);
+        }
     }
 }
 
@@ -1142,6 +1384,38 @@ fn fit_axis(min: f32, len: f32, c0: f32, c1: f32, flip: bool, art: f32, d0: f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bold_chars(kind: &ItemKind) -> String {
+        let ItemKind::Text { text, .. } = kind else { return String::new() };
+        text.chars().zip(char_looks(kind, text)).filter(|(_, l)| l.bold).map(|(c, _)| c).collect()
+    }
+
+    /// Bolding some letters bolds only them; typing keeps them bold and moves them along.
+    #[test]
+    fn letter_styles_follow_edits() {
+        let mut it = Item::new(1, "t", ItemKind::text("hello world", 20.0, [0, 0, 0, 255], TextAlign::Left, false), Pos2::ZERO, Vec2::splat(100.0));
+        set_flag(&mut it.kind, Some(6..11), TextFlag::Bold, true);
+        assert_eq!(bold_chars(&it.kind), "world");
+        assert!(flag_all(&it.kind, Some(7..9), TextFlag::Bold) && !flag_all(&it.kind, None, TextFlag::Bold));
+        for (old, new) in [("hello world", "oh, hello world"), ("oh, hello world", "oh, hello worlds")] {
+            let ItemKind::Text { text, .. } = &mut it.kind else { unreachable!() };
+            *text = new.into();
+            it.remap_text_runs(old);
+        }
+        // The 's' typed after the bold word takes its style.
+        assert_eq!(bold_chars(&it.kind), "worlds");
+        set_flag(&mut it.kind, Some(10..12), TextFlag::Bold, false);
+        assert_eq!(bold_chars(&it.kind), "rlds");
+        // Styling the whole box overrides the letters'.
+        set_flag(&mut it.kind, None, TextFlag::Bold, false);
+        assert_eq!(bold_chars(&it.kind), "");
+        assert!(matches!(&it.kind, ItemKind::Text { runs, .. } if runs.is_empty()));
+        set_color(&mut it.kind, Some(0..2), [255, 0, 0, 255]);
+        assert_eq!(color_at(&it.kind, Some(0..1)), [255, 0, 0, 255]);
+        assert_eq!(color_at(&it.kind, None), [0, 0, 0, 255]);
+        let ItemKind::Text { text, .. } = &it.kind else { unreachable!() };
+        assert_eq!(text_sections(&it.kind, text).len(), 2);
+    }
 
     /// The Font menu is alphabetical and offers every font once.
     #[test]

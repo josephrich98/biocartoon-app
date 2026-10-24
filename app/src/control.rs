@@ -11,7 +11,7 @@
 
 use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, Screen};
 use crate::catalog::AssetRow;
-use crate::doc::{CodeLang, CodeTheme, ImageSource, Item, ItemKind, LineKind, LineStyle, ShapeKind, TextAlign, TextFont, TextVAlign, Unit, DPI, MAX_COORD, MAX_FONT_SIZE, MIN_PAGE};
+use crate::doc::{CodeLang, CodeTheme, ImageSource, Item, ItemKind, LineKind, LineStyle, ShapeKind, TextAlign, TextFlag, TextFont, TextVAlign, Unit, DPI, MAX_COORD, MAX_FONT_SIZE, MIN_PAGE};
 use egui::{Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -234,7 +234,7 @@ fn name_of<T: std::fmt::Debug>(v: T) -> String {
 /// Item fields `update_item` and the `insert_*` commands take (see [`patch_item`]).
 const ITEM_ARGS: &[&str] = &[
     "x", "y", "width", "height", "x1", "y1", "x2", "y2", "rotation", "flip_h", "flip_v", "locked", "opacity", "name", "crop", "overlay",
-    "text", "font_size", "color", "bold", "italic", "underline", "font", "line_spacing", "align", "valign", "shape", "fill", "stroke",
+    "text", "font_size", "color", "bold", "italic", "underline", "strikethrough", "font", "line_spacing", "align", "valign", "shape", "fill", "stroke",
     "stroke_width", "line_kind", "line_style", "line_width", "header", "cells", "code", "language", "theme", "line_numbers", "window", "rounded",
 ];
 
@@ -318,7 +318,7 @@ pub fn item_json(it: &Item) -> Value {
                 o.insert("layers".into(), json!(layers));
             }
         }
-        ItemKind::Text { text, size, color, align, bold, italic, underline, font, line_spacing, valign } => {
+        ItemKind::Text { text, size, color, align, bold, italic, underline, strike, font, line_spacing, valign, runs } => {
             o.insert("text".into(), json!(text));
             o.insert("font_size".into(), json!(size));
             o.insert("color".into(), json!(color));
@@ -327,6 +327,10 @@ pub fn item_json(it: &Item) -> Value {
             o.insert("bold".into(), json!(bold));
             o.insert("italic".into(), json!(italic));
             o.insert("underline".into(), json!(underline));
+            o.insert("strikethrough".into(), json!(strike));
+            if !runs.is_empty() {
+                o.insert("runs".into(), json!(runs));
+            }
             o.insert("font".into(), json!(name_of(font)));
             o.insert("line_spacing".into(), json!(line_spacing));
         }
@@ -396,6 +400,13 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
     if let Some(v) = b(args, "locked") { it.locked = v; }
     if let Some(v) = f(args, "opacity") { it.opacity = v.clamp(0.0, 1.0); }
     if let Some(v) = s(args, "name") { it.name = v.to_string(); }
+    if matches!(it.kind, ItemKind::Text { .. }) {
+        // The whole box's colour and decoration, over any its letters had of their own.
+        if let Some(v) = color(args, "color") { crate::doc::set_color(&mut it.kind, None, v); }
+        for (key, flag) in [("bold", TextFlag::Bold), ("italic", TextFlag::Italic), ("underline", TextFlag::Underline), ("strikethrough", TextFlag::Strike)] {
+            if let Some(v) = b(args, key) { crate::doc::set_flag(&mut it.kind, None, flag, v); }
+        }
+    }
     match &mut it.kind {
         ItemKind::Image { crop, overlay, .. } => {
             if let Some(c) = args.get("crop").and_then(Value::as_array) {
@@ -406,15 +417,14 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
             }
             if let Some(c) = color(args, "overlay") { *overlay = c; }
         }
-        ItemKind::Text { text, size, color: c, align, bold, italic, underline, font, line_spacing, valign } => {
-            if let Some(v) = s(args, "text") { *text = v.to_string(); }
+        ItemKind::Text { text, size, align, font, line_spacing, valign, runs, .. } => {
+            if let Some(v) = s(args, "text") {
+                let old = std::mem::replace(text, v.to_string());
+                *runs = crate::doc::remap_runs(runs, &old, text);
+            }
             if let Some(v) = f(args, "font_size") { *size = v.clamp(1.0, MAX_FONT_SIZE); }
-            if let Some(v) = color(args, "color") { *c = v; }
-            if let Some(v) = b(args, "bold") { *bold = v; }
             if let Some(v) = s(args, "align") { *align = parse_enum(&TextAlign::ALL, v, "align")?; }
             if let Some(v) = s(args, "valign") { *valign = parse_enum(&TextVAlign::ALL, v, "valign")?; }
-            if let Some(v) = b(args, "italic") { *italic = v; }
-            if let Some(v) = b(args, "underline") { *underline = v; }
             if let Some(v) = s(args, "font") { *font = parse_enum(&TextFont::ALL, v, "font")?; }
             if let Some(v) = f(args, "line_spacing") { *line_spacing = v.clamp(0.5, 4.0); }
         }
@@ -588,6 +598,8 @@ impl BioCartoon {
                     starred: false,
                     taxa: Vec::new(),
                     layers: Vec::new(),
+                    generative_ai_used: a.get("generative_ai_used").and_then(Value::as_bool),
+                    file_bytes: 0,
                 };
                 if row.id.is_empty() || row.png_key.is_empty() {
                     return Err("asset needs at least id and png_key".into());
@@ -713,7 +725,7 @@ impl BioCartoon {
             }
             "align" => {
                 let k = parse_enum(&[AlignKind::Left, AlignKind::CenterH, AlignKind::Right, AlignKind::Top, AlignKind::Middle, AlignKind::Bottom, AlignKind::DistributeH, AlignKind::DistributeV], s(args, "kind").ok_or("kind required")?, "align kind")?;
-                let ids = ids(args);
+                let ids = self.existing_ids(args)?;
                 if !ids.is_empty() {
                     self.select(ids);
                 }
@@ -722,7 +734,7 @@ impl BioCartoon {
             }
             "arrange" => {
                 let k = parse_enum(&[ArrangeKind::Front, ArrangeKind::Forward, ArrangeKind::Backward, ArrangeKind::Back], s(args, "kind").ok_or("kind required")?, "arrange kind")?;
-                let ids = ids(args);
+                let ids = self.existing_ids(args)?;
                 if !ids.is_empty() {
                     self.select(ids);
                 }

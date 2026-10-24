@@ -11,6 +11,7 @@ pub mod assets;
 pub mod canvas;
 pub mod catalog;
 pub mod code;
+pub mod color;
 pub mod credits;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
@@ -25,6 +26,7 @@ pub mod projects;
 pub mod mcp;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod query;
+pub mod snake;
 pub mod stars;
 pub mod spell;
 pub mod submit;

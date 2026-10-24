@@ -29,11 +29,22 @@ pub struct SubmitMeta {
     pub category: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The SVG's layers as the contributor named them (the catalog's `layers`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<crate::catalog::AssetLayer>,
     pub author: String,
     pub license: String,
+    /// `Some(false)` when the contributor checked "No generative AI was used to create this
+    /// asset", `Some(true)` when the app knows AI made it, `None` (undisclosed) otherwise. The
+    /// Worker only takes CC BY 4.0 with `Some(false)`.
+    pub generative_ai_used: Option<bool>,
     /// Optional contact address for the reviewers; the Worker stores it privately and never publishes it.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub email: String,
+    /// The contributor asked for it to go in the official BioCartoon library; a reviewer
+    /// decides (it is still credited to them either way).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub official: bool,
 }
 
 pub enum Part<'a> {
@@ -95,6 +106,29 @@ pub fn suggest(url: &str, s: &Suggestion) -> Result<String, String> {
     }
     let body = serde_json::to_vec(s).map_err(|e| e.to_string())?;
     post(url, "suggest", "application/json", body)
+}
+
+/// A request to take an icon out of the BioCartoon library, sent to `<url>/removal`. A reviewer
+/// reads it; nothing is removed automatically.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RemovalRequest {
+    /// The icon's catalog id (for one of the user's own submissions, its submission id).
+    pub asset_id: String,
+    pub title: String,
+    pub reason: String,
+    pub name: String,
+    /// Optional contact address, seen only by the reviewers.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub email: String,
+}
+
+/// POST a removal request; returns its id.
+pub fn request_removal(url: &str, r: &RemovalRequest) -> Result<String, String> {
+    if cfg!(target_arch = "wasm32") {
+        return Err("Sending removal requests isn't available in the web version yet.".into());
+    }
+    let body = serde_json::to_vec(r).map_err(|e| e.to_string())?;
+    post(url, "removal", "application/json", body)
 }
 
 /// Web build: submissions run inside blocking jobs, which the browser can't do yet.
