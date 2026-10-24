@@ -3080,10 +3080,10 @@ impl BioCartoon {
             it.pos = [it.pos[0] * s + off[0], it.pos[1] * s + off[1]];
             it.size = [it.size[0] * s, it.size[1] * s];
             match &mut it.kind {
-                ItemKind::Text { size, .. } => *size *= s,
+                ItemKind::Text { size, .. } => *size = (*size * s).min(crate::doc::MAX_FONT_SIZE),
                 ItemKind::Shape { stroke_width, .. } => *stroke_width *= s,
                 ItemKind::Line { width, .. } => *width *= s,
-                ItemKind::Table { font_size, .. } | ItemKind::Code { font_size, .. } => *font_size *= s,
+                ItemKind::Table { font_size, .. } | ItemKind::Code { font_size, .. } => *font_size = (*font_size * s).min(crate::doc::MAX_FONT_SIZE),
                 // Templates published before credits were stored: credit the template's author.
                 ItemKind::Image { source: ImageSource::Asset { source, title, credit, license, .. }, .. } if source == "template" && credit.is_empty() => {
                     *credit = crate::credits::template_credit(title, &t.meta.author, &t.meta.license, &t.meta.title);
@@ -3233,10 +3233,13 @@ impl BioCartoon {
     /// Ask for a `.biocartoon` file to import (see [`Self::open_file`]).
     fn open(&mut self) {
         let tx = self.action_tx.clone();
-        crate::platform::pick_files("biocartoon", &["biocartoon", "json", "zip"], true, move |mut paths| {
-            let zip = paths.iter().any(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")));
-            let _ = tx.send(if paths.len() == 1 && !zip { Action::OpenFile(paths.remove(0)) } else { Action::ImportFiles(paths) });
-        });
+        crate::platform::pick_files("biocartoon", &["biocartoon", "json", "zip"], true, move |paths| open_paths(&tx, paths));
+    }
+
+    /// Open files given on the command line, as when a `.biocartoon` file is double-clicked
+    /// (see main.rs), or passed on by another launch through the control socket.
+    pub fn open_paths(&self, paths: Vec<PathBuf>) {
+        open_paths(&self.action_tx, paths);
     }
 
     /// Import `.biocartoon` files, and those inside .zip files (a backup), as new projects.
@@ -3352,6 +3355,10 @@ impl BioCartoon {
                 if self.doc == Document::default() {
                     self.dirty = false; // nothing worth keeping yet
                     return true;
+                }
+                if self.doc.title == Document::default().title {
+                    let names: Vec<String> = self.store.list().into_iter().map(|m| m.name).collect();
+                    self.doc.title = crate::projects::untitled_name(&names);
                 }
                 match self.store.create(&self.doc) {
                     Ok(m) => {
@@ -5888,6 +5895,15 @@ impl BioCartoon {
 
 /// The AI settings tab's editors for the prompt text sent with each request. The system
 /// prompts are left out when the selected model is an image model, which never sees them.
+/// One `.biocartoon` file opens in the editor; several, or a .zip backup, are imported as projects.
+fn open_paths(tx: &std::sync::mpsc::Sender<Action>, mut paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    let zip = paths.iter().any(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")));
+    let _ = tx.send(if paths.len() == 1 && !zip { Action::OpenFile(paths.remove(0)) } else { Action::ImportFiles(paths) });
+}
+
 fn ai_prompt_fields(ui: &mut egui::Ui, prompts: &mut AiPrompts, svg: bool) {
     let defaults = AiPrompts::default();
     let dim = |t: &str| egui::RichText::new(t).color(theme::text_dim());
@@ -5906,7 +5922,11 @@ fn ai_prompt_fields(ui: &mut egui::Ui, prompts: &mut AiPrompts, svg: bool) {
         ui.add_space(8.0);
     };
 
-    egui::ScrollArea::vertical().min_scrolled_height(440.0).max_height(440.0).show(ui, |ui| {
+    // Up to 440 px, but no taller than what's left of the screen below the fields above it and the
+    // window's title bar, so the centered Settings window never spills off the top on short screens.
+    let room = ui.ctx().content_rect().height() - ui.min_rect().height() - 110.0;
+    let height = room.clamp(120.0, 440.0);
+    egui::ScrollArea::vertical().min_scrolled_height(height).max_height(height).show(ui, |ui| {
         ui.label(egui::RichText::new("Generate with AI").size(15.0).strong());
         ui.add_space(4.0);
         field(ui, "Image prompt", "Wraps what you type on the Generate page, for every provider. {prompt} marks where your text goes; without it, your text is added at the end.", &mut prompts.generate, &defaults.generate, 2);

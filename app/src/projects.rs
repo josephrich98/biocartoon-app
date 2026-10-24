@@ -137,6 +137,7 @@ struct PortableFile {
 pub fn to_file(doc: &Document) -> Result<Vec<u8>, String> {
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut doc = doc.clone();
+    doc.sanitize();
     let mut names: BTreeMap<String, String> = BTreeMap::new(); // path -> name
     let mut images = BTreeMap::new();
     for it in doc.slides.iter_mut().flat_map(|s| s.items.iter_mut()) {
@@ -160,7 +161,8 @@ pub fn to_file(doc: &Document) -> Result<Vec<u8>, String> {
 /// Read a `.biocartoon` file, writing its bundled images under `uploads_dir` and pointing the
 /// document at them.
 pub fn from_file(bytes: &[u8], uploads_dir: &Path) -> Result<Document, String> {
-    let PortableFile { mut doc, images } = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+    let PortableFile { mut doc, images } = crate::doc::from_json(text).map_err(|e| e.to_string())?;
     doc.upgrade();
     if images.is_empty() {
         return Ok(doc);
@@ -185,8 +187,20 @@ pub fn from_file(bytes: &[u8], uploads_dir: &Path) -> Result<Document, String> {
     Ok(doc)
 }
 
+/// A name for a new document that no project in `taken` has yet: "Untitled", then "Untitled 2",
+/// "Untitled 3", ... so new projects can be told apart on the home screen.
+pub fn untitled_name(taken: &[String]) -> String {
+    let base = Document::default().title;
+    std::iter::once(base.clone())
+        .chain((2..).map(|n| format!("{base} {n}")))
+        .find(|name| !taken.contains(name))
+        .expect("an unused name")
+}
+
 fn to_json(doc: &Document) -> Result<String, String> {
-    serde_json::to_string_pretty(doc).map_err(|e| e.to_string())
+    let mut doc = doc.clone();
+    doc.sanitize();
+    serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())
 }
 
 impl Store {
@@ -243,7 +257,7 @@ impl Store {
     pub fn load(&self, id: &str) -> Result<Document, String> {
         let p = self.doc_path(id);
         let s = storage::read_to_string(&p).map_err(|e| err(&p, e))?;
-        let mut doc: Document = serde_json::from_str(&s).map_err(|e| err(&p, e))?;
+        let mut doc: Document = crate::doc::from_json(&s).map_err(|e| err(&p, e))?;
         doc.upgrade();
         Ok(doc)
     }
@@ -305,7 +319,7 @@ impl Store {
         let bytes = storage::read(&p).map_err(|e| err(&p, e))?;
         let mut s = String::new();
         GzDecoder::new(bytes.as_slice()).read_to_string(&mut s).map_err(|e| err(&p, e))?;
-        let mut doc: Document = serde_json::from_str(&s).map_err(|e| err(&p, e))?;
+        let mut doc: Document = crate::doc::from_json(&s).map_err(|e| err(&p, e))?;
         doc.upgrade();
         Ok(doc)
     }
@@ -448,6 +462,15 @@ pub fn format_time(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untitled_names() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(untitled_name(&[]), "Untitled");
+        assert_eq!(untitled_name(&names(&["Untitled", "Cells"])), "Untitled 2");
+        assert_eq!(untitled_name(&names(&["Untitled", "Untitled 3"])), "Untitled 2");
+        assert_eq!(untitled_name(&names(&["Untitled", "Untitled 2"])), "Untitled 3");
+    }
 
     #[test]
     fn save_version_restore() {

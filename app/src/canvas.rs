@@ -3,7 +3,7 @@
 
 use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, UploadTarget};
 use crate::assets::{ImageCache, ImgState, IMAGE_EXTS};
-use crate::doc::{c32, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, ShapeKind, Slide, TextAlign, TextVAlign, Unit, DPI};
+use crate::doc::{c32, screen_font, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, ShapeKind, Slide, TextAlign, TextVAlign, Unit, DPI};
 use crate::theme;
 use egui::emath::Rot2;
 use std::path::Path;
@@ -623,7 +623,7 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
                 let x = rs.min.x + c as f32 * cw;
                 painter.line_segment([Pos2::new(x, rs.min.y), Pos2::new(x, rs.max.y)], bs);
             }
-            let font = FontId::proportional((font_size * z).max(1.0));
+            let font = FontId::proportional(screen_font(painter.ctx(), font_size * z));
             let tc = c32(*text_color).gamma_multiply(op);
             for r in 0..rows {
                 for c in 0..cols {
@@ -649,7 +649,7 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
 fn draw_code(painter: &egui::Painter, rs: Rect, z: f32, op: f32, code: &str, language: CodeLang, theme: CodeTheme, font_size: f32, line_numbers: bool, window: bool, rounded: bool) {
     let pal = theme.palette();
     let col = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]).gamma_multiply(op);
-    let fs = (font_size * z).max(1.0);
+    let fs = screen_font(painter.ctx(), font_size * z);
     let font = FontId::monospace(fs);
     let (char_w, line_h) = painter.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
     let lines = crate::code::highlight(code, language.resolve(code));
@@ -686,7 +686,7 @@ fn draw_code(painter: &egui::Painter, rs: Rect, z: f32, op: f32, code: &str, lan
 /// on-canvas editor and the exports all lay text out with it, so they break lines the same way.
 pub(crate) fn text_job(ctx: &egui::Context, text: &str, kind: &ItemKind, zoom: f32, width: f32, col: Color32) -> egui::text::LayoutJob {
     let ItemKind::Text { size, align, italic, underline, font, line_spacing, .. } = kind else { return Default::default() };
-    let px = (size * zoom).max(1.0);
+    let px = screen_font(ctx, size * zoom);
     let font_id = font.font_id(px);
     let line_height = (*line_spacing != 1.0).then(|| ctx.fonts_mut(|f| f.row_height(&font_id)) * line_spacing.max(0.1));
     let format = egui::TextFormat {
@@ -786,7 +786,7 @@ fn draw_squiggles(painter: &egui::Painter, xf: &Xform, slide: &Slide, spell: &cr
                     }
                     let cell = cell_rect(rs, *rows, *cols, i);
                     let p = painter.with_clip_rect(cell.intersect(painter.clip_rect()));
-                    let (galley, pos) = cell_layout(&p, cell, t, FontId::proportional((font_size * z).max(1.0)), Color32::WHITE, z);
+                    let (galley, pos) = cell_layout(&p, cell, t, FontId::proportional(screen_font(p.ctx(), font_size * z)), Color32::WHITE, z);
                     crate::spell::paint_squiggles(&p, &galley, t, spell.at(it.id, Some(i)), z, |q| pos + q.to_vec2());
                 }
             }
@@ -1141,7 +1141,7 @@ impl BioCartoon {
         }
         let cell = cell_rect(xf.rect(before.rect()), *rows, *cols, i);
         let col = c32(*text_color).gamma_multiply(before.opacity.clamp(0.0, 1.0));
-        let font = FontId::proportional((*font_size * z).max(1.0));
+        let font = FontId::proportional(screen_font(ui.ctx(), *font_size * z));
         let wrap = (cell.width() - 8.0 * z).max(4.0);
         let te_id = egui::Id::new(("text_editor", id));
         // Taken before the editor sees it, which would type a tab.

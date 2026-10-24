@@ -9,6 +9,54 @@ pub use crate::code::{CodeLang, CodeTheme};
 pub const DPI: f32 = 96.0;
 pub type ItemId = u64;
 
+/// Largest font size a document holds, in document px: where the text panel's size field stops
+/// (which clamps a larger size as soon as the item is selected).
+pub const MAX_FONT_SIZE: f32 = 400.0;
+/// Coordinates and sizes are kept within this many document px of the origin (about 10 m).
+pub const MAX_COORD: f32 = 1.0e6;
+/// The smallest page side, in document px (as the page size fields allow).
+pub const MIN_PAGE: f32 = 48.0;
+/// Largest glyph drawn on screen, in physical pixels. egui rasterises every glyph into one font
+/// atlas and panics on a glyph wider than it (16384 px), and each large glyph grows the atlas, so
+/// text zoomed in past this is drawn at this size instead.
+const MAX_GLYPH_PX: f32 = 2048.0;
+
+/// The font size to draw at on screen for `px` points: at least 1, and small enough for the
+/// font atlas (see [`MAX_GLYPH_PX`]).
+pub fn screen_font(ctx: &egui::Context, px: f32) -> f32 {
+    px.clamp(1.0, MAX_GLYPH_PX / ctx.pixels_per_point().max(0.1))
+}
+
+/// Replace `v` with `default` when it is NaN or infinite (JSON has no spelling for those, so they
+/// would save as `null` and the file would no longer load) or the [`NULL_NUMBER`] a damaged file
+/// was read with, and keep it within `range` otherwise.
+fn fix(v: &mut f32, default: f32, range: std::ops::RangeInclusive<f32>) {
+    *v = if v.is_finite() && *v != NULL_NUMBER { v.clamp(*range.start(), *range.end()) } else { default };
+}
+
+/// What [`from_json`] reads a `null` number as; [`Document::upgrade`] replaces it.
+const NULL_NUMBER: f32 = f32::MIN;
+
+/// Parse JSON written by the editor. Versions up to 0.3.9 could save a NaN or infinite number
+/// (from the control socket), which JSON writes as `null` and which then failed to parse as a
+/// number; such a `null` is read as [`NULL_NUMBER`] so the file still opens, and
+/// [`Document::upgrade`] puts a sensible value in its place.
+pub fn from_json<T: serde::de::DeserializeOwned>(s: &str) -> serde_json::Result<T> {
+    let mut s = std::borrow::Cow::Borrowed(s);
+    loop {
+        match serde_json::from_str(&s) {
+            Err(e) if e.is_data() && e.to_string().starts_with("invalid type: null, expected f32") => {
+                // serde_json reports the position of the null's last character.
+                let line_start: usize = s.split_inclusive('\n').take(e.line().saturating_sub(1)).map(str::len).sum();
+                let end = line_start + e.column();
+                let Some(at) = s.get(..end).and_then(|head| head.rfind("null")).filter(|at| end - at <= 8) else { return Err(e) };
+                s.to_mut().replace_range(at..at + 4, &format!("{NULL_NUMBER:e}"));
+            }
+            r => return r,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ImageSource {
     /// An asset from the catalog (`assets.sqlite`); `key` is the R2 object key of the PNG, and
@@ -742,6 +790,42 @@ impl Item {
         matches!(self.kind, ItemKind::Line { .. })
     }
 
+    /// Put every number back in range: NaN and infinities get a default (see [`fix`]), font
+    /// sizes stay within [`MAX_FONT_SIZE`] and coordinates within [`MAX_COORD`].
+    pub fn sanitize(&mut self) {
+        let c = -MAX_COORD..=MAX_COORD;
+        for v in &mut self.pos {
+            fix(v, 0.0, c.clone());
+        }
+        let size = if self.is_line() { 0.0 } else { 1.0 };
+        for v in &mut self.size {
+            fix(v, size, c.clone());
+        }
+        fix(&mut self.rotation, 0.0, -1.0e4..=1.0e4);
+        fix(&mut self.opacity, 1.0, 0.0..=1.0);
+        let font = 1.0..=MAX_FONT_SIZE;
+        match &mut self.kind {
+            ItemKind::Image { crop, .. } => {
+                for (v, d) in crop.iter_mut().zip([0.0, 0.0, 1.0, 1.0]) {
+                    fix(v, d, 0.0..=1.0);
+                }
+            }
+            ItemKind::Text { size, line_spacing, .. } => {
+                fix(size, 24.0, font);
+                fix(line_spacing, 1.0, 0.1..=10.0);
+            }
+            ItemKind::Shape { stroke_width, .. } => fix(stroke_width, 2.0, 0.0..=MAX_FONT_SIZE),
+            ItemKind::Line { width, points, .. } => {
+                fix(width, 3.0, 0.0..=MAX_FONT_SIZE);
+                points.retain(|p| p.iter().all(|v| v.is_finite() && *v != NULL_NUMBER));
+                for v in points.iter_mut().flatten() {
+                    *v = v.clamp(-MAX_COORD, MAX_COORD);
+                }
+            }
+            ItemKind::Table { font_size, .. } | ItemKind::Code { font_size, .. } => fix(font_size, 14.0, font),
+        }
+    }
+
     pub fn pos(&self) -> Pos2 {
         Pos2::new(self.pos[0], self.pos[1])
     }
@@ -834,8 +918,21 @@ impl Comment {
 }
 
 impl Slide {
+    /// See [`Item::sanitize`].
+    pub fn sanitize(&mut self) {
+        for it in &mut self.items {
+            it.sanitize();
+        }
+        for c in &mut self.comments {
+            for v in &mut c.pos {
+                fix(v, 0.0, -MAX_COORD..=MAX_COORD);
+            }
+        }
+    }
+
     /// See [`Document::upgrade`].
     pub fn upgrade(&mut self) {
+        self.sanitize();
         for it in &mut self.items {
             if let ItemKind::Line { kind, style, .. } = &mut it.kind {
                 match kind {
@@ -919,10 +1016,30 @@ impl Default for Document {
 
 impl Document {
     /// Bring a document saved by an earlier version up to date: dashed line kinds become a
-    /// straight / arrow line with the dashed style. Call after deserializing.
+    /// straight / arrow line with the dashed style, and numbers out of range are put back in it
+    /// (see [`Self::sanitize`]). Call after deserializing.
     pub fn upgrade(&mut self) {
+        self.sanitize_page();
         for s in &mut self.slides {
             s.upgrade();
+        }
+    }
+
+    /// Put every number back in range (see [`Item::sanitize`]). Done on load and before saving,
+    /// so a document never holds a number its JSON can't round-trip.
+    pub fn sanitize(&mut self) {
+        self.sanitize_page();
+        for s in &mut self.slides {
+            s.sanitize();
+        }
+    }
+
+    fn sanitize_page(&mut self) {
+        let d = Document::default();
+        fix(&mut self.width, d.width, MIN_PAGE..=MAX_COORD);
+        fix(&mut self.height, d.height, MIN_PAGE..=MAX_COORD);
+        for g in &mut self.guides {
+            fix(&mut g.pos, 0.0, -MAX_COORD..=MAX_COORD);
         }
     }
 
@@ -1094,6 +1211,43 @@ mod tests {
         // Round-trips under the new names.
         let again: Document = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
         assert_eq!(again, doc);
+    }
+
+    /// An infinite number saved as `null` used to make the document fail to load.
+    #[test]
+    fn null_numbers_load_and_never_save() {
+        let mut it = Item::new(1, "r", ItemKind::Shape { shape: ShapeKind::Rectangle, fill: [0; 4], stroke: [0; 4], stroke_width: 2.0 }, Pos2::new(5.0, 6.0), Vec2::splat(50.0));
+        it.rotation = f32::INFINITY;
+        it.opacity = f32::NAN;
+        it.pos[1] = f32::NEG_INFINITY;
+        let mut doc = Document::default();
+        doc.slides[0].items.push(it);
+        let damaged = serde_json::to_string_pretty(&doc).unwrap();
+        assert!(damaged.contains("null") && serde_json::from_str::<Document>(&damaged).is_err());
+
+        let mut loaded: Document = from_json(&damaged).unwrap();
+        loaded.upgrade();
+        let it = &loaded.slides[0].items[0];
+        assert_eq!((it.rotation, it.opacity, it.pos), (0.0, 1.0, [5.0, 0.0]));
+        // `group: null` is a real null and stays one.
+        assert_eq!(it.group, None);
+
+        doc.sanitize();
+        let json = serde_json::to_string(&doc).unwrap();
+        assert_eq!(serde_json::from_str::<Document>(&json).unwrap(), doc);
+        // Other errors still fail.
+        assert!(from_json::<Document>(r#"{"title": null}"#).is_err());
+    }
+
+    #[test]
+    fn sanitize_clamps() {
+        let mut doc = Document { width: 1.0, ..Default::default() };
+        doc.slides[0].items.push(Item::new(1, "t", ItemKind::text("x", 1.0e5, [0; 4], TextAlign::Left, false), Pos2::new(1.0e30, 0.0), Vec2::splat(10.0)));
+        doc.sanitize();
+        assert_eq!(doc.width, MIN_PAGE);
+        let it = &doc.slides[0].items[0];
+        assert!(matches!(it.kind, ItemKind::Text { size, .. } if size == MAX_FONT_SIZE));
+        assert_eq!(it.pos[0], MAX_COORD);
     }
 
     #[test]

@@ -113,6 +113,50 @@ signing-identity = "-"
 [package.metadata.packager.nsis]
 installer-icon = "assets/icon.ico"
 installer-mode = "currentUser"
+# Put the install folder on the user's PATH, so `biocartoon` (the command line / MCP server)
+# runs from any terminal, and take it off again on uninstall. NSIS strings hold at most
+# NSIS_MAX_STRLEN - 1 characters: ReadRegStr fails (and gives "") for a longer value, and longer
+# results are cut short without an error. Writing either back would lose PATH entries, so PATH
+# is left alone when it can't be read (or is missing) or the edited value wouldn't fit.
+preinstall-section = '''
+!define /math BIOCARTOON_PATH_ROOM ${NSIS_MAX_STRLEN} - 3
+${UnStrRep}
+
+Section AddCliToPath
+  ClearErrors
+  ReadRegStr $0 HKCU "Environment" "Path"
+  StrLen $1 $0
+  StrLen $2 $INSTDIR
+  IntOp $1 $1 + $2
+  ${If} ${Errors}
+  ${OrIf} $0 == ""
+  ${OrIf} $1 >= ${BIOCARTOON_PATH_ROOM}
+    DetailPrint "Not changing PATH; add $INSTDIR to it to run biocartoon from a terminal."
+  ${Else}
+    ${StrLoc} $1 ";$0;" ";$INSTDIR;" ">"
+    ${If} $1 == ""
+      WriteRegExpandStr HKCU "Environment" "Path" "$0;$INSTDIR"
+      SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=500
+    ${EndIf}
+  ${EndIf}
+SectionEnd
+
+Section un.RemoveCliFromPath
+  ClearErrors
+  ReadRegStr $0 HKCU "Environment" "Path"
+  StrLen $1 $0
+  ${IfNot} ${Errors}
+  ${AndIf} $1 < ${BIOCARTOON_PATH_ROOM}
+    ${UnStrRep} $1 ";$0;" ";$INSTDIR;" ";"
+    StrCpy $1 $1 "" 1
+    StrCpy $1 $1 -1
+    ${If} $1 != $0
+      WriteRegExpandStr HKCU "Environment" "Path" "$1"
+      SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=500
+    ${EndIf}
+  ${EndIf}
+SectionEnd
+'''
 
 [package.metadata.packager.deb]
 depends = ["libxkbcommon0", "libgl1"]
