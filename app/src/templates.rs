@@ -437,7 +437,8 @@ pub fn parse(bytes: &[u8]) -> Result<TemplateFile, String> {
     if bytes.len() > submit::MAX_TEMPLATE_JSON_BYTES {
         return Err("template is too large".into());
     }
-    let mut t: TemplateFile = serde_json::from_slice(bytes).map_err(|e| format!("template: {e}"))?;
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("template: {e}"))?;
+    let mut t: TemplateFile = crate::doc::from_json(text).map_err(|e| format!("template: {e}"))?;
     t.slide.upgrade();
     Ok(t)
 }

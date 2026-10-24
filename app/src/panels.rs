@@ -2574,9 +2574,9 @@ fn text_style_ui(
                 *size = (*size - 1.0).max(4.0);
                 changed = true;
             }
-            changed |= ui.add_sized(cell, egui::DragValue::new(size).range(4.0..=400.0).speed(0.25).max_decimals(1)).changed();
+            changed |= ui.add_sized(cell, egui::DragValue::new(size).range(4.0..=crate::doc::MAX_FONT_SIZE).speed(0.25).max_decimals(1)).changed();
             if ui.add_sized(cell, egui::Button::new(ph::PLUS).frame(false)).on_hover_text("Larger").clicked() {
-                *size = (*size + 1.0).min(400.0);
+                *size = (*size + 1.0).min(crate::doc::MAX_FONT_SIZE);
                 changed = true;
             }
         });

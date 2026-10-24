@@ -5,7 +5,7 @@
 //!                                .deb needs these or GNOME shows a generic icon)
 //!   assets/apple-touch-icon.png  180 px, the web build's bookmark / home-screen icon, on white since
 //!                                Safari puts transparent touch icons on a gray backing (copy it to site/public/ too)
-//!   assets/icon.ico              256 px, the Windows installer icon (see [package.metadata.packager])
+//!   assets/icon.ico              16-256 px, the Windows .exe icon (embedded by build.rs) and installer icon
 //! The web build uses logo.svg itself as the tab favicon (see index.html).
 //! Re-run with `cargo run --bin make_icon` after changing the icon.
 
@@ -47,12 +47,15 @@ fn render_on_white(tree: &usvg::Tree, px: u32, out: &str) {
     println!("wrote {out}");
 }
 
-fn render_ico(tree: &usvg::Tree, px: u32, out: &str) {
-    // tiny-skia pixels are premultiplied; .ico wants straight alpha.
-    let pixmap = rasterize(tree, px);
-    let rgba: Vec<u8> = pixmap.pixels().iter().flat_map(|p| { let c = p.demultiply(); [c.red(), c.green(), c.blue(), c.alpha()] }).collect();
-    let img = image::RgbaImage::from_raw(px, px, rgba).unwrap();
-    img.save_with_format(out, image::ImageFormat::Ico).unwrap();
+fn render_ico(tree: &usvg::Tree, out: &str) {
+    // Several sizes, so Explorer and the taskbar get a sharp small icon instead of a downscaled 256 px one.
+    use image::codecs::ico::{IcoEncoder, IcoFrame};
+    let frames: Vec<IcoFrame> = [16, 24, 32, 48, 64, 256].into_iter().map(|px| {
+        // tiny-skia pixels are premultiplied; .ico wants straight alpha.
+        let rgba: Vec<u8> = rasterize(tree, px).pixels().iter().flat_map(|p| { let c = p.demultiply(); [c.red(), c.green(), c.blue(), c.alpha()] }).collect();
+        IcoFrame::as_png(&rgba, px, px, image::ExtendedColorType::Rgba8).unwrap()
+    }).collect();
+    IcoEncoder::new(std::fs::File::create(out).unwrap()).encode_images(&frames).unwrap();
     println!("wrote {out}");
 }
 
@@ -80,5 +83,5 @@ fn main() {
         render(&tree, px, &format!("assets/icon-{px}.png"));
     }
     render_on_white(&tree, 180, "assets/apple-touch-icon.png");
-    render_ico(&tree, 256, "assets/icon.ico");
+    render_ico(&tree, "assets/icon.ico");
 }

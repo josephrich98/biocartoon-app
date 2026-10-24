@@ -96,6 +96,16 @@ You need a stable [Rust toolchain](https://rustup.rs). Then:
 
 Linux needs `libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev` for the desktop build.
 
+Windows needs the Visual Studio Build Tools with the C++ workload, which provide the linker
+(without them the build fails with "linker `link.exe` not found"):
+
+```
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+Then build from PowerShell or cmd, not Git Bash: Git Bash's own `link` command shadows the MSVC
+linker and the build fails with `link: extra operand`.
+
 The web build needs `rustup target add wasm32-unknown-unknown` and
 [trunk](https://trunkrs.dev) (`cargo install trunk --locked`). It compiles SQLite from C to
 wasm32, which needs a clang that can target wasm32. `app/.cargo/config.toml` points at Homebrew's

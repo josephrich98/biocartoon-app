@@ -11,7 +11,7 @@
 
 use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, Screen};
 use crate::catalog::AssetRow;
-use crate::doc::{CodeLang, CodeTheme, ImageSource, Item, ItemKind, LineKind, LineStyle, ShapeKind, TextAlign, TextFont, TextVAlign, Unit, DPI};
+use crate::doc::{CodeLang, CodeTheme, ImageSource, Item, ItemKind, LineKind, LineStyle, ShapeKind, TextAlign, TextFont, TextVAlign, Unit, DPI, MAX_COORD, MAX_FONT_SIZE, MIN_PAGE};
 use egui::{Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -231,6 +231,56 @@ fn name_of<T: std::fmt::Debug>(v: T) -> String {
     format!("{v:?}")
 }
 
+/// Item fields `update_item` and the `insert_*` commands take (see [`patch_item`]).
+const ITEM_ARGS: &[&str] = &[
+    "x", "y", "width", "height", "x1", "y1", "x2", "y2", "rotation", "flip_h", "flip_v", "locked", "opacity", "name", "crop", "overlay",
+    "text", "font_size", "color", "bold", "italic", "underline", "font", "line_spacing", "align", "valign", "shape", "fill", "stroke",
+    "stroke_width", "line_kind", "line_style", "line_width", "header", "cells", "code", "language", "theme", "line_numbers", "window", "rounded",
+];
+
+/// The arguments `cmd` takes; `None` for an unknown command (which fails on its own).
+fn known_args(cmd: &str) -> Option<Vec<&'static str>> {
+    let (own, item): (&[&str], bool) = match cmd {
+        "state" | "slides" | "add_slide" | "new_document" | "undo" | "redo" | "save" => (&[], false),
+        "get_item" => (&["id"], false),
+        "go_slide" => (&["index"], false),
+        "set_page" => (&["width", "height", "unit", "background"], false),
+        // `id` is the asset's, as the MCP tool passes it along with the row.
+        "insert_asset" => (&["asset", "replace_item", "id"], true),
+        "insert_text" | "insert_code" | "insert_shape" | "insert_line" => (&[], true),
+        "insert_template" => (&["id"], false),
+        "update_item" => (&["id"], true),
+        "move_items" => (&["ids", "id", "x", "y", "dx", "dy"], false),
+        "delete_items" | "select" | "duplicate" => (&["ids", "id"], false),
+        "align" | "arrange" => (&["kind", "ids", "id"], false),
+        "render" => (&["slide", "max_side", "path"], false),
+        "open_files" => (&["paths"], false),
+        _ => return None,
+    };
+    Some(own.iter().chain(if item { ITEM_ARGS } else { &[] }).copied().collect())
+}
+
+/// Refuse arguments `cmd` doesn't take, so a typo or a guessed option fails instead of being
+/// ignored, and numbers past f32's range, which would turn into infinities in the document.
+fn check_args(cmd: &str, args: &Value) -> Result<(), String> {
+    let obj = args.as_object().ok_or("arguments must be a JSON object")?;
+    if let Some(known) = known_args(cmd) {
+        if let Some(k) = obj.keys().find(|k| !known.contains(&k.as_str())) {
+            return Err(if known.is_empty() { format!("{cmd} takes no arguments (got {k:?})") } else { format!("unknown argument {k:?} for {cmd}; it takes {}", known.join(", ")) });
+        }
+    }
+    check_numbers(args)
+}
+
+fn check_numbers(v: &Value) -> Result<(), String> {
+    match v {
+        Value::Number(n) if n.as_f64().is_some_and(|x| x.abs() > f32::MAX as f64) => Err(format!("number {n} is out of range")),
+        Value::Array(a) => a.iter().try_for_each(check_numbers),
+        Value::Object(o) => o.values().try_for_each(check_numbers),
+        _ => Ok(()),
+    }
+}
+
 pub fn item_json(it: &Item) -> Value {
     let r = it.rect();
     let mut v = json!({
@@ -358,7 +408,7 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
         }
         ItemKind::Text { text, size, color: c, align, bold, italic, underline, font, line_spacing, valign } => {
             if let Some(v) = s(args, "text") { *text = v.to_string(); }
-            if let Some(v) = f(args, "font_size") { *size = v.max(1.0); }
+            if let Some(v) = f(args, "font_size") { *size = v.clamp(1.0, MAX_FONT_SIZE); }
             if let Some(v) = color(args, "color") { *c = v; }
             if let Some(v) = b(args, "bold") { *bold = v; }
             if let Some(v) = s(args, "align") { *align = parse_enum(&TextAlign::ALL, v, "align")?; }
@@ -381,7 +431,7 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
             if let Some(v) = f(args, "line_width") { *width = v.max(0.5); }
         }
         ItemKind::Table { font_size, cells, header, .. } => {
-            if let Some(v) = f(args, "font_size") { *font_size = v.max(1.0); }
+            if let Some(v) = f(args, "font_size") { *font_size = v.clamp(1.0, MAX_FONT_SIZE); }
             if let Some(v) = b(args, "header") { *header = v; }
             if let Some(c) = args.get("cells").and_then(Value::as_array) {
                 for (i, v) in c.iter().enumerate().take(cells.len()) {
@@ -393,7 +443,7 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
             if let Some(v) = s(args, "code") { *code = v.to_string(); }
             if let Some(v) = s(args, "language") { *language = parse_enum(&CodeLang::ALL, v, "language")?; }
             if let Some(v) = s(args, "theme") { *theme = parse_enum(&CodeTheme::ALL, v, "theme")?; }
-            if let Some(v) = f(args, "font_size") { *font_size = v.max(1.0); }
+            if let Some(v) = f(args, "font_size") { *font_size = v.clamp(1.0, MAX_FONT_SIZE); }
             if let Some(v) = b(args, "line_numbers") { *line_numbers = v; }
             if let Some(v) = b(args, "window") { *window = v; }
             if let Some(v) = b(args, "rounded") { *rounded = v; }
@@ -451,8 +501,19 @@ impl BioCartoon {
         self.item(id).ok_or_else(|| format!("no item {id} on this slide"))
     }
 
+    /// `ids` from `args`, each checked to be an item on the current slide.
+    fn existing_ids(&self, args: &Value) -> Result<Vec<u64>, String> {
+        let ids = ids(args);
+        for id in &ids {
+            self.require_item(*id)?;
+        }
+        Ok(ids)
+    }
+
     fn control_exec(&mut self, cmd: &str, args: &Value, ctx: &egui::Context) -> Outcome {
-        let r = self.control_cmd(cmd, args, ctx);
+        let r = check_args(cmd, args).and_then(|_| self.control_cmd(cmd, args, ctx));
+        // Sums of in-range numbers can still overflow (a move by dx); keep the document savable.
+        self.doc.sanitize();
         if matches!(r, Ok(Outcome::Now(Ok(_)))) {
             ctx.request_repaint();
         }
@@ -472,10 +533,9 @@ impl BioCartoon {
             }
             "slides" => now(json!(self.doc.slides.iter().enumerate().map(|(i, s)| json!({"index": i, "name": s.name, "items": s.items.len(), "current": i == self.cur_slide})).collect::<Vec<_>>())),
             "go_slide" => {
-                let i = u(args, "index").ok_or("index required")? as usize;
-                if i >= self.doc.slides.len() {
-                    return Err(format!("slide index {i} out of range (0..{})", self.doc.slides.len()));
-                }
+                let n = self.doc.slides.len();
+                let v = args.get("index").ok_or("index required")?;
+                let i = v.as_u64().map(|i| i as usize).filter(|i| *i < n).ok_or_else(|| format!("slide index {v} out of range (0..{n})"))?;
                 self.ensure_editor();
                 self.actions.push(Action::GoSlide(i));
                 self.run_actions(ctx);
@@ -498,8 +558,8 @@ impl BioCartoon {
                     self.doc.unit = parse_enum(&Unit::ALL, un, "unit")?;
                 }
                 let unit = self.doc.unit;
-                if let Some(w) = f(args, "width") { self.doc.width = unit.to_px(w).max(1.0); }
-                if let Some(h) = f(args, "height") { self.doc.height = unit.to_px(h).max(1.0); }
+                if let Some(w) = f(args, "width") { self.doc.width = unit.to_px(w).clamp(MIN_PAGE, MAX_COORD); }
+                if let Some(h) = f(args, "height") { self.doc.height = unit.to_px(h).clamp(MIN_PAGE, MAX_COORD); }
                 if let Some(c) = color(args, "background") { self.slide_mut().background = Some(c); }
                 self.view.fit_requested = true;
                 now(self.page_json())
@@ -550,7 +610,7 @@ impl BioCartoon {
             }
             "insert_text" => {
                 let text = s(args, "text").ok_or("text required")?.to_string();
-                let size = f(args, "font_size").unwrap_or(24.0).max(1.0);
+                let size = f(args, "font_size").unwrap_or(24.0).clamp(1.0, MAX_FONT_SIZE);
                 let lines = text.lines().count().max(1) as f32;
                 let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
                 let kind = ItemKind::text(text, size, color(args, "color").unwrap_or([30, 30, 30, 255]), TextAlign::Center, false);
@@ -606,12 +666,9 @@ impl BioCartoon {
                 now(item_json(self.require_item(id)?))
             }
             "move_items" => {
-                let ids = ids(args);
+                let ids = self.existing_ids(args)?;
                 if ids.is_empty() {
                     return Err("ids required".into());
-                }
-                for id in &ids {
-                    self.require_item(*id)?;
                 }
                 self.commit();
                 let (x, y, dx, dy) = (f(args, "x"), f(args, "y"), f(args, "dx").unwrap_or(0.0), f(args, "dy").unwrap_or(0.0));
@@ -626,18 +683,30 @@ impl BioCartoon {
                 now(json!(ids.iter().filter_map(|id| self.item(*id)).map(item_json).collect::<Vec<_>>()))
             }
             "delete_items" => {
-                let ids = ids(args);
-                self.select(ids.clone());
+                let ids = self.existing_ids(args)?;
+                if ids.is_empty() {
+                    return now(json!({"deleted": 0}));
+                }
+                // Counts the rest of any group the ids are in, which goes with them.
+                self.select(ids);
                 let n = self.selection.len();
                 self.delete_selection();
                 now(json!({"deleted": n}))
             }
             "select" => {
-                self.select(ids(args));
+                let ids = self.existing_ids(args)?;
+                self.select(ids);
                 now(json!({"selection": self.selection}))
             }
             "duplicate" => {
-                self.select(ids(args));
+                // Without ids, the current selection (as align and arrange do).
+                let ids = self.existing_ids(args)?;
+                if !ids.is_empty() {
+                    self.select(ids);
+                }
+                if self.selection.is_empty() {
+                    return Err("nothing to duplicate: give ids or select items first".into());
+                }
                 self.actions.push(Action::Duplicate);
                 self.run_actions(ctx);
                 now(json!(self.selected_items().into_iter().map(item_json).collect::<Vec<_>>()))
@@ -681,6 +750,15 @@ impl BioCartoon {
                 let slide = self.doc.slides.get(idx).cloned().ok_or_else(|| format!("slide index {idx} out of range"))?;
                 let max_side = u(args, "max_side").unwrap_or(1024).clamp(64, 4096) as u32;
                 let path = s(args, "path").map(PathBuf::from);
+                if let Some(p) = &path {
+                    // The editor's working directory is not the caller's (the CLI makes paths absolute).
+                    if !p.is_absolute() {
+                        return Err(format!("{}: the path must be absolute", p.display()));
+                    }
+                    if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+                        return Err(format!("{}: render writes a PNG, so the path must end in .png (the editor's Export makes SVG, PDF and JPEG)", p.display()));
+                    }
+                }
                 let (requests, cached) = self.render_inputs(&slide);
                 let (page, bg, ctx) = (self.doc.page_rect(), self.doc.background_of(&slide), ctx.clone());
                 Ok(Outcome::Later(Box::new(move || {
@@ -695,6 +773,17 @@ impl BioCartoon {
                     use base64::Engine;
                     Ok(json!({"png_base64": base64::engine::general_purpose::STANDARD.encode(&png), "width": w, "height": h}))
                 })))
+            }
+            // A second launch to open a double-clicked file hands it to this window (see main.rs).
+            "open_files" => {
+                let paths: Vec<PathBuf> = args.get("paths").and_then(Value::as_array).ok_or("paths required")?.iter().filter_map(Value::as_str).map(PathBuf::from).collect();
+                if let Some(p) = paths.iter().find(|p| !p.is_absolute() || !p.is_file()) {
+                    return Err(format!("{}: not a file", p.display()));
+                }
+                self.open_paths(paths);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                now(json!({"status": "opening"}))
             }
             other => Err(format!("unknown command {other:?}")),
         }
@@ -726,5 +815,35 @@ impl BioCartoon {
             *self.item_mut(id).ok_or("item vanished")? = edited;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_args() {
+        assert!(check_args("render", &json!({"path": "/tmp/a.png", "max_side": 512})).is_ok());
+        assert!(check_args("render", &json!({"scale": 2})).unwrap_err().contains("unknown argument \"scale\" for render"));
+        assert!(check_args("undo", &json!({"x": 1})).unwrap_err().contains("takes no arguments"));
+        assert!(check_args("update_item", &json!({"id": 1, "rotation": 1e308})).unwrap_err().contains("out of range"));
+        assert!(check_args("update_item", &json!({"id": 1, "crop": [0, 0, 1e39, 1]})).is_err());
+        assert!(check_args("update_item", &json!({"id": 1, "rotation": 45, "fill": [1, 2, 3]})).is_ok());
+        assert!(check_args("state", &json!([1])).is_err());
+        // Unknown commands are left to fail on their own.
+        assert!(check_args("nope", &json!({"anything": 1})).is_ok());
+    }
+
+    /// Every argument a canvas_<cmd> MCP tool offers is one <cmd> accepts.
+    #[test]
+    fn mcp_fields_are_known() {
+        for t in crate::mcp::tools() {
+            let Some(cmd) = t["name"].as_str().and_then(|n| n.strip_prefix("canvas_")) else { continue };
+            let known = known_args(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            for k in t["inputSchema"]["properties"].as_object().unwrap().keys() {
+                assert!(known.contains(&k.as_str()), "{cmd}: {k}");
+            }
+        }
     }
 }

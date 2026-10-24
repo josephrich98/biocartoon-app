@@ -35,6 +35,7 @@ EDITOR (the desktop app must be running)
                               app state
                               app move_items '{{\"ids\":[3],\"dx\":48}}'
                               app insert_asset '{{\"asset\":\"bioart/424_633918\",\"x\":200,\"width\":300}}'
+                              app align '{{\"kind\":\"left\",\"ids\":[1,2]}}'
                               app render '{{\"path\":\"slide.png\"}}'
                             commands: state get_item slides go_slide add_slide new_document set_page
                             insert_asset insert_text insert_shape insert_line insert_code insert_template
@@ -81,6 +82,13 @@ ASSISTANTS
                     if let Some(id) = args.get("asset").and_then(Value::as_str).map(String::from) {
                         let asset = Catalog::open_default()?.get(&id)?.ok_or_else(|| format!("no asset {id}"))?;
                         args["asset"] = serde_json::to_value(&asset).map_err(|e| e.to_string())?;
+                    }
+                }
+                // The editor has its own working directory: resolve `render`'s path against ours.
+                if c == "render" {
+                    if let Some(p) = args.get("path").and_then(Value::as_str) {
+                        let abs = std::path::absolute(p).map_err(|e| format!("{p}: {e}"))?;
+                        args["path"] = json!(abs);
                     }
                 }
                 print_json(&control::send(&query::app_dir(), c, args)?);
