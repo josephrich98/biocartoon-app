@@ -56,6 +56,9 @@ pub struct Settings {
     /// Star changes the Worker has not confirmed yet (asset id, starred), sent again when it can
     /// be reached, so favorites work offline.
     pub pending_stars: Vec<(String, bool)>,
+    /// Edits are saved to the project as they happen. Off: only Cmd+S saves, and leaving the
+    /// project or quitting asks first.
+    pub autosave: bool,
     pub grid_snap: bool,
     /// Moved and resized items snap to guides.
     pub guide_snap: bool,
@@ -128,6 +131,7 @@ impl Default for Settings {
             uploads: Vec::new(),
             favorites: Vec::new(),
             pending_stars: Vec::new(),
+            autosave: true,
             grid_snap: false,
             guide_snap: true,
             show_grid: false,
@@ -1021,6 +1025,11 @@ pub struct BioCartoon {
     /// Emailing a project: subject and attachments, sent once the PNG export finishes.
     pub pending_email: Option<(String, Vec<PathBuf>)>,
     pub dirty: bool,
+    /// "Save changes?" is open, holding what to do once answered: an action that leaves the
+    /// project, or `None` for quitting.
+    leave_prompt: Option<Option<Action>>,
+    /// Quitting was answered, so the next close request goes through.
+    quit_ok: bool,
     pub actions: Vec<Action>,
     pub show_export: bool,
     /// The "Save as picture" dialog, which picks the file type, is open.
@@ -1214,6 +1223,8 @@ impl BioCartoon {
             export_project: None,
             pending_email: None,
             dirty: false,
+            leave_prompt: None,
+            quit_ok: false,
             actions: Vec::new(),
             show_export: false,
             show_save_picture: false,
@@ -3497,8 +3508,13 @@ impl BioCartoon {
         }
     }
 
+    /// Whether the open document has changes not written to its project.
+    fn unsaved(&self) -> bool {
+        self.screen == Screen::Editor && self.saved_doc.as_ref() != Some(&self.doc)
+    }
+
     fn autosave(&mut self, ctx: &egui::Context, now: f64) {
-        let save_now = crate::platform::take_save_request();
+        let save_now = crate::platform::take_save_request() && self.settings.autosave;
         if self.screen != Screen::Editor {
             crate::platform::set_unsaved(false);
             return;
@@ -3506,17 +3522,92 @@ impl BioCartoon {
         let wait = 2.0 - (now - self.last_autosave);
         if save_now || wait <= 0.0 {
             self.last_autosave = now;
-            if self.saved_doc.as_ref() != Some(&self.doc) {
+            if self.unsaved() {
                 self.dirty = true;
-                self.save_current(Snapshot::IfDue, "Autosaved");
+                if self.settings.autosave {
+                    self.save_current(Snapshot::IfDue, "Autosaved");
+                }
             } else {
                 self.dirty = false; // e.g. an undo back to the saved state
             }
-        } else if self.dirty {
+        } else if self.dirty && self.settings.autosave {
             // Egui only draws on input, so wake up for the save even if the user stops.
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
         crate::platform::set_unsaved(self.dirty);
+    }
+
+    /// Desktop: stop the window closing while there are changes that would be lost, and ask
+    /// about them. With autosave on they are saved first, so only a failed save asks.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        crate::platform::route_quit_through_close();
+        if self.quit_ok || !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.settings.autosave && self.unsaved() {
+            self.save_current(Snapshot::IfChanged, "Edited");
+        }
+        if self.unsaved() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.leave_prompt = Some(None);
+        }
+    }
+
+    /// "Want to save your changes?" before leaving the project or quitting with unsaved changes:
+    /// the system alert on macOS, a dialog of the app's own elsewhere (and in screenshot runs,
+    /// which a blocking alert would stall).
+    fn leave_prompt_ui(&mut self, ctx: &egui::Context) {
+        use crate::platform::SaveAnswer;
+        if self.leave_prompt.is_none() {
+            return;
+        }
+        let question = format!("Want to save your changes to {}?", self.doc.title);
+        let native = if std::env::var("BIOCARTOON_SCREENSHOT").is_ok() { None } else { crate::platform::ask_save_native(&self.doc.title) };
+        let answer = native.or_else(|| {
+            let mut answer = None;
+            let modal = egui::Modal::new(egui::Id::new("leave_prompt_modal")).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(crate::logo(ui.ctx(), 56.0));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(&question).strong());
+                    ui.add_space(12.0);
+                    let w = ui.available_width();
+                    let wide = |text: egui::RichText| egui::Button::new(text).min_size(Vec2::new(w, 30.0)).corner_radius(6);
+                    if ui.add(wide(egui::RichText::new("Save").color(Color32::WHITE)).fill(theme::accent())).clicked() {
+                        answer = Some(SaveAnswer::Save);
+                    }
+                    if ui.add(wide("Don't Save".into()).fill(theme::hover())).clicked() {
+                        answer = Some(SaveAnswer::Discard);
+                    }
+                    ui.add_space(8.0);
+                    if ui.add(wide("Cancel".into()).fill(theme::hover())).clicked() {
+                        answer = Some(SaveAnswer::Cancel);
+                    }
+                });
+            });
+            answer.or(modal.should_close().then_some(SaveAnswer::Cancel))
+        });
+        let Some(answer) = answer else { return };
+        let then = self.leave_prompt.take().flatten();
+        match answer {
+            SaveAnswer::Cancel => return,
+            SaveAnswer::Save if !self.save_current(Snapshot::IfChanged, "Saved") => return, // the error is shown; stay put
+            _ => {}
+        }
+        // Back to what was saved, so leaving (or on_exit) writes nothing.
+        if let Some(saved) = self.saved_doc.clone() {
+            self.doc = saved;
+        }
+        self.dirty = false;
+        match then {
+            Some(a) => self.apply(a, ctx),
+            None => {
+                self.quit_ok = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
     }
 
     // ---------- projects (home screen commands) ----------
@@ -4825,6 +4916,8 @@ impl BioCartoon {
         self.debug_hook(&ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_control(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.handle_close_request(&ctx);
         self.images.poll(&ctx);
         self.fit_images();
         self.handle_catalog();
@@ -4893,6 +4986,7 @@ impl BioCartoon {
         self.canvas_ui(ui);
         self.windows(&ctx);
         self.home_windows_in_editor(&ctx);
+        self.leave_prompt_ui(&ctx);
         self.toasts_ui(&ctx);
         self.run_actions(&ctx);
     }
@@ -4902,6 +4996,15 @@ impl BioCartoon {
         self.actions.extend(self.action_rx.try_iter());
         let acts = std::mem::take(&mut self.actions);
         for a in acts {
+            let leaves = match &a {
+                Action::NewDoc | Action::GoHome | Action::OpenFile(_) => true,
+                Action::OpenProject(id) => self.project.as_deref() != Some(id.as_str()),
+                _ => false,
+            };
+            if leaves && !self.settings.autosave && self.unsaved() {
+                self.leave_prompt = Some(Some(a));
+                continue;
+            }
             if matches!(a, Action::Ai(_) | Action::OpenAiEdit | Action::Generate(_)) && !self.ai_ready() {
                 self.open_ai_setup(Some(a));
                 continue;
@@ -4966,8 +5069,12 @@ impl BioCartoon {
                     let title_w = (ui.ctx().content_rect().right() - ui.cursor().min.x - 160.0).clamp(40.0, 140.0);
                     let title = ui.add(egui::TextEdit::singleline(&mut self.doc.title).desired_width(title_w).frame(egui::Frame::NONE));
                     if title.changed() { self.dirty = true; }
-                    ui.label(egui::RichText::new(if self.dirty { ph::CLOUD_ARROW_UP } else { ph::CHECK }).color(theme::text_dim()))
-                        .on_hover_text(if self.dirty { "Saving..." } else { "All changes saved to this computer" });
+                    let (icon, tip) = match (self.dirty, self.settings.autosave) {
+                        (false, _) => (ph::CHECK, "All changes saved to this computer"),
+                        (true, true) => (ph::CLOUD_ARROW_UP, "Saving..."),
+                        (true, false) => (ph::FLOPPY_DISK, "Unsaved changes: Cmd+S saves them (autosave is off in Settings)"),
+                    };
+                    ui.label(egui::RichText::new(icon).color(theme::text_dim())).on_hover_text(tip);
                     ui.separator();
                     if ui.add_enabled(!self.history.is_empty(), egui::Button::new(egui::RichText::new(ph::ARROW_U_UP_LEFT).size(16.0)).frame(false)).on_hover_text("Undo (Cmd+Z)").clicked() {
                         self.actions.push(Action::Undo);
@@ -5103,6 +5210,9 @@ impl BioCartoon {
                                 ui.checkbox(&mut d.tile_colors, "Multicolor").on_hover_text("A color wheel on icons that come in several colors");
                                 ui.checkbox(&mut d.tile_stars, "Stars").on_hover_text("The star and how many people starred the icon, upper right. Without it, your favorites still show a gold star.");
                             });
+                            ui.end_row();
+                            ui.label("Saving");
+                            ui.checkbox(&mut d.autosave, "Save changes automatically").on_hover_text("Off: changes are saved only with Cmd+S, and BioCartoon asks before you leave a project or quit with unsaved changes");
                             ui.end_row();
                         });
                         ui.add_space(10.0);
@@ -5605,7 +5715,7 @@ impl BioCartoon {
     /// Headless-ish smoke test: `BIOCARTOON_SCREENSHOT=out.png` captures the window after a
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
-    /// settings, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, dictionary, textedit, tableedit, placetext,
+    /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, dictionary, textedit, tableedit, placetext,
     /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
@@ -5831,6 +5941,8 @@ impl BioCartoon {
                     "grid" => self.settings.show_grid = true,
                     "snap" => self.settings.grid_snap = true,
                     "settings" => self.open_settings(SettingsTab::General),
+                    "noautosave" => self.settings.autosave = false,
+                    "quitprompt" => self.leave_prompt = Some(None),
                     "aisettings" => self.open_settings(SettingsTab::Ai),
                     "about" => self.show_about = true,
                     "templates" => {
@@ -5934,6 +6046,7 @@ impl BioCartoon {
             } else {
                 log::info!("wrote screenshot {path}");
             }
+            self.quit_ok = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint();

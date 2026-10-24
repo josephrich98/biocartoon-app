@@ -80,6 +80,92 @@ fn bounce_downloads(path: &Path) {
     unsafe { NSDistributedNotificationCenter::defaultCenter().postNotificationName_object(&name, Some(&file)) };
 }
 
+/// How the user answered "Want to save your changes?".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SaveAnswer {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// macOS: ask "Want to save your changes to <name>?" with the system alert, its icon the caution
+/// sign badged with the app icon. `None` elsewhere, where the app draws its own dialog.
+pub fn ask_save_native(name: &str) -> Option<SaveAnswer> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle, NSEventModifierFlags};
+        use objc2_foundation::NSString;
+        let mtm = MainThreadMarker::new()?;
+        let alert = NSAlert::new(mtm);
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.setMessageText(&NSString::from_str(&format!("Want to save your changes to {name}?")));
+        if let Some(icon) = caution_badge(mtm) {
+            unsafe { alert.setIcon(Some(&icon)) };
+        }
+        alert.addButtonWithTitle(&NSString::from_str("Save"));
+        let discard = alert.addButtonWithTitle(&NSString::from_str("Don't Save"));
+        discard.setKeyEquivalent(&NSString::from_str("d"));
+        discard.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        alert.addButtonWithTitle(&NSString::from_str("Cancel")); // Escape, by its title
+        Some(match alert.runModal() {
+            r if r == NSAlertFirstButtonReturn => SaveAnswer::Save,
+            r if r == NSAlertSecondButtonReturn => SaveAnswer::Discard,
+            _ => SaveAnswer::Cancel,
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// The system caution sign with the app icon in its lower right, as document apps' alerts show it
+/// (the critical alert style draws a stop sign instead on recent macOS).
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // lockFocus: fine for a one-off 64 pt image
+fn caution_badge(mtm: objc2::MainThreadMarker) -> Option<objc2::rc::Retained<objc2_app_kit::NSImage>> {
+    use objc2::AnyThread;
+    use objc2_app_kit::{NSApplication, NSImage, NSImageNameCaution};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    let caution = NSImage::imageNamed(unsafe { NSImageNameCaution })?;
+    let app_icon = NSApplication::sharedApplication(mtm).applicationIconImage()?;
+    let image = NSImage::initWithSize(NSImage::alloc(), NSSize::new(64.0, 64.0));
+    image.lockFocus();
+    caution.drawInRect(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(64.0, 64.0)));
+    app_icon.drawInRect(NSRect::new(NSPoint::new(26.0, 0.0), NSSize::new(38.0, 38.0)));
+    image.unlockFocus();
+    Some(image)
+}
+
+/// macOS: the app menu's Quit (Cmd+Q) terminates the app outright, with no close request to
+/// stop. Point it at the window's close instead, so quitting can ask about unsaved changes. Call
+/// every frame; it does the work once.
+pub fn route_quit_through_close() {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::{sel, MainThreadMarker};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if DONE.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let Some(menu) = objc2_app_kit::NSApplication::sharedApplication(mtm).mainMenu() else { return };
+        for i in 0..menu.numberOfItems() {
+            let Some(sub) = menu.itemAtIndex(i).and_then(|m| m.submenu()) else { continue };
+            for j in 0..sub.numberOfItems() {
+                if let Some(item) = sub.itemAtIndex(j).filter(|it| it.action() == Some(sel!(terminate:))) {
+                    // performClose: goes to the key window, which asks the app (a close request).
+                    unsafe { item.setAction(Some(sel!(performClose:))) };
+                    DONE.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
 /// Keep the browser from dropping unsaved work: ask for a save as soon as the tab is hidden or
 /// closing, and have the browser confirm leaving while changes or storage writes are pending. The
 /// desktop needs none of this, since `on_exit` saves. Call once at startup.
