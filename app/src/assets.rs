@@ -24,7 +24,7 @@ use std::thread;
 use std::time::Duration;
 
 /// Longest side kept in GPU memory. Larger images are downscaled on the worker thread.
-const MAX_SIDE: u32 = 768;
+pub(crate) const MAX_SIDE: u32 = 768;
 /// Smallest and largest longer side of an SVG rendered for the canvas beyond the base texture.
 /// Sizes go up by powers of two in between, so a drawing is never minified more than 2x.
 const MIN_LOD_SIDE: u32 = 1024;

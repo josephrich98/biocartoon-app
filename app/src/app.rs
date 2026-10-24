@@ -2022,18 +2022,30 @@ impl BioCartoon {
             self.toast_err("Select a single image first");
             return;
         };
-        let ItemKind::Image { source, .. } = &it.kind else {
+        let ItemKind::Image { source, layers, .. } = &it.kind else {
             self.toast_err("AI edits work on images");
             return;
         };
-        let key = source.cache_key();
-        let Some(img) = self.images.cpu_image(&key) else {
+        let Some((image, svg)) = self.ai_input(source, layers) else {
             self.toast_err("Image is still loading, try again in a moment");
             return;
         };
-        let svg = svg_source(source);
         self.toast(format!("{} ({})", op.label(), self.ai.backend.name()));
-        self.ai.submit(AiJob::Edit { item: it.id, image: (*img).clone(), svg, op });
+        self.ai.submit(AiJob::Edit { item: it.id, image, svg, op });
+    }
+
+    /// What an AI edit of an image starts from: the picture as the canvas shows it, its restyled
+    /// layers included, and the SVG text the model may read (see [`svg_source`]), restyled too.
+    /// `None` while the image is loading.
+    fn ai_input(&self, source: &ImageSource, layers: &[crate::doc::LayerStyle]) -> Option<(image::RgbaImage, Option<String>)> {
+        let key = source.cache_key();
+        if let Some(v) = self.images.vector(&key).and_then(|v| v.restyled(layers)) {
+            match v.render(crate::assets::MAX_SIDE) {
+                Ok(img) => return Some((img, svg_source(source).map(|_| v.to_svg()))),
+                Err(e) => log::warn!("restyled image for an AI edit: {e}"),
+            }
+        }
+        Some(((*self.images.cpu_image(&key)?).clone(), svg_source(source)))
     }
 
     fn handle_ai_results(&mut self, ctx: &egui::Context) {
@@ -2069,9 +2081,11 @@ impl BioCartoon {
                         };
                         self.commit();
                         if let Some(it) = self.item_mut(item) {
-                            if let ItemKind::Image { source, .. } = &mut it.kind {
+                            if let ItemKind::Image { source, layers, .. } = &mut it.kind {
                                 // The edit still owes the original's credit.
                                 *source = source.derived(p);
+                                // It was made from the restyled colours, which it now has.
+                                layers.clear();
                             }
                             it.name = format!("{} ({})", it.name, op.label());
                         }
@@ -4573,9 +4587,9 @@ impl BioCartoon {
                     // Try the edit itself first; the chat reply explains what happened.
                     self.ai.submit(AiJob::Chat { item, history, message: msg.clone() });
                     if let Some(it) = self.item(item).cloned() {
-                        if let ItemKind::Image { source, .. } = &it.kind {
-                            if let Some(img) = self.images.cpu_image(&source.cache_key()) {
-                                self.ai.submit(AiJob::Edit { item, image: (*img).clone(), svg: svg_source(source), op: AiOp::Custom(msg) });
+                        if let ItemKind::Image { source, layers, .. } = &it.kind {
+                            if let Some((image, svg)) = self.ai_input(source, layers) {
+                                self.ai.submit(AiJob::Edit { item, image, svg, op: AiOp::Custom(msg) });
                             }
                         }
                     }

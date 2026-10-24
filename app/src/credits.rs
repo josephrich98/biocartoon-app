@@ -287,8 +287,6 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
         if credits.len() == 1 { "piece of artwork" } else { "pieces of artwork" },
         if required == 1 { "requires" } else { "require" }
     ));
-    ui.checkbox(only, "Only show credits for licenses requiring credit")
-        .on_hover_text("Public-domain and CC0 artwork needs no credit, but artists still appreciate it.");
     if pending > 0 {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -315,6 +313,10 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
             action = Some(CreditsAction::Save { required: true });
         }
     });
+    ui.separator();
+    // A filter for the list below, set apart from it so it doesn't read as a credit.
+    ui.checkbox(only, "Only show credits for licenses requiring credit")
+        .on_hover_text("Public-domain and CC0 artwork needs no credit, but artists still appreciate it.");
     ui.separator();
     egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
         for c in credits.iter().filter(|c| !*only || c.required) {

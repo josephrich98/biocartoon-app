@@ -949,6 +949,11 @@ impl Vector {
         &self.colors
     }
 
+    /// The file as SVG text (as usvg writes it: every style resolved into attributes).
+    pub fn to_svg(&self) -> String {
+        self.tree.to_string(&usvg::WriteOptions::default())
+    }
+
     /// The drawing with `layers` restyled: every fill, stroke and gradient stop in one of a
     /// layer's colours painted in its colour and opacity instead. `None` when no layer changes
     /// anything (or the restyled file fails to parse). Keeps the drawing's box, so a layer faded
@@ -957,7 +962,7 @@ impl Vector {
         if layers.iter().all(LayerStyle::is_plain) {
             return None;
         }
-        let xml = restyle_xml(&self.tree.to_string(&usvg::WriteOptions::default()), layers);
+        let xml = restyle_xml(&self.to_svg(), layers);
         match parse(&xml) {
             Ok(tree) => Some(Self { tree, content: self.content, colors: self.colors.clone() }),
             Err(e) => {
@@ -1417,6 +1422,7 @@ mod tests {
         let blue = v.restyled(&[liquid(Some([0, 0, 255]), 1.0)]).unwrap();
         assert_eq!(px(&blue, 60), [0, 0, 255, 255]);
         assert_eq!(px(&blue, 10), [255, 255, 255, 255], "the glass keeps its colour");
+        assert!(blue.to_svg().contains("#0000ff") && !blue.to_svg().contains("#f49dc0"), "its text has the new colour too");
         let faded = v.restyled(&[liquid(None, 0.0)]).unwrap();
         assert_eq!(px(&faded, 60)[3], 0);
         assert_eq!(faded.content(), v.content(), "a faded layer keeps the image's box");
