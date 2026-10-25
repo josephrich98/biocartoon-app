@@ -42,6 +42,22 @@ pub fn template_credit(title: &str, author: &str, license: &str, template: &str)
     format!("\"{title}\"{by}, template \"{template}\", {lic}")
 }
 
+/// The credit line of a template itself, for its hover text: the one its metadata carries, else
+/// `"Title" by Author, BioCartoon, CC0` (a community template names the library's contribution).
+pub fn template_row_credit(meta: &crate::templates::TemplateMeta) -> String {
+    if !meta.credit.is_empty() {
+        return meta.credit.clone();
+    }
+    let by = if meta.author.is_empty() || meta.author == "anonymous" { String::new() } else { format!(" by {}", meta.author) };
+    let from = if meta.official || meta.author == theme::BIOCARTOON_AUTHOR { "BioCartoon" } else { "BioCartoon community contribution" };
+    let lic = match meta.license.as_str() {
+        "CC0-1.0" => "CC0",
+        "" => "license unknown",
+        l => l,
+    };
+    format!("\"{}\"{by}, {from}, {lic}", meta.title)
+}
+
 /// The asset an image item is, or was made from.
 fn origin(it: &Item) -> Option<(&ImageSource, bool)> {
     let ItemKind::Image { source, .. } = &it.kind else { return None };
@@ -155,13 +171,12 @@ impl BioCartoon {
         };
         let mut open = true;
         let mut copied = false;
-        let center = ctx.content_rect().center();
         egui::Window::new(format!("{}  Credit", ph::QUOTES))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .default_width(360.0)
-            .default_pos(center - Vec2::new(180.0, 80.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new(&title).strong());
                 ui.add(egui::Label::new(&credit).selectable(true));
@@ -179,16 +194,18 @@ impl BioCartoon {
         }
     }
 
-    /// File > Attributions: every asset in the document (or one slide, from the canvas's
-    /// right-click menu) with its credit line, and a ready-made sentence for the figure legend.
+    /// Credits for one slide or the whole document, with copy/save actions for a figure legend.
     pub fn attributions_window(&mut self, ctx: &egui::Context) {
         if !self.show_attributions {
             return;
         }
         let stem = BioCartoon::slugify(&self.doc.title);
-        let (credits, title, stem) = match (&self.attributions_export, self.attributions_slide.filter(|&i| i < self.doc.slides.len())) {
+        let export_scope = self.attributions_export.as_ref().map(|(_, _, all)| *all);
+        let mut all_slides = export_scope.unwrap_or(self.attributions_all_slides);
+        let slide = self.attributions_slide.filter(|&i| i < self.doc.slides.len()).unwrap_or(self.cur_slide);
+        let (credits, title, stem) = match (&self.attributions_export, all_slides) {
             // Just after an export: the credits of what was exported.
-            (Some((credits, stem)), _) => {
+            (Some((credits, stem, _)), _) => {
                 // Fill in credits that were still being looked up when the export started.
                 let live = collect(&self.doc.slides, 1);
                 let credits = credits
@@ -200,21 +217,23 @@ impl BioCartoon {
                     .collect();
                 (credits, format!("{}  Credits for your export", ph::QUOTES), stem.clone())
             }
-            (None, Some(i)) => (collect([&self.doc.slides[i]], i + 1), format!("{}  Attributions: slide {}", ph::QUOTES, i + 1), format!("{stem}-slide{}", i + 1)),
-            (None, None) => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES), stem),
+            (None, false) => (collect([&self.doc.slides[slide]], slide + 1), format!("{}  Attributions: slide {}", ph::QUOTES, slide + 1), format!("{stem}-slide{}", slide + 1)),
+            (None, true) => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES), stem),
         };
         let mut open = true;
         let mut action = None;
-        let center = ctx.content_rect().center();
         let window = egui::Window::new(title)
             .id(egui::Id::new("attributions_window"))
             .open(&mut open)
             .collapsible(false)
             .default_size([480.0, 460.0])
-            .default_pos(center - Vec2::new(240.0, 230.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                action = attributions_ui(ui, &credits, &mut self.attributions_required_only);
+                action = attributions_ui(ui, &credits, &mut self.attributions_required_only, &mut all_slides, export_scope.is_some());
             });
+        if export_scope.is_none() {
+            self.attributions_all_slides = all_slides;
+        }
         // For a few seconds after an export, a green banner just above the window says it worked.
         let now = ctx.input(|i| i.time);
         if let (Some(at), Some(w), Some(_)) = (self.export_saved_at, &window, &self.attributions_export) {
@@ -264,7 +283,7 @@ impl BioCartoon {
     }
 }
 
-/// The credit list a copy or save button hands over: all credits end by naming the app; the
+/// The credit list displayed and handed over by copy or save: all credits end by naming the app; the
 /// required ones stay just what the licenses ask for.
 fn shared_list(credits: &[Credit], only_required: bool) -> String {
     let lines = list(credits, only_required);
@@ -282,14 +301,13 @@ enum CreditsAction {
 }
 
 /// The body of the Attributions popup. Returns what a copy or save button asked for, if one was clicked.
-fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Option<CreditsAction> {
+fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool, all_slides: &mut bool, export: bool) -> Option<CreditsAction> {
     let mut action = None;
     let pending = credits.iter().filter(|c| c.credit.is_empty()).count();
     let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
     if credits.is_empty() {
         ui.label("There is no library artwork here, so there is no one to credit.");
         ui.label(dim("Images you uploaded or generated yourself are listed here once they are in the library."));
-        return None;
     }
     let required = credits.iter().filter(|c| c.required).count();
     ui.label(format!(
@@ -331,24 +349,12 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool) -> Op
     // A filter for the list below, set apart from it so it doesn't read as a credit.
     ui.checkbox(only, "Only show credits for licenses requiring credit")
         .on_hover_text("Public-domain and CC0 artwork needs no credit, but artists still appreciate it.");
+    ui.add_enabled(!export, egui::Checkbox::new(all_slides, "Show all slides"))
+        .on_hover_text("Include credits for artwork on every slide.")
+        .on_disabled_hover_text("Fixed to the slides selected for this export.");
     ui.separator();
     egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-        for c in credits.iter().filter(|c| !*only || c.required) {
-            ui.label(egui::RichText::new(&c.title).strong());
-            if c.credit.is_empty() {
-                ui.label(dim("Credit not found yet."));
-            } else {
-                ui.add(egui::Label::new(&c.credit).selectable(true));
-            }
-            let slides = c.slides.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
-            let mut note = format!("{} {slides}", if c.slides.len() == 1 { "Slide" } else { "Slides" });
-            note.push_str(if c.required { "  ·  credit required" } else { "  ·  credit optional" });
-            if c.derived {
-                note.push_str("  ·  includes an edited copy, which still needs this credit");
-            }
-            ui.label(dim(&note));
-            ui.add_space(6.0);
-        }
+        ui.add(egui::Label::new(shared_list(credits, *only)).wrap().selectable(true));
     });
     action
 }
@@ -431,5 +437,16 @@ mod tests {
     #[test]
     fn template_credit_matches_the_worker() {
         assert_eq!(template_credit("pic", "ann", "CC0-1.0", "Pathway"), "\"pic\" by ann, template \"Pathway\", CC0");
+    }
+
+    #[test]
+    fn template_row_credit_prefers_the_stored_line() {
+        use crate::templates::TemplateMeta;
+        let m = TemplateMeta { title: "Eukaryotic cell".into(), author: "BioCartoon".into(), license: "CC0-1.0".into(), credit: "\"Eukaryotic cell\" by Joseph Rich, BioCartoon, CC0".into(), ..Default::default() };
+        assert_eq!(template_row_credit(&m), "\"Eukaryotic cell\" by Joseph Rich, BioCartoon, CC0");
+        let m = TemplateMeta { title: "Pathway".into(), author: "ann".into(), license: "CC-BY-4.0".into(), ..Default::default() };
+        assert_eq!(template_row_credit(&m), "\"Pathway\" by ann, BioCartoon community contribution, CC-BY-4.0");
+        let m = TemplateMeta { title: "Cell".into(), author: "BioCartoon".into(), license: "CC0-1.0".into(), ..Default::default() };
+        assert_eq!(template_row_credit(&m), "\"Cell\" by BioCartoon, BioCartoon, CC0");
     }
 }

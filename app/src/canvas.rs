@@ -1808,6 +1808,7 @@ impl BioCartoon {
         if ui.button(format!("{}  Show credits", ph::QUOTES)).on_hover_text("Credits for the library artwork on this slide").clicked() {
             self.show_attributions = true;
             self.attributions_slide = Some(self.cur_slide);
+            self.attributions_all_slides = false;
             self.attributions_export = None;
             ui.close();
         }

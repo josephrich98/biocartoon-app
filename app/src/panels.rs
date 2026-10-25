@@ -1051,16 +1051,20 @@ impl BioCartoon {
         let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
         let (abbr, col, _) = theme::source_badge(row.source());
         let r = tile(ui, size, &row.meta.title, state, self.settings.tile_database.then_some((abbr, col, "Template")));
+        // Laid out like an icon's: "Eukaryotic cell  ·  Template", the description and category,
+        // "BioCartoon  ·  CC0-1.0  ·  AI unknown", the ID, and the credit line in grey.
         let info = |ui: &mut egui::Ui| {
-            ui.label(egui::RichText::new(&row.meta.title).strong());
+            ui.label(egui::RichText::new(format!("{}  ·  Template", row.meta.title)).strong());
             if !row.meta.description.is_empty() {
                 ui.label(&row.meta.description);
             }
             if !row.meta.category.is_empty() {
                 ui.label(format!("Database category: {}", row.meta.category));
             }
-            let line = ["Template", row.meta.author.as_str(), row.meta.license.as_str(), ai_label(row.meta.generative_ai_used)];
-            ui.label(egui::RichText::new(line.iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  ")).small().color(theme::text_dim()));
+            let line = [row.meta.author.as_str(), row.meta.license.as_str(), ai_label(row.meta.generative_ai_used)];
+            ui.label(line.iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  "));
+            ui.label(format!("Template ID: {}", row.meta.id));
+            ui.label(egui::RichText::new(crate::credits::template_row_credit(&row.meta)).small().color(theme::text_dim()));
         };
         // A long press opens the context menu when there is one, so the info goes there.
         let r = if row.json_local.is_some() { r.on_hover_ui(info) } else { info_ui(r, info) };
@@ -1538,6 +1542,9 @@ impl BioCartoon {
         }
         ui.label(egui::RichText::new(first).strong());
         ui.label(egui::RichText::new(second).small().color(theme::text_dim()));
+        if let ImageSource::Asset { id, .. } = source {
+            ui.label(format!("Asset ID: {id}"));
+        }
     }
 
     /// An image file's size in pixels (from its header, as the canvas holds a scaled-down copy)
@@ -2518,6 +2525,7 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
             file += &format!("  ·  {}", crate::offline::human_bytes(row.file_bytes));
         }
         ui.label(file);
+        ui.label(format!("Asset ID: {}", row.id));
         ui.label(egui::RichText::new(&row.credit).small().color(theme::text_dim()));
     };
     // A long press opens the context menu too, so the info goes there for touch screens.

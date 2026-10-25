@@ -40,6 +40,11 @@ pub struct TemplateMeta {
     /// [`TemplateRow::source`].
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub official: bool,
+    /// The ready-to-print attribution line (`"Eukaryotic cell" by Joseph Rich, BioCartoon, CC0`);
+    /// empty when nobody set one, and then made up from the author and license
+    /// ([`crate::credits::template_row_credit`]).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub credit: String,
 }
 
 /// What `template.json` holds: the metadata, the page it was designed on, and one slide.
@@ -73,11 +78,11 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, category TEXT, author TEXT,
     license TEXT, created_at TEXT, json_key TEXT NOT NULL, thumb_key TEXT,
     json_local TEXT, thumb_local TEXT,
-    tags TEXT NOT NULL DEFAULT '[]', generative_ai_used INTEGER, official INTEGER NOT NULL DEFAULT 0);
+    tags TEXT NOT NULL DEFAULT '[]', generative_ai_used INTEGER, official INTEGER NOT NULL DEFAULT 0, credit TEXT);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);";
 
 /// Whether `table` (e.g. `pub.templates`) has `column`: lists made before templates had tags
-/// (or `generative_ai_used`, or `official`) don't.
+/// (or `generative_ai_used`, `official` or `credit`) don't.
 fn has_col(c: &Connection, table: &str, column: &str) -> bool {
     c.prepare(&format!("SELECT {column} FROM {table} LIMIT 0")).is_ok()
 }
@@ -108,6 +113,9 @@ impl TemplateStore {
             }
             if !has_col(&c, "templates", "official") {
                 c.execute_batch("ALTER TABLE templates ADD COLUMN official INTEGER NOT NULL DEFAULT 0;")?;
+            }
+            if !has_col(&c, "templates", "credit") {
+                c.execute_batch("ALTER TABLE templates ADD COLUMN credit TEXT;")?;
             }
             Ok(c)
         });
@@ -168,7 +176,7 @@ impl TemplateStore {
             let mut st = c.prepare(
                 "SELECT id, title, coalesce(description,''), coalesce(category,''), coalesce(author,''), \
                  coalesce(license,''), coalesce(created_at,''), coalesce(thumb_key,''), json_key, json_local, thumb_local, \
-                 coalesce(tags,'[]'), generative_ai_used, official FROM templates ORDER BY json_local IS NULL, lower(title), id",
+                 coalesce(tags,'[]'), generative_ai_used, official, coalesce(credit,'') FROM templates ORDER BY json_local IS NULL, lower(title), id",
             )?;
             let rows = st
                 .query_map([], |r| {
@@ -185,6 +193,7 @@ impl TemplateStore {
                             thumb_key: r.get(7)?,
                             generative_ai_used: r.get::<_, Option<i64>>(12)?.map(|v| v != 0),
                             official: r.get::<_, i64>(13)? != 0,
+                            credit: r.get(14)?,
                         },
                         json_key: r.get(8)?,
                         json_local: r.get(9)?,
@@ -205,7 +214,7 @@ impl TemplateStore {
         let m = &row.meta;
         c.execute(
             "INSERT OR REPLACE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, \
-             json_local, thumb_local, tags, generative_ai_used, official) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             json_local, thumb_local, tags, generative_ai_used, official, credit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 m.id,
                 m.title,
@@ -220,7 +229,8 @@ impl TemplateStore {
                 row.thumb_local,
                 serde_json::to_string(&m.tags).map_err(|e| e.to_string())?,
                 m.generative_ai_used,
-                m.official
+                m.official,
+                m.credit
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -247,10 +257,11 @@ impl TemplateStore {
         let tags = if has_col(c, "pub.templates", "tags") { "coalesce(tags,'[]')" } else { "'[]'" };
         let ai = if has_col(c, "pub.templates", "generative_ai_used") { "generative_ai_used" } else { "NULL" };
         let official = if has_col(c, "pub.templates", "official") { "coalesce(official,0)" } else { "0" };
+        let credit = if has_col(c, "pub.templates", "credit") { "credit" } else { "NULL" };
         let r = c.execute_batch(&format!(
             "BEGIN; DELETE FROM templates WHERE json_local IS NULL; \
-             INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, tags, generative_ai_used, official) \
-             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags}, {ai}, {official} FROM pub.templates; COMMIT;"
+             INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, tags, generative_ai_used, official, credit) \
+             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags}, {ai}, {official}, {credit} FROM pub.templates; COMMIT;"
         ));
         if r.is_err() {
             let _ = c.execute_batch("ROLLBACK;");

@@ -1086,16 +1086,19 @@ pub struct BioCartoon {
     /// Asset ids whose credit has been asked of the catalog (see [`crate::credits::missing`]).
     pub credit_lookups: HashSet<String>,
     pub show_attributions: bool,
-    /// The slide (0-based) the Attributions window is limited to, or the whole document.
+    /// The slide (0-based) shown when all slides is unchecked; defaults to the current slide.
     pub attributions_slide: Option<usize>,
-    /// The credits of what was just exported, and the stem for saving them: the Attributions
+    /// Whether the Attributions window includes artwork from all slides.
+    pub attributions_all_slides: bool,
+    /// The credits of what was just exported, the stem for saving them, and whether all slides
+    /// were selected for export: the Attributions
     /// window shows these instead of the document's while set.
-    pub attributions_export: Option<(Vec<crate::credits::Credit>, String)>,
+    pub attributions_export: Option<(Vec<crate::credits::Credit>, String, bool)>,
     /// When the export whose credits the Attributions window shows finished, for the
     /// "Image saved successfully" banner above it.
     pub export_saved_at: Option<f64>,
     /// The credits of the export that is running, shown once it finishes.
-    pub export_credits: Option<(Vec<crate::credits::Credit>, String)>,
+    pub export_credits: Option<(Vec<crate::credits::Credit>, String, bool)>,
     /// The image whose credit the Credit window shows (right-click > Show credit).
     pub credit_item: Option<ItemId>,
     /// The Attributions window lists only credits the licenses require.
@@ -1282,6 +1285,7 @@ impl BioCartoon {
             credit_lookups: HashSet::new(),
             show_attributions: false,
             attributions_slide: None,
+            attributions_all_slides: false,
             attributions_export: None,
             export_saved_at: None,
             export_credits: None,
@@ -3239,6 +3243,7 @@ impl BioCartoon {
             generative_ai_used,
             // Only a reviewer makes one official (it is listed as the published copy says).
             official: false,
+            credit: String::new(),
         };
         let (page, bg) = (t.page_rect(), t.background);
         let replaces = t.saved.map(|m| m.id);
@@ -3982,7 +3987,7 @@ impl BioCartoon {
         // Its credits pop up once it is done.
         let credits = if slides.len() > 1 { crate::credits::collect(&doc.slides, 1) } else { crate::credits::collect([&doc.slides[slide]], slide + 1) };
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| Self::slugify(&doc.title));
-        self.export_credits = (!credits.is_empty()).then_some((credits, stem));
+        self.export_credits = (!credits.is_empty()).then_some((credits, stem, self.settings.export.all_slides));
         let job = self.export_job_for(&doc, &slides, path, self.settings.export.clone());
         self.export_job = Some(crate::export::start(ctx.clone(), job));
         self.toast("Exporting...");
@@ -3996,7 +4001,8 @@ impl BioCartoon {
         let format = &mut self.settings.picture_format;
         let dpi = &mut self.settings.picture_dpi;
         let modal = egui::Modal::new(egui::Id::new("save_picture_modal")).show(ctx, |ui| {
-            ui.set_width(440.0);
+            // Keep the header aligned when the controls need more than the minimum width.
+            ui.set_min_width(440.0);
             ui.horizontal(|ui| {
                 ui.heading("Save as picture");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4174,7 +4180,8 @@ impl BioCartoon {
         let screen = ctx.content_rect().size();
         let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
             let body = |ui: &mut egui::Ui| {
-                ui.set_width(440.0);
+                // Reuse the measured content width so the header and body share the same bounds.
+                ui.set_min_width(440.0);
                 ui.horizontal(|ui| {
                     ui.heading(heading);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4446,9 +4453,9 @@ impl BioCartoon {
                         cols: 2,
                         cells: vec!["Symbol".into(), "Meaning".into(), "".into(), "".into(), "".into(), "".into(), "".into(), "".into()],
                         header: true,
-                        border: [190, 195, 205, 255],
+                        border: [0, 0, 0, 255],
                         fill: [255, 255, 255, 255],
-                        header_fill: [230, 236, 245, 255],
+                        header_fill: [255, 255, 255, 255],
                         text_color: [30, 30, 30, 255],
                         font_size: 14.0,
                     },
@@ -4647,9 +4654,9 @@ impl BioCartoon {
                     cols,
                     cells: vec![String::new(); rows * cols],
                     header: true,
-                    border: [190, 195, 205, 255],
+                    border: [0, 0, 0, 255],
                     fill: [255, 255, 255, 255],
-                    header_fill: [230, 236, 245, 255],
+                    header_fill: [255, 255, 255, 255],
                     text_color: [30, 30, 30, 255],
                     font_size: 14.0,
                 };
@@ -5221,7 +5228,7 @@ impl BioCartoon {
                         if ui.button("Add to dictionary...").on_hover_text("Words the spelling check should accept: type them in or upload a list").clicked() { self.show_dict_window = true; ui.close(); }
                         ui.separator();
                         if ui.button("Export...").clicked() { self.actions.push(Action::OpenExport); ui.close(); }
-                        if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = None; self.attributions_export = None; ui.close(); }
+                        if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = Some(self.cur_slide); self.attributions_all_slides = false; self.attributions_export = None; ui.close(); }
                         ui.separator();
                         if ui.button("Settings...").clicked() { self.open_settings(SettingsTab::General); ui.close(); }
                         if ui.button(if cfg!(target_arch = "wasm32") { "Bulk download..." } else { "Download..." }).clicked() { self.open_settings(SettingsTab::Offline); ui.close(); }
@@ -5346,7 +5353,7 @@ impl BioCartoon {
         // Settings
         if self.show_settings {
             let mut open = true;
-            egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).fixed_size([620.0, 0.0]).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).default_width(620.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::General, "General");
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Ai, "AI");
@@ -5502,7 +5509,7 @@ impl BioCartoon {
         // About
         if self.show_about {
             let mut open = true;
-            egui::Window::new("About").open(&mut open).collapsible(false).resizable(false).fixed_size([500.0, 0.0]).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            egui::Window::new("About").open(&mut open).collapsible(false).resizable(false).default_width(500.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add(crate::logo(ui.ctx(), 64.0));
                     ui.label(egui::RichText::new("BioCartoon").size(20.0).strong());
@@ -5514,7 +5521,7 @@ impl BioCartoon {
                     linked_line(ui, "Web app: ", "app.biocartoon.com", "https://app.biocartoon.com");
                     ui.add_space(10.0);
                     linked_line(ui, "Free and open source under the ", "GNU AGPL v3.0", "https://www.gnu.org/licenses/agpl-3.0.html");
-                    linked_line(ui, "Database and CLI Source Code: ", "github.com/josephrich98/biocartoon", "https://github.com/josephrich98/biocartoon");
+                    linked_line(ui, "Database and CLI source code: ", "github.com/josephrich98/biocartoon", "https://github.com/josephrich98/biocartoon");
                     linked_line(ui, "App source code: ", "github.com/josephrich98/biocartoon-app", crate::GITHUB_URL);
                 });
             });
@@ -5526,7 +5533,7 @@ impl BioCartoon {
             let mut open = true;
             let mut connect = false;
             let mut cancel = false;
-            egui::Window::new("Connect an AI model").open(&mut open).collapsible(false).resizable(false).fixed_size([460.0, 0.0]).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            egui::Window::new("Connect an AI model").open(&mut open).collapsible(false).resizable(false).default_width(460.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
                 ui.label(egui::RichText::new("AI tools run on a hosted model with your own API key, or on your own vLLM server. Keys are stored only on this computer.").color(theme::text_dim()));
                 ui.add_space(8.0);
                 ai_fields(ui, &mut setup.provider, &mut setup.model, &mut setup.key, &mut setup.base_url);
@@ -5579,8 +5586,7 @@ impl BioCartoon {
             let ce_item = self.ai_edit.as_ref().unwrap().item;
             let item = self.slide().items.iter().find(|i| i.id == ce_item).cloned();
             let ce = self.ai_edit.as_mut().unwrap();
-            let center = ctx.content_rect().center();
-            egui::Window::new(format!("{}  Edit with AI", ph::SPARKLE)).open(&mut open).collapsible(false).default_size([460.0, 600.0]).default_pos(center - Vec2::new(230.0, 300.0)).show(ctx, |ui| {
+            egui::Window::new(format!("{}  Edit with AI", ph::SPARKLE)).open(&mut open).collapsible(false).default_size([460.0, 600.0]).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
                 if let Some(it) = &item {
                     if let ItemKind::Image { source, .. } = &it.kind {
                         let key = source.cache_key();
@@ -6194,7 +6200,7 @@ impl BioCartoon {
                     }
                     // The Attributions window as an export leaves it, with the "Image saved" banner.
                     "exportsaved" => {
-                        self.attributions_export = Some((crate::credits::collect(&self.doc.slides, 1), Self::slugify(&self.doc.title)));
+                        self.attributions_export = Some((crate::credits::collect(&self.doc.slides, 1), Self::slugify(&self.doc.title), true));
                         self.export_saved_at = Some(0.0);
                         self.show_attributions = true;
                     }

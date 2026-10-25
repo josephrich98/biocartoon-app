@@ -434,12 +434,11 @@ impl BioCartoon {
         let mut cmd: Option<Cmd> = None;
         let mut grammar = self.settings.check_grammar;
         let doc = &self.doc;
-        let center = ctx.content_rect().center();
         egui::Window::new(format!("{}  Spelling and grammar", ph::TEXT_AA))
             .open(&mut open)
             .collapsible(false)
             .default_size([420.0, 520.0])
-            .default_pos(center - Vec2::new(210.0, 260.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 let n = st.issues.len();
                 ui.horizontal(|ui| {
@@ -618,12 +617,11 @@ impl BioCartoon {
         let mut add = false;
         let mut remove: Option<usize> = None;
         let mut clear = false;
-        let center = ctx.content_rect().center();
         egui::Window::new(format!("{}  Add to dictionary", ph::BOOK_OPEN_TEXT))
             .open(&mut open)
             .collapsible(false)
             .default_width(360.0)
-            .default_pos(center - Vec2::new(180.0, 200.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new("The spelling check accepts these words. They are kept with your settings on this device.").small().color(theme::text_dim()));
                 ui.add_space(4.0);
