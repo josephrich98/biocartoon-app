@@ -608,6 +608,14 @@ impl TextFont {
     /// missing (on the web, one that failed to load) still gets its family, of the fallbacks
     /// alone, since egui panics on an unknown family.
     pub fn install(defs: &mut egui::FontDefinitions) {
+        // egui's Ubuntu and Hack lack glyphs like ⁺ ⁻ → (and Hack ₂): Arimo, last in their
+        // chains, covers them without changing any glyph they do have.
+        if let Some(bytes) = TextFont::Arimo.bytes() {
+            defs.font_data.insert("Arimo".into(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                defs.families.entry(family).or_default().push("Arimo".into());
+            }
+        }
         let fallback = defs.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
         for (f, name, ..) in Self::EMBEDDED {
             let mut chain = Vec::new();

@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn query_values_are_escaped() {
-        assert_eq!(encode("bioart/2_626557,user/a-b"), "bioart/2_626557,user/a-b");
+        assert_eq!(encode("BA000001,user/a-b"), "BA000001,user/a-b");
         assert_eq!(encode("a b&c"), "a%20b%26c");
     }
 }

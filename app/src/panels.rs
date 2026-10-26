@@ -7,6 +7,7 @@ use crate::templates::TemplateRow;
 use crate::assets::ImgState;
 use crate::canvas::{draw_slide, tool_button, Xform};
 use crate::catalog::{AssetRow, Facets, IconSort};
+use biocartoon_catalog::syntax::{self, contains, Expr, Field};
 use crate::doc::{c32, c4, CodeLang, CodeTheme, ImageSource, Item, ItemKind, LayerStyle, LineFamily, LineKind, LineStyle, ShapeKind, TextAlign, TextFlag, TextFont, TextVAlign, Unit};
 use crate::stars::format_stars;
 use crate::theme;
@@ -20,6 +21,8 @@ const PANEL_MAX_W: f32 = 720.0;
 const TILE: f32 = 96.0;
 /// Most layers an SVG offers from its own colours (when the catalog names none), the most used.
 const MAX_COLOR_LAYERS: usize = 8;
+/// Most layers an upload keeps, so the Layers editor stays short for everyone who uses it.
+pub const MAX_LAYERS: usize = 20;
 
 /// The Slides panel starts narrower, and can be dragged narrower, than the others.
 const SLIDES_W: f32 = 186.0;
@@ -287,14 +290,14 @@ impl BioCartoon {
                     return Vec::new();
                 }
                 let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
-                let q = self.icons.query.trim().to_lowercase();
+                let q = self.icons.query.trim();
                 let authors = f.authors();
                 let tags = f.tags();
                 // A template's category is free text: it matches a picked category or subcategory by name.
                 let places: Vec<&str> = f.cats.iter().map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
                 // Each is in BioCartoon or User-generated: another database's filter leaves it out.
                 rows.filter(|r| any_source || f.sources.is_empty() || f.sources.iter().any(|s| s == r.source()))
-                    .filter(|r| q.is_empty() || [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q)) || r.meta.tags.iter().any(|t| t.to_lowercase().contains(&q)))
+                    .filter(|r| template_match(r, q))
                     .filter(|r| authors.is_empty() || authors.iter().any(|a| r.meta.author.to_lowercase().contains(a)))
                     .filter(|r| tags.is_empty() || tags.iter().any(|t| r.meta.tags.iter().any(|x| eq(x, t))))
                     .filter(|r| f.licenses.is_empty() || f.licenses.iter().any(|l| eq(l, &r.meta.license)))
@@ -313,10 +316,10 @@ impl BioCartoon {
                 }
                 let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
                 let places: Vec<&str> = f.cats.iter().map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
-                let q = self.icons.mine_query.trim().to_lowercase();
+                let q = self.icons.mine_query.trim();
                 rows.filter(|r| r.json_local.is_some())
                     .filter(|r| places.is_empty() || places.iter().any(|p| eq(p, &r.meta.category)))
-                    .filter(|r| q.is_empty() || [&r.meta.title, &r.meta.description, &r.meta.category].iter().any(|t| t.to_lowercase().contains(&q)) || r.meta.tags.iter().any(|t| t.to_lowercase().contains(&q)))
+                    .filter(|r| template_match(r, q))
                     .cloned()
                     .collect()
             }
@@ -344,7 +347,7 @@ impl BioCartoon {
         // Each dropdown lists the choices that find icons under the query and the other filters, with
         // how many; the picked ones stay listed so they can be taken out. Until the counts arrive, all of them.
         let facets = if mine {
-            Some(local_facets(&self.icons.results, &self.icons.mine_query.trim().to_lowercase(), &self.icons.mine_filter))
+            Some(local_facets(&self.icons.results, self.icons.mine_query.trim(), &self.icons.mine_filter))
         } else {
             if self.icons.facets_for.as_ref().is_none_or(|(q, f)| q != self.icons.query.trim() || *f != self.icons.filter) {
                 self.request_facets();
@@ -549,7 +552,7 @@ impl BioCartoon {
                     if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
                         self.icons.show_filters = !self.icons.show_filters;
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.icons.query).frame(egui::Frame::NONE).desired_width(ui.available_width()))
+                    ui.add(egui::TextEdit::singleline(&mut self.icons.query).frame(egui::Frame::NONE).desired_width(ui.available_width())).on_hover_text(SEARCH_SYNTAX_TIP)
                 })
                 .inner
             })
@@ -596,7 +599,7 @@ impl BioCartoon {
                         self.icons.mine_query.clear();
                         self.icons.typed_at = f64::NEG_INFINITY;
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.icons.mine_query).hint_text(hint).frame(egui::Frame::NONE).desired_width(ui.available_width()))
+                    ui.add(egui::TextEdit::singleline(&mut self.icons.mine_query).hint_text(hint).frame(egui::Frame::NONE).desired_width(ui.available_width())).on_hover_text(SEARCH_SYNTAX_TIP)
                 })
                 .inner
             })
@@ -779,8 +782,8 @@ impl BioCartoon {
         let mine = matches!(self.icons.mode, IconsMode::Favorites | IconsMode::Library)
             && (!self.icons.mine_query.trim().is_empty() || self.icons.mine_filter.active() > 0);
         let shown: Vec<AssetRow> = if mine {
-            let q = self.icons.mine_query.trim().to_lowercase();
-            self.icons.results.iter().filter(|r| local_match(r, &q, &self.icons.mine_filter, None)).cloned().collect()
+            let q = self.icons.mine_query.trim();
+            self.icons.results.iter().filter(|r| local_match(r, q, &self.icons.mine_filter, None)).cloned().collect()
         } else {
             self.icons.results.clone()
         };
@@ -1601,28 +1604,33 @@ impl BioCartoon {
             return false;
         }
         let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Layers").strong()).on_hover_text("Recolor or fade one part of the drawing at a time");
-            if layers.iter().any(|l| !l.is_plain()) {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Reset").on_hover_text("Every layer back to the drawing's own colors").clicked() {
-                        layers.clear();
-                        changed = true;
-                    }
-                });
-            }
-        });
-        let mut rows: Vec<EditLayer> = offered
-            .into_iter()
-            .map(|(name, colors)| {
-                let style = layers.iter().find(|l| l.colors == colors).cloned().unwrap_or(LayerStyle { colors, color: None, opacity: 1.0 });
-                EditLayer { name, style }
+        // Collapsible, open by default; the Reset stays in the header row.
+        let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id("image_layers_open"), true);
+        state
+            .show_header(ui, |ui| {
+                ui.label(egui::RichText::new("Layers").strong()).on_hover_text("Recolor or fade one part of the drawing at a time");
+                if layers.iter().any(|l| !l.is_plain()) {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Reset").on_hover_text("Every layer back to the drawing's own colors").clicked() {
+                            layers.clear();
+                            changed = true;
+                        }
+                    });
+                }
             })
-            .collect();
-        if layer_grid(ui, "image_layers", &mut rows, false) {
-            changed = true;
-            *layers = rows.into_iter().map(|r| r.style).filter(|l| !l.is_plain()).collect();
-        }
+            .body_unindented(|ui| {
+                let mut rows: Vec<EditLayer> = offered
+                    .into_iter()
+                    .map(|(name, colors)| {
+                        let style = layers.iter().find(|l| same_colors(&l.colors, &colors)).cloned().unwrap_or(LayerStyle { colors, color: None, opacity: 1.0 });
+                        EditLayer { name, style, picked: false, removed: false }
+                    })
+                    .collect();
+                if layer_grid(ui, "image_layers", &mut rows, None) {
+                    changed = true;
+                    *layers = rows.into_iter().map(|r| r.style).filter(|l| !l.is_plain()).collect();
+                }
+            });
         changed
     }
 
@@ -1723,9 +1731,11 @@ impl BioCartoon {
                         }
                     }
                 }
-                changed |= self.layers_ui(ui, source, layers);
                 ui.label(egui::RichText::new("Style").strong());
                 ui.horizontal(|ui| {
+                    // As tall as the % box from the start, so the row centres on it rather than
+                    // the box hanging below the label.
+                    ui.set_min_height(ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y);
                     ui.label("Color overlay");
                     let mut rgb = [overlay[0], overlay[1], overlay[2]];
                     if crate::color::edit_button_rgb(ui, &mut rgb).changed() {
@@ -1734,17 +1744,19 @@ impl BioCartoon {
                         changed = true;
                     }
                     let mut strength = overlay[3] as f32 / 255.0 * 100.0;
-                    // Fit the slider between the colour button and Reset (its value box and Reset take ~130px).
-                    ui.spacing_mut().slider_width = (ui.available_width() - 130.0).max(40.0);
-                    if ui.add(egui::Slider::new(&mut strength, 0.0..=100.0).suffix("%")).changed() {
-                        overlay[3] = (strength / 100.0 * 255.0) as u8;
+                    if ui.add(egui::DragValue::new(&mut strength).speed(1.0).range(0.0..=100.0).max_decimals(0).suffix("%")).on_hover_text("Overlay strength").changed() {
+                        overlay[3] = (strength / 100.0 * 255.0).round() as u8;
                         changed = true;
                     }
-                    if ui.small_button("Reset").clicked() {
-                        *overlay = [255, 255, 255, 0];
-                        changed = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Reset").on_hover_text("Remove the color overlay").clicked() {
+                            *overlay = [255, 255, 255, 0];
+                            changed = true;
+                        }
+                    });
                 });
+                ui.add_space(4.0);
+                changed |= self.layers_ui(ui, source, layers);
                 ui.separator();
                 let b = egui::Button::new(egui::RichText::new(format!("{}  Edit with AI", ph::SPARKLE)).color(Color32::WHITE)).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 36.0));
                 if ui.add(b).on_hover_text("Restyle, remove the background or text, or describe any other change").clicked() {
@@ -2988,10 +3000,58 @@ enum Dim {
 
 /// Whether a loaded asset passes Favorites' or Your library's box (`q`, lowercase: in its title,
 /// description, category or tags) and filters, as the catalog's search would, leaving out `skip`.
+/// The search boxes' hover text: their advanced syntax (see [`syntax`]).
+const SEARCH_SYNTAX_TIP: &str = "Search by field: database:, author:, category:, subcategory:, database_category:, license:, \
+file_type:, tags:, id: (e.g. author:\"Jane Doe\")\nCombine with AND, OR, NOT and parentheses, \
+e.g. (mouse OR rat) AND file_type:svg NOT database:servier";
+
+/// Whether a record passes the search box's `q` (as typed): a plain query as a part of its
+/// `text` or `tags`, an advanced one (see [`syntax`]) term by term, `field` matching a field term.
+fn query_match(q: &str, text: &[&str], tags: &[String], field: impl Fn(Field, &str) -> bool) -> bool {
+    match syntax::parse(q) {
+        None => {
+            let q = q.to_lowercase();
+            q.is_empty() || text.iter().any(|t| t.to_lowercase().contains(&q)) || tags.iter().any(|t| t.to_lowercase().contains(&q))
+        }
+        Some(e) => {
+            let all = text.iter().copied().chain(tags.iter().map(String::as_str)).collect::<Vec<_>>().join(" ");
+            e.eval(&|t| match t {
+                Expr::Field(f, v) => field(*f, v),
+                t => syntax::text_matches(&all, t),
+            })
+        }
+    }
+}
+
+/// [`query_match`] for a saved template. Its category is free text, so it answers `category`,
+/// `subcategory` and `database_category` alike; slides, it has no file type.
+fn template_match(r: &TemplateRow, q: &str) -> bool {
+    let m = &r.meta;
+    query_match(q, &[&m.title, &m.description, &m.category], &m.tags, |f, v| match f {
+        Field::Database => contains(r.source(), v) || (r.source() == "user" && contains("user-generated", v)),
+        Field::Author => contains(&m.author, v),
+        Field::Category | Field::Subcategory | Field::DatabaseCategory => contains(&m.category, v),
+        Field::License => contains(&m.license, v),
+        Field::FileType => false,
+        Field::Tags => m.tags.iter().any(|t| contains(t, v)),
+        Field::Id => m.id.eq_ignore_ascii_case(v),
+    })
+}
+
 fn local_match(row: &AssetRow, q: &str, f: &SearchFilter, skip: Option<Dim>) -> bool {
     let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
     let shown = theme::asset_source(row);
-    let text = q.is_empty() || [&row.title, &row.description, &row.category].iter().any(|t| t.to_lowercase().contains(q)) || row.tags.iter().any(|t| t.to_lowercase().contains(q));
+    let text = query_match(q, &[&row.title, &row.description, &row.category], &row.tags, |f, v| match f {
+        Field::Database => contains(shown, v) || contains(&row.source_name, v),
+        Field::Author => contains(&row.author, v),
+        Field::Category => row.taxa.iter().any(|(c, _)| contains(c, v)),
+        Field::Subcategory => row.taxa.iter().any(|(_, s)| contains(s, v)),
+        Field::DatabaseCategory => contains(&row.category, v),
+        Field::License => contains(&row.license, v),
+        Field::FileType => syntax::file_type_matches(v, row.svg_key.is_some()),
+        Field::Tags => row.tags.iter().any(|t| contains(t, v)),
+        Field::Id => row.id.eq_ignore_ascii_case(v),
+    });
     let authors = f.authors();
     let tags = f.tags();
     let taxa = f.catalog().taxa;
@@ -3066,6 +3126,21 @@ fn local_facets(rows: &[AssetRow], q: &str, f: &SearchFilter) -> Facets {
 pub struct EditLayer {
     pub name: String,
     pub style: LayerStyle,
+    /// Ticked to be merged (only in the upload dialog).
+    pub picked: bool,
+    /// Crossed out in the upload dialog: not kept as a layer, so its colour stays as drawn.
+    pub removed: bool,
+}
+
+impl EditLayer {
+    pub fn new(name: String, colors: Vec<[u8; 3]>) -> Self {
+        Self { name, style: LayerStyle { colors, color: None, opacity: 1.0 }, picked: false, removed: false }
+    }
+}
+
+/// How many of the layers are kept (not crossed out).
+pub fn kept(rows: &[EditLayer]) -> usize {
+    rows.iter().filter(|r| !r.removed).count()
 }
 
 /// The catalog's named layers with their colours read, leaving out any with none.
@@ -3087,46 +3162,290 @@ pub fn color_layers(colors: &[[u8; 3]]) -> Vec<(String, Vec<[u8; 3]>)> {
     colors.iter().take(MAX_COLOR_LAYERS).enumerate().map(|(i, c)| (format!("Layer {}", i + 1), vec![*c])).collect()
 }
 
-/// One row per layer, as the Layers editor and the library dialog show them: `Name:` (a text
-/// box with `edit_names`), a colour box, the opacity and an eye, and a button back to its own
-/// colour once it is restyled. Whether a style changed (not a name).
-pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut [EditLayer], edit_names: bool) -> bool {
+/// The layers an upload starts with: `named` (the catalog's, when it names two or more) or none,
+/// then every colour of the drawing they leave out as a layer of its own, Layer n. Not capped at
+/// [`MAX_COLOR_LAYERS`] like the layers a drawing nobody named offers: the contributor merges
+/// them into the parts they belong to, and no colour is left unrestylable.
+pub fn upload_layers(named: Vec<(String, Vec<[u8; 3]>)>, colors: &[[u8; 3]]) -> Vec<(String, Vec<[u8; 3]>)> {
+    let mut layers = if named.len() >= 2 { named } else { Vec::new() };
+    for c in colors {
+        if !layers.iter().any(|(_, l)| l.contains(c)) {
+            layers.push((format!("Layer {}", layers.len() + 1), vec![*c]));
+        }
+    }
+    if layers.len() < 2 { Vec::new() } else { layers }
+}
+
+/// Layers whose colours look at least this alike (CIE76 ΔE; about 2.3 is just noticeable) are
+/// offered to [`merge_similar`].
+const SIMILAR_DELTA_E: f32 = 10.0;
+
+/// A colour in CIELAB (D65).
+fn lab(c: [u8; 3]) -> [f32; 3] {
+    let lin = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    let (r, g, b) = (lin(c[0]), lin(c[1]), lin(c[2]));
+    let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+    let f = |t: f32| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// How different two colours look (CIE76 ΔE).
+fn delta_e(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let (a, b) = (lab(a), lab(b));
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+/// Whether two layers hold the same colours, in any order.
+pub fn same_colors(a: &[[u8; 3]], b: &[[u8; 3]]) -> bool {
+    a.len() == b.len() && a.iter().all(|c| b.contains(c))
+}
+
+/// Whether a layer still has the name it was given (Layer n), not one the contributor typed.
+fn numbered(name: &str) -> bool {
+    name.strip_prefix("Layer ").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Name the kept layers still called Layer n after their place among them, once merging,
+/// splitting or crossing out moved them.
+fn renumber(rows: &mut [EditLayer]) {
+    for (i, r) in rows.iter_mut().filter(|r| !r.removed).enumerate() {
+        if numbered(&r.name) {
+            r.name = format!("Layer {}", i + 1);
+        }
+    }
+}
+
+/// Merge the picked layers into the first of them, which keeps its name and look and takes all
+/// their colours.
+pub fn merge_picked(rows: &mut Vec<EditLayer>) {
+    let picked: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].picked && !rows[i].removed).collect();
+    if let [first, rest @ ..] = picked.as_slice() {
+        for &i in rest.iter().rev() {
+            let r = rows.remove(i);
+            rows[*first].style.colors.extend(r.style.colors);
+        }
+    }
+    rows.iter_mut().for_each(|r| r.picked = false);
+    renumber(rows);
+}
+
+/// Pairs of layers that look alike (by their most used colours), each the later into the earlier.
+fn similar(rows: &[EditLayer]) -> Vec<(usize, usize)> {
+    let mut into: Vec<(usize, usize)> = Vec::new();
+    for i in (1..rows.len()).filter(|&i| !rows[i].removed) {
+        // Into an earlier kept layer that is not itself merged away.
+        let target = (0..i)
+            .filter(|&j| !rows[j].removed && !into.iter().any(|&(k, _)| k == j))
+            .find(|&j| delta_e(rows[j].style.colors[0], rows[i].style.colors[0]) < SIMILAR_DELTA_E);
+        if let Some(j) = target {
+            into.push((i, j));
+        }
+    }
+    into
+}
+
+/// Merge every layer into an earlier one that looks alike. Whether any was.
+pub fn merge_similar(rows: &mut Vec<EditLayer>) -> bool {
+    let into = similar(rows);
+    for &(i, j) in into.iter().rev() {
+        let r = rows.remove(i);
+        rows[j].style.colors.extend(r.style.colors);
+    }
+    renumber(rows);
+    !into.is_empty()
+}
+
+/// Split a layer into one per colour, after it; the first keeps its name and look.
+pub fn split_layer(rows: &mut Vec<EditLayer>, i: usize) {
+    let rest = rows[i].style.colors.split_off(1);
+    let name = rows[i].name.clone();
+    for (k, c) in rest.into_iter().enumerate() {
+        let name = if numbered(&name) { "Layer 0".to_string() } else { format!("{name} {}", k + 2) };
+        rows.insert(i + 1 + k, EditLayer::new(name, vec![c]));
+    }
+    renumber(rows);
+}
+
+/// Split every layer of several colours into one per colour.
+pub fn unmerge_all(rows: &mut Vec<EditLayer>) {
+    for i in (0..rows.len()).rev() {
+        if rows[i].style.colors.len() > 1 {
+            split_layer(rows, i);
+        }
+    }
+}
+
+/// Cross a layer out (or bring it back): one crossed out keeps its own colour and is not kept.
+pub fn remove_layer(rows: &mut [EditLayer], i: usize, removed: bool) {
+    let r = &mut rows[i];
+    r.removed = removed;
+    r.picked = false;
+    r.style.color = None;
+    r.style.opacity = 1.0;
+    renumber(rows);
+}
+
+/// Whether the layers are as the upload dialog started them.
+fn as_started(rows: &[EditLayer], start: &[(String, Vec<[u8; 3]>)]) -> bool {
+    rows.len() == start.len() && rows.iter().zip(start).all(|(r, (name, colors))| !r.removed && r.style.is_plain() && &r.name == name && &r.style.colors == colors)
+}
+
+/// Most stripes a layer of several colours shows on its colour box.
+const MAX_STRIPES: usize = 8;
+
+/// One row per layer, as the Layers editor and the library dialog show them: `Name:`, a colour
+/// box (striped with each of its colours while a layer of several is not recoloured), the
+/// opacity and an eye, and a button back to its own colour once it is restyled. Whether a style
+/// changed (not a name).
+///
+/// `upload` (the layers the upload dialog started with) makes it the dialog's editor: the names
+/// are text boxes, a box to tick layers to merge starts each row, and one at its end splits a
+/// layer of several colours, or else crosses it out (or brings it back); above, the buttons to
+/// merge, and below them, to unmerge all and to start over.
+pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, upload: Option<&[(String, Vec<[u8; 3]>)]>) -> bool {
+    let edit = upload.is_some();
     let mut changed = false;
-    egui::Grid::new(id_salt).num_columns(5).spacing([6.0, 4.0]).show(ui, |ui| {
-        for row in rows.iter_mut() {
+    if let Some(start) = upload {
+        let picked = rows.iter().filter(|r| r.picked && !r.removed).count();
+        let alike = similar(rows).len();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(picked >= 2, egui::Button::new(format!("{} Merge", ph::ARROWS_MERGE)).small())
+                .on_hover_text("Merge the ticked layers into one, so recoloring it recolors all of them")
+                .on_disabled_hover_text("Tick two or more layers to merge them")
+                .clicked()
+            {
+                merge_picked(rows);
+                changed = true;
+            }
+            if alike > 0
+                && ui.add(egui::Button::new(format!("Merge similar colors ({alike})")).small())
+                    .on_hover_text("Merge each layer into an earlier one of nearly the same color")
+                    .clicked()
+            {
+                merge_similar(rows);
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            let merged = rows.iter().any(|r| r.style.colors.len() > 1);
+            if ui.add_enabled(merged, egui::Button::new(format!("{} Unmerge all", ph::ARROWS_SPLIT)).small())
+                .on_hover_text("Split every merged layer into one layer per color")
+                .clicked()
+            {
+                unmerge_all(rows);
+                changed = true;
+            }
+            if ui.add_enabled(!as_started(rows, start), egui::Button::new(format!("{} Reset all", ph::ARROW_COUNTER_CLOCKWISE)).small())
+                .on_hover_text("Every layer back as it was: unmerged, none crossed out, the names and colors it started with")
+                .clicked()
+            {
+                *rows = start.iter().map(|(name, colors)| EditLayer::new(name.clone(), colors.clone())).collect();
+                changed = true;
+            }
+        });
+    }
+    // What a row's last button asks for: split it, or cross it out (true) or bring it back.
+    let (mut split, mut remove) = (None, None);
+    egui::Grid::new(id_salt).num_columns(if edit { 7 } else { 5 }).spacing([6.0, 4.0]).show(ui, |ui| {
+        for (i, row) in rows.iter_mut().enumerate() {
             let style = &mut row.style;
             let before = style.clone();
-            if edit_names {
+            let live = !row.removed;
+            if edit {
+                ui.add_enabled(live, egui::Checkbox::new(&mut row.picked, ""))
+                    .on_hover_text("Tick two or more to merge them into one layer")
+                    .on_disabled_hover_text("Crossed out");
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    ui.add(egui::TextEdit::singleline(&mut row.name).char_limit(40).desired_width(110.0));
+                    if live {
+                        ui.add(egui::TextEdit::singleline(&mut row.name).char_limit(40).desired_width(110.0));
+                    } else {
+                        let size = egui::vec2(110.0, ui.spacing().interact_size.y);
+                        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.set_min_size(size);
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&row.name).strikethrough().color(theme::text_dim()));
+                        });
+                    }
                     ui.label(":");
                 });
             } else {
                 ui.label(format!("{}:", row.name));
             }
-            let mut rgb = style.color.unwrap_or(style.colors[0]);
-            if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Color").changed() {
-                style.color = Some(rgb);
-            }
-            let mut op = style.opacity * 100.0;
-            if ui.add(egui::DragValue::new(&mut op).speed(1.0).range(0.0..=100.0).suffix("%")).on_hover_text("Opacity").changed() {
-                style.opacity = op / 100.0;
-            }
-            let hidden = style.opacity <= 0.0;
-            if ui.small_button(if hidden { ph::EYE_SLASH } else { ph::EYE }).on_hover_text(if hidden { "Show" } else { "Hide" }).clicked() {
-                style.opacity = if hidden { 1.0 } else { 0.0 };
-            }
+            ui.add_enabled_ui(live, |ui| {
+                let mut rgb = style.color.unwrap_or(style.colors[0]);
+                let several = style.colors.len() > 1;
+                let hover = if several {
+                    let hex: Vec<String> = style.colors.iter().map(|c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect();
+                    format!("Color (one for all {} of this layer's colors: {})", style.colors.len(), hex.join(", "))
+                } else {
+                    "Color".to_string()
+                };
+                let swatch = ui.color_edit_button_srgb(&mut rgb);
+                if several && style.color.is_none() && ui.is_rect_visible(swatch.rect) {
+                    // Inside the button's 1 px border, as egui fills it.
+                    let inner = swatch.rect.shrink(1.0);
+                    let shown = &style.colors[..style.colors.len().min(MAX_STRIPES)];
+                    let w = inner.width() / shown.len() as f32;
+                    for (k, c) in shown.iter().enumerate() {
+                        let x = inner.left() + w * k as f32;
+                        let r = egui::Rect::from_min_max(egui::pos2(x, inner.top()), egui::pos2(x + w, inner.bottom()));
+                        ui.painter().rect_filled(r, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
+                    }
+                }
+                if swatch.on_hover_text(hover).on_disabled_hover_text("Crossed out: its color stays as drawn").changed() {
+                    style.color = Some(rgb);
+                }
+            });
+            ui.add_enabled_ui(live, |ui| {
+                let mut op = style.opacity * 100.0;
+                if ui.add(egui::DragValue::new(&mut op).speed(1.0).range(0.0..=100.0).suffix("%")).on_hover_text("Opacity").changed() {
+                    style.opacity = op / 100.0;
+                }
+            });
+            ui.add_enabled_ui(live, |ui| {
+                let hidden = style.opacity <= 0.0;
+                if ui.small_button(if hidden { ph::EYE_SLASH } else { ph::EYE }).on_hover_text(if hidden { "Show" } else { "Hide" }).clicked() {
+                    style.opacity = if hidden { 1.0 } else { 0.0 };
+                }
+            });
             if before.is_plain() {
                 ui.label("");
             } else if ui.small_button(ph::ARROW_COUNTER_CLOCKWISE).on_hover_text("Its own color").clicked() {
                 style.color = None;
                 style.opacity = 1.0;
             }
+            if edit {
+                if !live {
+                    if ui.small_button(ph::ARROW_U_UP_LEFT).on_hover_text("Bring it back as a layer").clicked() {
+                        remove = Some((i, false));
+                    }
+                } else if style.colors.len() > 1 {
+                    if ui.small_button(ph::ARROWS_SPLIT).on_hover_text("Split into one layer per color (a merged layer is split before it can be crossed out)").clicked() {
+                        split = Some(i);
+                    }
+                } else if ui.small_button(ph::X).on_hover_text("Cross it out: not a layer, so its color stays as drawn").clicked() {
+                    remove = Some((i, true));
+                }
+            }
             ui.end_row();
             changed |= *style != before;
         }
     });
+    if let Some(i) = split {
+        split_layer(rows, i);
+        changed = true;
+    }
+    if let Some((i, removed)) = remove {
+        remove_layer(rows, i, removed);
+        changed = true;
+    }
     changed
 }
 
@@ -3200,5 +3519,97 @@ mod tests {
         assert_eq!(t, "Gene\n\nProtein");
         assert_eq!(parse_hex("#ff8000"), Some([255, 128, 0]));
         assert_eq!(parse_hex("#ff80"), None);
+    }
+
+    fn rows(colors: &[[u8; 3]]) -> Vec<EditLayer> {
+        color_layers(colors).into_iter().map(|(n, c)| EditLayer::new(n, c)).collect()
+    }
+
+    fn names(rows: &[EditLayer]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn uploads_leave_no_color_out() {
+        // Every colour its own layer, past the eight a drawing nobody named offers.
+        let colors: Vec<[u8; 3]> = (0..10u8).map(|i| [i * 25, 0, 255 - i * 25]).collect();
+        let layers = upload_layers(Vec::new(), &colors);
+        assert_eq!(layers.len(), 10);
+        assert_eq!(layers[9], ("Layer 10".to_string(), vec![[225, 0, 30]]));
+        // A catalog's named layers are kept, and a colour they missed added after them.
+        let named = vec![("Ink".to_string(), vec![[0, 0, 0]]), ("Paper".to_string(), vec![[255, 255, 255], [240, 240, 240]])];
+        let layers = upload_layers(named, &[[0, 0, 0], [255, 255, 255], [240, 240, 240], [9, 9, 200]]);
+        assert_eq!(layers.iter().map(|l| l.0.as_str()).collect::<Vec<_>>(), ["Ink", "Paper", "Layer 3"]);
+        // One colour: no layers.
+        assert!(upload_layers(Vec::new(), &[[1, 2, 3]]).is_empty());
+    }
+
+    #[test]
+    fn layers_merge_and_split() {
+        let mut r = rows(&[[0, 136, 255], [255, 0, 0], [255, 102, 0], [27, 31, 46]]);
+        r[1].name = "Blood".into();
+        r[1].picked = true;
+        r[3].picked = true;
+        merge_picked(&mut r);
+        assert_eq!(names(&r), ["Layer 1", "Blood", "Layer 3"]);
+        assert_eq!(r[1].style.colors, vec![[255, 0, 0], [27, 31, 46]]);
+        assert!(r.iter().all(|r| !r.picked));
+        split_layer(&mut r, 1);
+        assert_eq!(names(&r), ["Layer 1", "Blood", "Blood 2", "Layer 4"]);
+        assert_eq!(r[2].style.colors, vec![[27, 31, 46]]);
+        // A numbered layer's parts are numbered too.
+        r[0].style.colors.push([1, 2, 3]);
+        split_layer(&mut r, 0);
+        assert_eq!(names(&r), ["Layer 1", "Layer 2", "Blood", "Blood 2", "Layer 5"]);
+    }
+
+    #[test]
+    fn similar_colors_merge() {
+        // The near-blacks and the near-whites, not the light grey-blue or the bright colours.
+        let mut r = rows(&[[0, 136, 255], [255, 0, 0], [255, 102, 0], [27, 31, 46], [10, 18, 38], [255, 255, 255], [241, 243, 248], [203, 213, 225]]);
+        assert!(merge_similar(&mut r));
+        assert_eq!(r.len(), 6);
+        assert_eq!(r[3].style.colors, vec![[27, 31, 46], [10, 18, 38]]);
+        assert_eq!(r[4].style.colors, vec![[255, 255, 255], [241, 243, 248]]);
+        assert_eq!(names(&r), ["Layer 1", "Layer 2", "Layer 3", "Layer 4", "Layer 5", "Layer 6"]);
+        assert!(!merge_similar(&mut r));
+        assert!(same_colors(&[[1, 1, 1], [2, 2, 2]], &[[2, 2, 2], [1, 1, 1]]));
+        assert!(!same_colors(&[[1, 1, 1]], &[[1, 1, 1], [2, 2, 2]]));
+    }
+
+    #[test]
+    fn layers_cross_out_and_unmerge() {
+        let mut r = rows(&[[0, 136, 255], [255, 0, 0], [255, 102, 0], [27, 31, 46]]);
+        r[1].style.color = Some([1, 2, 3]);
+        remove_layer(&mut r, 1, true);
+        // Its colour as drawn, and the numbered layers after it one lower.
+        assert!(r[1].style.is_plain());
+        assert_eq!(names(&r), ["Layer 1", "Layer 2", "Layer 2", "Layer 3"]);
+        assert_eq!(kept(&r), 3);
+        // Crossed out: not merged, nor merged into.
+        r[1].picked = true;
+        r[2].picked = true;
+        merge_picked(&mut r);
+        assert_eq!(r.len(), 4);
+        remove_layer(&mut r, 1, false);
+        assert_eq!(names(&r), ["Layer 1", "Layer 2", "Layer 3", "Layer 4"]);
+        // Unmerge all splits every merged layer back.
+        r[0].picked = true;
+        r[3].picked = true;
+        merge_picked(&mut r);
+        r[1].picked = true;
+        r[2].picked = true;
+        merge_picked(&mut r);
+        assert_eq!(r.len(), 2);
+        unmerge_all(&mut r);
+        assert_eq!(r.iter().map(|r| r.style.colors.len()).collect::<Vec<_>>(), [1, 1, 1, 1]);
+        assert_eq!(names(&r), ["Layer 1", "Layer 2", "Layer 3", "Layer 4"]);
+    }
+
+    #[test]
+    fn crossed_out_layers_are_not_similar() {
+        let mut r = rows(&[[255, 255, 255], [241, 243, 248], [0, 0, 0]]);
+        remove_layer(&mut r, 1, true);
+        assert!(!merge_similar(&mut r));
     }
 }

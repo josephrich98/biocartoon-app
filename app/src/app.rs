@@ -699,6 +699,8 @@ pub struct UploadDialog {
     /// An SVG's layers, named by the contributor (Layer 1, 2... until then); their colour and
     /// opacity only restyle the preview.
     pub layers: Vec<crate::panels::EditLayer>,
+    /// The layers as the dialog opened, for Reset all.
+    pub layers_start: Vec<(String, Vec<[u8; 3]>)>,
     pub license: &'static str,
     /// The contributor checked "No generative AI was used to create this asset" (unchecked by
     /// default; kept through a batch, like the license).
@@ -1122,6 +1124,8 @@ pub struct BioCartoon {
     /// The "Save as picture" dialog, which picks the file type, is open.
     pub show_save_picture: bool,
     pub export_job: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// The running export's progress, and when it started (for the time left).
+    export_progress: Option<(std::sync::Arc<crate::export::Progress>, f64)>,
     /// The export dialog's last file size, with the options it was worked out for.
     export_size: Option<(ExportOptions, Result<crate::export::SizeEstimate, String>)>,
     export_size_rx: Option<std::sync::mpsc::Receiver<(ExportOptions, Result<crate::export::SizeEstimate, String>)>>,
@@ -1325,6 +1329,7 @@ impl BioCartoon {
             show_export: false,
             show_save_picture: false,
             export_job: None,
+            export_progress: None,
             export_size: None,
             export_size_rx: None,
             variants: Vec::new(),
@@ -2780,17 +2785,17 @@ impl BioCartoon {
             UploadTarget::Template(_) => None,
         };
         let svg = svg_text.is_some();
-        let layers = match svg_text.as_deref().map(|t| crate::export::Vector::parse(t.as_bytes())) {
+        let layers_start = match svg_text.as_deref().map(|t| crate::export::Vector::parse(t.as_bytes())) {
             Some(Ok(vector)) => {
                 let named = match &target {
                     UploadTarget::Library(row) => crate::panels::named_layers(&row.layers),
                     _ => Vec::new(),
                 };
-                let offered = if named.len() >= 2 { named } else { crate::panels::color_layers(vector.colors()) };
-                offered.into_iter().map(|(name, colors)| crate::panels::EditLayer { name, style: LayerStyle { colors, color: None, opacity: 1.0 } }).collect()
+                crate::panels::upload_layers(named, vector.colors())
             }
             _ => Vec::new(),
         };
+        let layers = layers_start.iter().map(|(name, colors)| crate::panels::EditLayer::new(name.clone(), colors.clone())).collect();
         // A raster image is read now, so its size can be shown, and made smaller if its PNG
         // would be over the limit, before it is added.
         let read = match (&target, svg) {
@@ -2818,6 +2823,7 @@ impl BioCartoon {
             description,
             tags,
             layers,
+            layers_start,
             license,
             no_ai,
             ai_made,
@@ -2938,10 +2944,17 @@ impl BioCartoon {
             return;
         }
         let credit: String = d.credit.trim().chars().take(60).collect();
-        // Layers keep their names (Layer n when left blank), not the preview's restyling.
+        if crate::panels::kept(&d.layers) > crate::panels::MAX_LAYERS {
+            self.toast_err(format!("Too many layers (max {}). Please merge or remove some.", crate::panels::MAX_LAYERS));
+            self.upload_dialog = Some(d);
+            return;
+        }
+        // Layers keep their names (Layer n when left blank), not the preview's restyling; those
+        // crossed out are not kept.
         let layers: Vec<crate::catalog::AssetLayer> = d
             .layers
             .iter()
+            .filter(|l| !l.removed)
             .enumerate()
             .map(|(i, l)| {
                 let name: String = l.name.trim().chars().take(40).collect();
@@ -3970,10 +3983,10 @@ impl BioCartoon {
             return self.toast_err(format!("email: {e}"));
         }
         let png = dir.join(format!("{slug}.png"));
-        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: false, jpg_quality: 90 };
+        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: false, pdf_raster: false, jpg_quality: 90 };
         self.pending_email = Some((doc.title.clone(), vec![png.clone(), file]));
         let job = self.export_job_for(&doc, &[0], png, opts);
-        self.export_job = Some(crate::export::start(ctx.clone(), job));
+        self.launch_export(ctx, job);
         self.toast("Preparing email...");
     }
 
@@ -4076,8 +4089,7 @@ impl BioCartoon {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| Self::slugify(&doc.title));
         self.export_credits = (!credits.is_empty()).then_some((credits, stem, self.settings.export.all_slides));
         let job = self.export_job_for(&doc, &slides, path, self.settings.export.clone());
-        self.export_job = Some(crate::export::start(ctx.clone(), job));
-        self.toast("Exporting...");
+        self.launch_export(ctx, job);
     }
 
     /// "Save as picture": pick a file type (the last one picked to start with), then save.
@@ -4146,8 +4158,7 @@ impl BioCartoon {
         let opts = ExportOptions { format, dpi: self.settings.picture_dpi, transparent: true, jpg_quality: self.settings.export.jpg_quality, ..Default::default() };
         let mut job = self.export_job_for(&doc, &[0], path, opts);
         job.page = region;
-        self.export_job = Some(crate::export::start(ctx.clone(), job));
-        self.toast("Saving...");
+        self.launch_export(ctx, job);
     }
 
     /// `slides` are 0-based indices into `doc.slides`.
@@ -4167,7 +4178,12 @@ impl BioCartoon {
                 }
             }
         }
-        crate::export::ExportJob { path, opts, slides, page: doc.page_rect(), background: doc.background, requests, fallbacks, downloads: HashMap::new() }
+        crate::export::ExportJob { path, opts, slides, page: doc.page_rect(), background: doc.background, requests, fallbacks, downloads: HashMap::new(), progress: Default::default() }
+    }
+
+    fn launch_export(&mut self, ctx: &egui::Context, job: crate::export::ExportJob) {
+        self.export_progress = Some((job.progress.clone(), ctx.input(|i| i.time)));
+        self.export_job = Some(crate::export::start(ctx.clone(), job));
     }
 
     fn poll_export(&mut self, ctx: &egui::Context) {
@@ -4175,6 +4191,7 @@ impl BioCartoon {
         match rx.try_recv() {
             Ok(res) => {
                 self.export_job = None;
+                self.export_progress = None;
                 let credits = self.export_credits.take();
                 if let Some((subject, files)) = self.pending_email.take() {
                     // Without the PNG, still send the project file.
@@ -4200,6 +4217,7 @@ impl BioCartoon {
             Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.export_job = None;
+                self.export_progress = None;
                 self.pending_email = None;
                 self.export_credits = None;
                 self.toast_err("export failed");
@@ -4305,7 +4323,7 @@ impl BioCartoon {
                     }
 
                     ui.label("Resolution (dpi)");
-                    ui.add_enabled_ui(opts.format.is_raster(), |ui| {
+                    ui.add_enabled_ui(opts.format.is_raster() || (opts.format == ExportFormat::Pdf && opts.pdf_raster), |ui| {
                         ui.horizontal(|ui| dpi_picker(ui, &mut opts.dpi, egui::Id::new("export_custom_dpi")));
                     });
                     ui.end_row();
@@ -4339,8 +4357,9 @@ impl BioCartoon {
                     ui.end_row();
 
                     if !opts.format.is_raster() {
+                        let note = if opts.format == ExportFormat::Pdf && opts.pdf_raster { "Vector text and shapes; images at the resolution above." } else { "Vector output: scales to any size." };
                         ui.label("");
-                        ui.label(egui::RichText::new("Vector output: scales to any size.").color(theme::text_dim()));
+                        ui.label(egui::RichText::new(note).color(theme::text_dim()));
                         ui.end_row();
                     }
 
@@ -4360,6 +4379,10 @@ impl BioCartoon {
                 ui.add_space(6.0);
                 if opts.format == ExportFormat::Png {
                     ui.checkbox(&mut opts.transparent, "Transparent background");
+                }
+                if opts.format == ExportFormat::Pdf {
+                    ui.checkbox(&mut opts.pdf_raster, "Rasterize images (reduce file size)")
+                        .on_hover_text("Draw each image at the resolution above instead of embedding it as it is. Detailed vector drawings and large photos make big PDFs; text and shapes stay vector.");
                 }
                 if !project_file {
                     ui.add_enabled_ui(n_images > 0 && !opts.individual, |ui| {
@@ -5218,6 +5241,7 @@ impl BioCartoon {
                 self.export_window(&ctx);
             }
             self.settings_windows(&ctx);
+            self.export_progress_ui(&ctx);
             self.toasts_ui(&ctx);
             self.run_actions(&ctx);
             return;
@@ -5268,6 +5292,7 @@ impl BioCartoon {
         self.windows(&ctx);
         self.home_windows_in_editor(&ctx);
         self.leave_prompt_ui(&ctx);
+        self.export_progress_ui(&ctx);
         self.toasts_ui(&ctx);
         self.run_actions(&ctx);
     }
@@ -5406,6 +5431,17 @@ impl BioCartoon {
             let w = fixed + if slider { slider_w + sp } else { 0.0 };
             let x = ui.ctx().content_rect().center().x.clamp(lo + w / 2.0, (hi - w / 2.0).max(lo + w / 2.0));
             let zoom = ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), Rect::from_center_size(Pos2::new(x, full.center().y), Vec2::new(w, full.height()))), |ui| {
+                // The current slide's page colour, edited like the one in the Page panel (one undo
+                // step per burst of edits).
+                let mut col = self.doc.background_of(self.slide());
+                if crate::color::edit_button(ui, &mut col).on_hover_text("Page color").changed() {
+                    let before = (self.doc.width, self.doc.height, self.doc.unit, self.slide().background);
+                    if self.page.last_edit != Some(before) { self.commit(); }
+                    self.slide_mut().background = Some(col);
+                    self.page.last_edit = Some((self.doc.width, self.doc.height, self.doc.unit, Some(col)));
+                    self.dirty = true;
+                }
+                ui.add_space(4.0);
                 if ui.add(egui::Button::new(ph::MINUS).frame(false)).on_hover_text("Zoom out (Cmd+-)").clicked() { self.actions.push(Action::ZoomTo(self.view.zoom / 1.2)); }
                 if slider {
                     ui.spacing_mut().slider_width = slider_w;
@@ -5421,6 +5457,40 @@ impl BioCartoon {
                 ui.ctx().data_mut(|d| d.insert_temp(width_id, used));
                 ui.ctx().request_repaint();
             }
+        });
+    }
+
+    /// While an export runs, a card above the toasts: a bar with the time left once more than one
+    /// file is being written (each takes about as long), otherwise a spinner and the time so far.
+    fn export_progress_ui(&self, ctx: &egui::Context) {
+        let Some((progress, started)) = &self.export_progress else { return };
+        // The email preview is quick and has its own flow.
+        if self.pending_email.is_some() {
+            return;
+        }
+        let elapsed = ctx.input(|i| i.time) - started;
+        // Quick exports finish without flashing a bar.
+        if elapsed < 0.4 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        let (done, total) = progress.get();
+        let secs = |s: f64| if s < 60.0 { format!("{:.0} s", s.max(1.0)) } else { format!("{}:{:02} min", s as u64 / 60, s as u64 % 60) };
+        egui::Area::new(egui::Id::new("export_progress")).anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -96.0)).order(egui::Order::Tooltip).interactable(false).show(ctx, |ui| {
+            egui::Frame::new().fill(theme::toast()).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 8)).stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
+                if total > 1 {
+                    let frac = done as f32 / total as f32;
+                    let left = if done == 0 { "estimating time left".to_string() } else { format!("about {} left", secs(elapsed * (total - done) as f64 / done as f64)) };
+                    ui.label(format!("Exporting {} of {total} · {left}", (done + 1).min(total)));
+                    ui.add(egui::ProgressBar::new(frac).desired_width(280.0).show_percentage());
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Exporting... {}", secs(elapsed)));
+                    });
+                }
+            });
         });
     }
 
@@ -5825,10 +5895,17 @@ impl BioCartoon {
                 ui.add(egui::TextEdit::singleline(&mut d.tags).hint_text("optional, commas between").desired_width(w))
                     .on_hover_text(format!("Words to find it by in search, up to {} (each up to {} characters)", crate::catalog::MAX_TAGS, crate::catalog::MAX_TAG_CHARS));
                 let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
-                if d.layers.len() >= 2 {
-                    field(ui, "Layers");
-                    crate::panels::layer_grid(ui, "upload_layers", &mut d.layers, true);
-                    ui.label(dim("Name the parts of the drawing so they are easy to find when restyling it. Color and opacity here only preview each layer; they aren't saved."));
+                if d.layers.iter().map(|l| l.style.colors.len()).sum::<usize>() >= 2 {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Layers");
+                        ui.label(dim(&format!("maximum {}", crate::panels::MAX_LAYERS)));
+                        if crate::panels::kept(&d.layers) > crate::panels::MAX_LAYERS {
+                            ui.colored_label(theme::danger(), format!("{} Too many layers (max {}). Please merge or remove some.", ph::WARNING, crate::panels::MAX_LAYERS));
+                        }
+                    });
+                    crate::panels::layer_grid(ui, "upload_layers", &mut d.layers, Some(&d.layers_start));
+                    ui.label(dim("Name the parts of the drawing so they are easy to find when restyling it, and merge colors that belong to one part. Color and opacity here only preview each layer; they aren't saved."));
                 }
                 // Your library keeps it on this computer: license, credit and contact are for submissions.
                 if d.share {
@@ -5901,11 +5978,15 @@ impl BioCartoon {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let credited = !d.share || d.license != "CC-BY-4.0" || !d.credit.trim().is_empty();
-                    let can = !d.name.trim().is_empty() && credited && (!d.share || can_submit) && (!png || d.png_ok) && (reduced.is_none() || d.reduced_ok) && !over;
+                    let too_many = crate::panels::kept(&d.layers) > crate::panels::MAX_LAYERS;
+                    let can = !d.name.trim().is_empty() && credited && (!d.share || can_submit) && (!png || d.png_ok) && (reduced.is_none() || d.reduced_ok) && !over && !too_many;
                     let label = if d.share { "Submit" } else { "Save" };
                     let b = ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(theme::accent()));
+                    let too_many_why = format!("Too many layers (max {})", crate::panels::MAX_LAYERS);
                     let why = if d.name.trim().is_empty() {
                         "Give it a name first"
+                    } else if too_many {
+                        too_many_why.as_str()
                     } else if !credited {
                         "CC BY needs a name to credit, or choose CC0"
                     } else if d.share && !can_submit {
@@ -6295,8 +6376,8 @@ impl BioCartoon {
                     // AI-edited, and the Attributions window that looks the credits up.
                     "attributions" => {
                         self.show_settings = false;
-                        for (i, (id, title)) in [("scidraw/9e80cff8-4f88-47cf-b1ed-a8840ac13809", "mouse"), ("servier/abdominal-aorta", "Abdominal aorta"), ("bioart/369_638402", "Mouse Brain")].into_iter().enumerate() {
-                            let mut source = ImageSource::Asset { id: id.into(), key: format!("{id}.png"), svg: None, title: title.into(), source: id.split('/').next().unwrap_or_default().into(), credit: String::new(), license: String::new() };
+                        for (i, (id, key, title)) in [("SD016269", "scidraw/9e80cff8-4f88-47cf-b1ed-a8840ac13809", "mouse"), ("SV017042", "servier/abdominal-aorta", "Abdominal aorta"), ("BA001219", "bioart/369_638402", "Mouse Brain")].into_iter().enumerate() {
+                            let mut source = ImageSource::Asset { id: id.into(), key: format!("{key}.png"), svg: None, title: title.into(), source: key.split('/').next().unwrap_or_default().into(), credit: String::new(), license: String::new() };
                             if i == 1 {
                                 source = source.derived(self.app_dir.join("generated").join("missing.png").display().to_string());
                             }

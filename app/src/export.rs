@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +74,7 @@ impl ExportFormat {
 #[serde(default)]
 pub struct ExportOptions {
     pub format: ExportFormat,
-    /// Raster formats only.
+    /// Raster formats, and PDF images when `pdf_raster` is on.
     pub dpi: u32,
     /// PNG only: leave the slide background out.
     pub transparent: bool,
@@ -87,13 +88,17 @@ pub struct ExportOptions {
     pub all_slides: bool,
     /// PDF of several slides: one file with a page per slide, instead of a file per slide.
     pub pdf_pages: bool,
+    /// PDF only: draw image items as pictures at `dpi` instead of as they are. Detailed SVG
+    /// drawings become many thousands of PDF objects, and photos keep their full resolution;
+    /// this makes much smaller files. Text and shapes stay vector.
+    pub pdf_raster: bool,
     /// JPG only: 1 (smallest file) to 100 (best quality).
     pub jpg_quality: u8,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: true, jpg_quality: 90 }
+        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: true, pdf_raster: false, jpg_quality: 90 }
     }
 }
 
@@ -140,6 +145,22 @@ pub struct ExportJob {
     pub fallbacks: HashMap<String, Arc<RgbaImage>>,
     /// Web build: cache key -> the original's bytes, which `start` downloads first.
     pub downloads: HashMap<String, Vec<u8>>,
+    /// How far along the export is, for the progress bar.
+    pub progress: Arc<Progress>,
+}
+
+/// Files written so far out of how many, updated by the worker as it goes. `total` is 0 until the
+/// images are loaded and the file count is known.
+#[derive(Default)]
+pub struct Progress {
+    pub done: AtomicUsize,
+    pub total: AtomicUsize,
+}
+
+impl Progress {
+    pub fn get(&self) -> (usize, usize) {
+        (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed))
+    }
 }
 
 /// Run an export on a worker thread. The receiver yields a status message when it is done.
@@ -276,12 +297,20 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
     }
 
     let transparent = opts.format == ExportFormat::Png && opts.transparent;
+    let raster = (opts.format == ExportFormat::Pdf && opts.pdf_raster).then(|| opts.dpi.clamp(MIN_DPI, MAX_DPI));
     let mut written = Vec::new();
     let multi = job.slides.len() > 1;
     let dir = job.path.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = job.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
     // One PDF with a page per slide: collect the pages, write them after the loop.
     let combine = multi && !opts.individual && opts.format == ExportFormat::Pdf && opts.pdf_pages;
+    let total = if combine {
+        1
+    } else {
+        let count = |s: &Slide| s.items.iter().filter(|it| matches!(it.kind, ItemKind::Image { .. })).count();
+        job.slides.iter().map(|(_, s)| if opts.individual { count(s) } else if opts.crop { (count(s) > 0) as usize } else { 1 }).sum()
+    };
+    job.progress.total.store(total, Ordering::Relaxed);
     let mut pages = Vec::new();
     for (n, slide) in &job.slides {
         let bg = if transparent { None } else { Some(slide.background.unwrap_or(job.background)) };
@@ -290,11 +319,13 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
             let pics: Vec<&Item> = slide.items.iter().filter(|it| matches!(it.kind, ItemKind::Image { .. })).collect();
             for (i, it) in pics.iter().enumerate() {
                 let region = item_bounds(it);
-                let svg = build_svg(ctx, &[it], region, bg, &images);
+                let svg = svg_document(ctx, &[it], region, bg, &images, raster);
                 let name = crate::app::BioCartoon::slugify(&it.name);
                 let path = dir.join(format!("{stem}-{:02}-{name}.{}", i + 1, opts.format.ext()));
                 emit(&svg, region, opts, max_pixels, &path, &crate::credits::for_items(&[it], false), out)?;
                 written.push(path);
+                job.progress.done.fetch_add(1, Ordering::Relaxed);
+                ctx.request_repaint();
             }
         } else {
             // Cropping to images skips the slides that have none.
@@ -307,7 +338,7 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
                 job.page
             };
             let items: Vec<&Item> = slide.items.iter().collect();
-            let svg = build_svg(ctx, &items, region, bg, &images);
+            let svg = svg_document(ctx, &items, region, bg, &images, raster);
             if combine {
                 pages.push(svg);
                 continue;
@@ -315,11 +346,14 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
             let path = if multi { dir.join(format!("{stem}.{}", opts.format.ext())) } else { job.path.clone() };
             emit(&svg, region, opts, max_pixels, &path, &crate::credits::for_items(&items, false), out)?;
             written.push(path);
+            job.progress.done.fetch_add(1, Ordering::Relaxed);
+            ctx.request_repaint();
         }
     }
     if !pages.is_empty() {
         let bytes = pdf_pages(&pages).map_err(|e| format!("{}: {e}", job.path.display()))?;
         out(&job.path, &bytes, 1.0)?;
+        job.progress.done.fetch_add(1, Ordering::Relaxed);
     }
     if written.is_empty() && pages.is_empty() {
         return Err(if multi { "There are no images on these slides" } else { "There are no images on this slide" }.into());
@@ -658,6 +692,32 @@ fn prepared_png(img: &RgbaImage, crop: [f32; 4], overlay: [u8; 4], flip_h: bool,
     Some(buf)
 }
 
+/// Whether rasterising image item `it` at `dpi` would help: always for a vector drawing; for
+/// pixels only when its crop has more of them than the item needs at `dpi`.
+fn should_rasterise(picture: &Picture, it: &Item, crop: [f32; 4], dpi: u32) -> bool {
+    match picture {
+        Picture::Vector(_) => true,
+        Picture::Pixels(img) => {
+            let [w, h] = pixel_size(it.rect(), dpi);
+            let (cw, ch) = ((crop[2] - crop[0]).abs() * img.width() as f32, (crop[3] - crop[1]).abs() * img.height() as f32);
+            cw * ch > w as f32 * h as f32 * 1.1
+        }
+    }
+}
+
+/// Image item `it` drawn on its own at `dpi`, unrotated and opaque (the caller's `<image>` adds
+/// those), as PNG bytes.
+fn rasterised_png(ctx: &egui::Context, it: &Item, images: &HashMap<String, Picture>, dpi: u32) -> Option<Vec<u8>> {
+    let mut flat = it.clone();
+    flat.rotation = 0.0;
+    flat.opacity = 1.0;
+    let svg = build_svg(ctx, &[&flat], it.rect(), None, images);
+    let img = rasterise(&parse(&svg).ok()?, it.rect(), dpi).ok()?;
+    let mut buf = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).ok()?;
+    Some(buf)
+}
+
 /// An image item's picture as export draws it: decoded pixels, or an uploaded SVG kept as
 /// vector shapes.
 pub enum Picture {
@@ -729,6 +789,11 @@ fn vector_image(s: &mut String, vector: &Vector, it: &Item, crop: [f32; 4], over
 }
 
 pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[u8; 4]>, images: &HashMap<String, Picture>) -> String {
+    svg_document(ctx, items, region, bg, images, None)
+}
+
+/// [`build_svg`], with image items drawn as PNGs at `raster` dpi when it is set.
+fn svg_document(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[u8; 4]>, images: &HashMap<String, Picture>, raster: Option<u32>) -> String {
     let mut s = String::new();
     let (w, h) = (region.width(), region.height());
     let _ = writeln!(
@@ -755,15 +820,17 @@ pub fn build_svg(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<
         let c = r.center();
         match &it.kind {
             ItemKind::Image { source, crop, overlay, layers } => {
-                let png = match images.get(&source.cache_key()) {
-                    Some(Picture::Vector(vector)) => {
+                let picture = images.get(&source.cache_key());
+                let png = match (picture, raster) {
+                    (Some(p), Some(dpi)) if should_rasterise(p, it, *crop, dpi) => rasterised_png(ctx, it, images, dpi),
+                    (Some(Picture::Vector(vector)), _) => {
                         clip_id += 1;
                         let restyled = vector.restyled(layers);
                         vector_image(&mut s, restyled.as_ref().unwrap_or(vector), it, *crop, *overlay, &format!("svg{clip_id}"));
                         continue;
                     }
-                    Some(Picture::Pixels(img)) => prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v),
-                    None => None,
+                    (Some(Picture::Pixels(img)), _) => prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v),
+                    (None, _) => None,
                 };
                 let Some(png) = png else { continue };
                 let op_attr = if op < 1.0 { format!(r#" opacity="{}""#, n(op)) } else { String::new() };
@@ -1522,6 +1589,11 @@ mod tests {
         let svg = build_svg(&ctx, &[&cropped, &flipped], region, None, &pics);
         let pdf = svg2pdf::to_pdf(&parse(&svg).unwrap(), svg2pdf::ConversionOptions::default(), svg2pdf::PageOptions { dpi: DPI }).unwrap();
         assert!(!pdf.windows(13).any(|w| w == b"/Subtype /Ima" || w == b"/Subtype/Imag"), "PDF should be vector only");
+
+        // Rasterised for PDF, each becomes one picture at the export's resolution.
+        let svg = svg_document(&ctx, &[&cropped, &flipped], region, None, &pics, Some(150));
+        assert_eq!(svg.matches("data:image/png").count(), 2);
+        assert!(!svg.contains("<svg x="), "no vector drawing left:\n{svg}");
     }
 
     /// A drawing's colours are its layers: found through CSS classes as BioArt paints, most used
@@ -1598,13 +1670,14 @@ mod tests {
         requests.insert(src.cache_key(), Request::Path(icon.clone()));
         let job = |format, dpi, transparent, individual, name: &str| ExportJob {
             path: dir.join(name),
-            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false, pdf_pages: true, jpg_quality: 90 },
+            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false, pdf_pages: true, pdf_raster: false, jpg_quality: 90 },
             slides: vec![(1, slide.clone())],
             page,
             background: [250, 245, 235, 255],
             requests: requests.clone(),
             fallbacks: HashMap::new(),
             downloads: HashMap::new(),
+            progress: Default::default(),
         };
         for (f, name) in [(ExportFormat::Png, "slide.png"), (ExportFormat::Jpg, "slide.jpg"), (ExportFormat::Tif, "slide.tif"), (ExportFormat::Pdf, "slide.pdf"), (ExportFormat::Svg, "slide.svg")] {
             run(&ctx, job(f, 150, false, false, name)).unwrap();

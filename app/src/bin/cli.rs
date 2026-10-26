@@ -34,7 +34,7 @@ EDITOR (the desktop app must be running)
   app <cmd> [json]          send a command, e.g.
                               app state
                               app move_items '{{\"ids\":[3],\"dx\":48}}'
-                              app insert_asset '{{\"asset\":\"bioart/424_633918\",\"x\":200,\"width\":300}}'
+                              app insert_asset '{{\"asset\":\"BA001506\",\"x\":200,\"width\":300}}'
                               app align '{{\"kind\":\"left\",\"ids\":[1,2]}}'
                               app render '{{\"path\":\"slide.png\"}}'
                             commands: state get_item slides go_slide add_slide new_document set_page

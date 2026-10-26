@@ -102,7 +102,7 @@ fn style_props() -> Map<String, Value> {
 /// The editor's own tools (templates and canvas), without the catalog's.
 fn editor_tools() -> Vec<Value> {
     let mut insert_asset = obj(json!({
-        "id": str_prop("Catalog asset id (from search_assets), e.g. bioart/424_633913."),
+        "id": str_prop("Catalog asset id (from search_assets), e.g. BA001505."),
         "replace_item": int_prop("Swap this existing image item's picture for the asset instead of adding a new item."),
     }));
     insert_asset.extend(style_props());
