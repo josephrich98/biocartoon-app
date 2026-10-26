@@ -409,10 +409,10 @@ impl BioCartoon {
         let local = self.home.projects.len();
         let pending = self.account.pending(&self.home.projects);
         let (icon, color, tip) = match &self.account.saved {
-            None => (ph::USER_CIRCLE, theme::text(), "Account (optional): keep your projects online".to_string()),
+            None => (ph::USER_CIRCLE, theme::text(), "Account (optional): keep your projects and library online".to_string()),
             Some(_) if self.account.error.is_some() => (ph::CLOUD_WARNING, Color32::from_rgb(0xe0, 0x8a, 0x1e), "Account: there was a problem saving online".to_string()),
-            Some(_) if pending > 0 => (ph::CLOUD_ARROW_UP, theme::text(), format!("Account: saving {pending} project{} online", if pending == 1 { "" } else { "s" })),
-            Some(_) => (ph::CLOUD_CHECK, theme::accent(), "Account: every project is saved online".to_string()),
+            Some(_) if pending > 0 => (ph::CLOUD_ARROW_UP, theme::text(), format!("Account: saving {pending} change{} online", if pending == 1 { "" } else { "s" })),
+            Some(_) => (ph::CLOUD_CHECK, theme::accent(), "Account: every project and your library are saved online".to_string()),
         };
         let btn = match &self.account.saved {
             None => {
@@ -432,9 +432,9 @@ impl BioCartoon {
             let dim = |t: &str| egui::RichText::new(t).color(theme::text_dim());
             match &self.account.saved {
                 None => {
-                    ui.label(egui::RichText::new("Keep your projects online").strong().size(sz(15.0)));
+                    ui.label(egui::RichText::new("Keep your projects and library online").strong().size(sz(15.0)));
                     ui.add_space(4.0);
-                    ui.label(dim("Optional. Sign in, and a copy of every project is kept on the BioCartoon server, so it is safe even if this browser clears its data, and comes back wherever you sign in."));
+                    ui.label(dim("Optional. Sign in, and a copy of every project and of Your library (your own icons, saved templates and favorites) is kept on the BioCartoon server, so it is safe even if this browser clears its data, and comes back wherever you sign in."));
                     ui.add_space(8.0);
                     if ui.add(egui::Button::new(format!("{}  Sign in with Google", ph::GOOGLE_LOGO)).min_size(Vec2::new(0.0, 30.0))).clicked() {
                         cmd = Some("google");
@@ -444,7 +444,7 @@ impl BioCartoon {
                     }
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(dim("Only your name, email and projects are stored. You can delete them any time.").size(sz(12.0)));
+                        ui.label(dim("Only your name, email, projects and library are stored. You can delete them any time.").size(sz(12.0)));
                         ui.hyperlink_to(egui::RichText::new("Privacy").size(sz(12.0)), "https://biocartoon.com/privacy");
                     });
                 }
@@ -464,7 +464,7 @@ impl BioCartoon {
                         (Some(e), _) => format!("{}  {e}", ph::CLOUD_WARNING),
                         (None, None) => format!("{}  Checking your online copies...", ph::CLOUD),
                         (None, Some(_)) if pending > 0 => format!("{}  Saving {pending} change{} online...", ph::CLOUD_ARROW_UP, if pending == 1 { "" } else { "s" }),
-                        (None, Some(_)) => format!("{}  All {local} project{} saved online", ph::CLOUD_CHECK, if local == 1 { "" } else { "s" }),
+                        (None, Some(_)) => format!("{}  All {local} project{} and your library saved online", ph::CLOUD_CHECK, if local == 1 { "" } else { "s" }),
                     };
                     ui.label(status);
                     if self.account.quota > 0 {
@@ -764,7 +764,7 @@ impl BioCartoon {
                 ui.set_width(400.0);
                 ui.heading("Delete your account?");
                 ui.add_space(6.0);
-                ui.label("The online copy of every project is deleted from the BioCartoon server, along with your name and email. Projects in this browser stay here.");
+                ui.label("The online copy of every project and of your library is deleted from the BioCartoon server, along with your name and email. Projects and library items in this browser stay here.");
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(egui::Button::new(egui::RichText::new("Delete account").color(Color32::WHITE)).fill(Color32::from_rgb(0xc0, 0x39, 0x2b))).clicked() {

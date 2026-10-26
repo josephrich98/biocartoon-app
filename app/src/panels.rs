@@ -667,7 +667,8 @@ impl BioCartoon {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
-                if row_button(ui, ph::BOOKS, "Add to your library").on_hover_text("Keep your images and slides in Your library, on this computer").clicked() {
+                if row_button(ui, ph::BOOKS, "Add to your library").on_hover_text("Keep your images and slides in Your library").clicked() {
+                    self.library_notice();
                     self.open_contribute(false);
                 }
                 if row_button(ui, ph::CLOUD_ARROW_UP, "Add to BioCartoon library").on_hover_text("Share your icons and templates with everyone").clicked() {
@@ -738,7 +739,15 @@ impl BioCartoon {
                     ui.label(egui::RichText::new("Nothing here yet. Images you add to your library (generated with AI, or from Uploads) and slides you save as templates appear here.").color(theme::text_dim()));
                 }
                 #[cfg(target_arch = "wasm32")]
-                ui.label(egui::RichText::new("In the browser, images added to your library are kept until the page is reloaded.").small().color(theme::text_dim()));
+                ui.label(
+                    egui::RichText::new(if self.account.signed_in() {
+                        "Your library is kept in this browser, with a copy online in your account."
+                    } else {
+                        "Your library is kept only in this browser. Sign in on the home screen to keep a copy online."
+                    })
+                    .small()
+                    .color(theme::text_dim()),
+                );
                 self.results_grid(ui);
             }
         }
@@ -989,7 +998,7 @@ impl BioCartoon {
                     if ui.button(format!("{}  Add to sheet", ph::PLUS)).clicked() {
                         self.actions.push(Action::InsertFile(path.clone().into()));
                     }
-                    if ui.button(format!("{}  Add to your library", ph::BOOKS)).on_hover_text("Keep it in Your library, on this computer").clicked() {
+                    if ui.button(format!("{}  Add to your library", ph::BOOKS)).on_hover_text("Keep it in Your library").clicked() {
                         self.actions.push(Action::GeneratedToLibrary { path: path.clone(), favorite: false });
                     }
                     let sent = crate::app::file_submitted(&mut self.fingerprints, &self.settings.submitted, &path);
@@ -1298,7 +1307,7 @@ impl BioCartoon {
         if b.on_disabled_hover_text("Pick icons or templates above first").clicked() {
             self.actions.push(Action::ContributeSelected);
         }
-        let note = if share { "Each one is reviewed before anyone else sees it." } else { "Saved on this computer only." };
+        let note = if share { "Each one is reviewed before anyone else sees it." } else { self.library_where() };
         ui.label(egui::RichText::new(note).small().color(theme::text_dim()));
     }
 

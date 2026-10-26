@@ -1917,7 +1917,7 @@ impl BioCartoon {
             ui.close();
         }
         if let Some(path) = own_file {
-            if ui.button(format!("{}  Add to your library...", ph::BOOKS)).on_hover_text("Keep this image in Your library, on this computer").clicked() {
+            if ui.button(format!("{}  Add to your library...", ph::BOOKS)).on_hover_text("Keep this image in Your library").clicked() {
                 self.actions.push(Action::OpenUploadDialog(UploadTarget::File(path.clone().into()), false));
                 ui.close();
             }

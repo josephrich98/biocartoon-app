@@ -112,6 +112,10 @@ pub struct Settings {
     pub show_comments: bool,
     /// Web: the home screen's backup reminder stays hidden until then (Unix milliseconds).
     pub backup_snoozed_until: i64,
+    /// Web: "Don't show this message again" was ticked on the new project storage notice.
+    pub hide_project_notice: bool,
+    /// Web: "Don't show this message again" was ticked on the Your library storage notice.
+    pub hide_library_notice: bool,
 }
 
 impl Default for Settings {
@@ -165,6 +169,8 @@ impl Default for Settings {
             show_spelling: false,
             show_comments: true,
             backup_snoozed_until: 0,
+            hide_project_notice: false,
+            hide_library_notice: false,
         }
     }
 }
@@ -954,6 +960,39 @@ pub enum Action {
     ClearGuides,
 }
 
+/// The notice that something is kept only in this browser without an account: `what` is saved
+/// only here, and `keep` says how to keep it safe. `hide` is its "Don't show this message again"
+/// box. False once accepted or closed.
+fn storage_notice(ctx: &egui::Context, title: &str, what: &str, keep: &str, hide: &mut bool) -> bool {
+    let mut open = true;
+    let mut accept = false;
+    // Above the library dialog that may open with it.
+    let id = egui::Id::new(title);
+    ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+    egui::Window::new(format!("{}  {title}", ph::WARNING_CIRCLE)).id(id).order(egui::Order::Foreground).open(&mut open).collapsible(false).resizable(false).default_width(460.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+        let risk = if crate::storage::is_safari() {
+            "Safari clears them after 7 days without a visit, and"
+        } else {
+            "The browser may clear them if the device runs low on space, and"
+        };
+        ui.label(format!("Without an account, {what} are saved only in this browser, on this device."));
+        ui.add_space(6.0);
+        ui.label(format!("{risk} they are lost if you clear the browser's site data or cache."));
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(format!("To keep them safe, {keep}.")).color(theme::text_dim()));
+        ui.add_space(12.0);
+        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 30.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.add(egui::Button::new(egui::RichText::new("Accept").color(Color32::WHITE)).fill(theme::accent()).min_size(Vec2::new(90.0, 30.0)).corner_radius(6)).clicked() {
+                accept = true;
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.checkbox(hide, "Don't show this message again");
+            });
+        });
+    });
+    open && !accept
+}
+
 /// How an image item placed before its picture had loaded is sized once it has: by the
 /// picture's longer side (an insert) or by its area (a replacement keeps the old picture's).
 enum Fit {
@@ -983,8 +1022,10 @@ pub struct BioCartoon {
     pub stars_in_flight: HashSet<String>,
     /// The stars from before favorites were kept in Settings have been carried over.
     stars_migrated: bool,
-    /// Web: the optional account that keeps projects online.
+    /// Web: the optional account that keeps projects and Your library online.
     pub account: crate::account::Account,
+    /// Web: Your library's own icons, put back into each catalog loaded.
+    pub library: crate::library::Library,
     pub images: ImageCache,
     pub ai: AiClient,
     pub settings: Settings,
@@ -996,6 +1037,10 @@ pub struct BioCartoon {
     /// The theme last applied: dark or not, and the text size.
     applied_theme: Option<(bool, theme::TextSize)>,
     pub show_about: bool,
+    /// Web: how projects are saved without an account, shown when a new project is started signed out.
+    show_storage_notice: bool,
+    /// Web, without an account: where Your library is kept, shown each time something is added.
+    show_library_notice: bool,
     /// Spelling and grammar problems, kept up to date while squiggles or the window are shown.
     pub spell: crate::spell::SpellState,
     /// The Spelling and grammar window is open (it also shows squiggles while open).
@@ -1218,6 +1263,7 @@ impl BioCartoon {
             stars_in_flight: HashSet::new(),
             stars_migrated: false,
             account: crate::account::Account::new(app_dir.join("account.json"), cc.egui_ctx.clone()),
+            library: crate::library::Library::open(app_dir.join("library.json")),
             catalog_sync: None,
             offline: Default::default(),
             images,
@@ -1228,6 +1274,8 @@ impl BioCartoon {
             settings_before_restore: None,
             applied_theme: None,
             show_about: false,
+            show_storage_notice: false,
+            show_library_notice: false,
             spell: Default::default(),
             show_spell_window: false,
             show_dict_window: false,
@@ -1350,6 +1398,11 @@ impl BioCartoon {
         self.icons.facets_for = None;
         self.icons.last_sent_query = "\u{0}".into(); // re-run the current search
         if self.catalog.ok {
+            // The browser's catalog is in memory: Your library goes back in (none on the desktop).
+            let rows: Vec<AssetRow> = self.library.m.assets.iter().map(|a| a.to_row()).collect();
+            if !rows.is_empty() {
+                self.catalog.send(Req::InsertUsers { rows });
+            }
             self.catalog.send(Req::Sources);
             // For the library dialog's category suggestions.
             self.catalog.send(Req::Categories { source: "user".into() });
@@ -1887,7 +1940,7 @@ impl BioCartoon {
             new_ids.push(it.id);
             self.slide_mut().items.push(it);
         }
-        self.select(new_ids);
+        self.select_quietly(new_ids);
     }
 
     pub fn duplicate(&mut self) {
@@ -2636,7 +2689,7 @@ impl BioCartoon {
             return None;
         }
         let id = row.id.clone();
-        self.catalog.send(Req::InsertUser { row });
+        self.library_insert(row);
         self.settings.generated[i].library_id = Some(id.clone());
         Some((id, true))
     }
@@ -3143,9 +3196,9 @@ impl BioCartoon {
             if let Some(id) = &replaces {
                 self.relink_generated(id, Some(row.id.clone()));
             }
-            self.catalog.send(Req::InsertUser { row });
+            self.library_insert(row);
             if let Some(id) = replaces {
-                self.catalog.send(Req::RemoveUser { id });
+                self.library_remove(id);
             }
             return;
         };
@@ -3176,6 +3229,41 @@ impl BioCartoon {
             let _ = tx.send(LibraryMsg::AssetSubmitted { row, result, replaces, as_png, fingerprint });
             ctx.request_repaint();
         });
+    }
+
+    /// Web, without an account: say where Your library is kept (each time something is added to it).
+    pub(crate) fn library_notice(&mut self) {
+        self.show_library_notice = cfg!(target_arch = "wasm32") && !self.account.signed_in() && !self.settings.hide_library_notice;
+    }
+
+    /// Where Your library is kept, under the buttons that add to it.
+    pub(crate) fn library_where(&self) -> &'static str {
+        match (cfg!(target_arch = "wasm32"), self.account.signed_in()) {
+            (false, _) => "Saved on this computer only.",
+            (true, false) => "Saved in this browser only.",
+            (true, true) => "Saved in this browser, with a copy online in your account.",
+        }
+    }
+
+    /// Put an icon into Your library: the catalog, and in the browser the list kept beside it.
+    fn library_insert(&mut self, row: AssetRow) {
+        self.library.add(&row, crate::projects::now_ms());
+        self.catalog.send(Req::InsertUser { row });
+    }
+
+    /// Take an icon out of Your library, and its online copy.
+    fn library_remove(&mut self, id: String) {
+        self.library.remove(&id);
+        self.account_forget_item(&crate::library::item_id("asset", &id));
+        self.catalog.send(Req::RemoveUser { id });
+    }
+
+    /// Delete a saved template here, and its online copy.
+    fn remove_saved_template(&mut self, id: &str) {
+        if let Err(e) = self.templates.remove_local(id) {
+            self.toast_err(e);
+        }
+        self.account_forget_item(&crate::library::item_id("template", id));
     }
 
     /// Write an image to the user's library folder and fill in `row`'s id and file; the PNG.
@@ -3368,9 +3456,9 @@ impl BioCartoon {
                     if let Some(id) = &replaces {
                         self.relink_generated(id, Some(row.id.clone()));
                     }
-                    self.catalog.send(Req::InsertUser { row });
+                    self.library_insert(row);
                     if let Some(id) = replaces {
-                        self.catalog.send(Req::RemoveUser { id });
+                        self.library_remove(id);
                     }
                 }
                 LibraryMsg::TemplateSaved(res, replaces) => match res {
@@ -3380,9 +3468,7 @@ impl BioCartoon {
                             self.toast_err(e);
                         } else {
                             if let Some(id) = replaces.filter(|id| *id != row.meta.id) {
-                                if let Err(e) = self.templates.remove_local(&id) {
-                                    self.toast_err(e);
-                                }
+                                self.remove_saved_template(&id);
                             }
                             match submitted {
                                 None => self.toast(format!("Saved template \"{title}\"")),
@@ -3452,6 +3538,7 @@ impl BioCartoon {
     pub(crate) fn new_doc(&mut self) {
         self.close_project();
         self.load_into_editor(Document::default(), None);
+        self.show_storage_notice = cfg!(target_arch = "wasm32") && !self.account.signed_in() && !self.settings.hide_project_notice;
     }
 
     fn open_project(&mut self, id: &str) {
@@ -4497,7 +4584,7 @@ impl BioCartoon {
                 if self.icons.results.len() < before {
                     self.icons.total = self.icons.total.map(|n| (n - 1).max(0));
                 }
-                self.catalog.send(Req::RemoveUser { id: row.id.clone() });
+                self.library_remove(row.id.clone());
                 self.relink_generated(&row.id, None);
                 self.toast(format!("Removed \"{}\" from your library", row.title));
             }
@@ -4834,10 +4921,23 @@ impl BioCartoon {
                 }
             }
             Action::Generate(p) => self.start_generate(p),
-            Action::GeneratedToLibrary { path, favorite } => self.generated_to_library(&path, favorite),
+            Action::GeneratedToLibrary { path, favorite } => {
+                self.library_notice();
+                self.generated_to_library(&path, favorite);
+            }
             Action::ContributeGenerated(path) => self.contribute_generated(&path),
-            Action::OpenUploadDialog(target, share) => self.open_upload_dialog(target, share),
-            Action::OpenContribute(share) => self.open_contribute(share),
+            Action::OpenUploadDialog(target, share) => {
+                if !share {
+                    self.library_notice();
+                }
+                self.open_upload_dialog(target, share);
+            }
+            Action::OpenContribute(share) => {
+                if !share {
+                    self.library_notice();
+                }
+                self.open_contribute(share);
+            }
             Action::PickLibraryFile => {
                 let tx = self.action_tx.clone();
                 crate::platform::pick_files("Images", &crate::assets::IMAGE_EXTS, false, move |mut paths| {
@@ -4896,9 +4996,7 @@ impl BioCartoon {
                 self.hide_icons_on_phones(ctx);
             }
             Action::RemoveTemplate(id) => {
-                if let Err(e) = self.templates.remove_local(&id) {
-                    self.toast_err(e);
-                }
+                self.remove_saved_template(&id);
                 self.template_rows = self.templates.list();
             }
             Action::PickUploads => {
@@ -5528,6 +5626,14 @@ impl BioCartoon {
             if !open { self.show_about = false; }
         }
 
+        // How projects, and Your library, are saved without an account (web)
+        if self.show_storage_notice && !storage_notice(ctx, "Saving your projects", "your projects", "download a backup from the home screen or save a project as a .biocartoon file, or sign in to keep a copy online", &mut self.settings.hide_project_notice) {
+            self.show_storage_notice = false;
+        }
+        if self.show_library_notice && !storage_notice(ctx, "Saving your library", "the icons and templates in Your library, and your favorites,", "sign in from the home screen to keep a copy online", &mut self.settings.hide_library_notice) {
+            self.show_library_notice = false;
+        }
+
         // AI setup, shown the first time an AI tool is used
         if let Some(setup) = &mut self.ai_setup {
             let mut open = true;
@@ -5686,6 +5792,7 @@ impl BioCartoon {
         let wide = size.x >= 760.0;
         const FORM_W: f32 = 320.0;
         egui::Window::new(title).id(egui::Id::new("upload_dialog")).open(&mut open).order(egui::Order::Foreground).collapsible(false).resizable(false).fixed_size(size).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            let saved_where = self.library_where();
             let form = |ui: &mut egui::Ui, d: &mut UploadDialog, submit: &mut bool, cancel: &mut bool| {
                 let w = ui.available_width();
                 let field = |ui: &mut egui::Ui, label: &str| {
@@ -5758,7 +5865,7 @@ impl BioCartoon {
                     }
                 } else {
                     ui.add_space(10.0);
-                    ui.label(dim("Saved on this computer only."));
+                    ui.label(dim(saved_where));
                 }
                 ui.add_space(10.0);
                 let png = !template && !d.svg;
@@ -6221,6 +6328,8 @@ impl BioCartoon {
                     }
                     "aisettings" => self.open_settings(SettingsTab::Ai),
                     "about" => self.show_about = true,
+                    "storagenotice" => self.show_storage_notice = true,
+                    "librarynotice" => self.show_library_notice = true,
                     "templates" => {
                         self.settings.show_icons = true;
                         self.search_database(theme::BIOCARTOON_SOURCE);

@@ -39,6 +39,8 @@ pub enum Req {
     Random { seed: u64 },
     /// Record a user-generated asset (already written to `png_local`).
     InsertUser { row: AssetRow },
+    /// Record several at once (Your library, put back into a catalog just loaded), with one reply.
+    InsertUsers { rows: Vec<AssetRow> },
     /// Take one of the user's own assets back out of the local catalog.
     RemoveUser { id: String },
     /// An asset was placed on a canvas; feeds `IconSort::Popular`.
@@ -179,6 +181,7 @@ fn handle(w: &Worker, req_id: u64, req: Req) -> Resp {
             }
         }
         Req::InsertUser { row } => Resp::Inserted { req_id, result: w.insert_user(&row).map_err(|e| e.to_string()) },
+        Req::InsertUsers { rows } => Resp::Inserted { req_id, result: rows.iter().try_for_each(|r| w.insert_user(r)).map_err(|e| e.to_string()) },
         Req::RemoveUser { id } => Resp::Removed { req_id, result: w.remove_user(&id).map(|_| ()).map_err(|e| e.to_string()) },
         Req::RecordUse { source, title } => {
             if let Err(e) = w.record_use(&source, &title) {
