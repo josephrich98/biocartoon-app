@@ -115,12 +115,17 @@
   </div>
   <script>
     // Each click on the speaker plays the next 10 second clip in music/, cycling back to the first
-    // after the last. A click mid-clip skips ahead.
+    // after the last. A click mid-clip stops it.
     const clips = 5;
     const music = document.getElementById("music");
     const speaker = document.querySelector(".speaker");
     let next = 0;
     speaker.addEventListener("click", () => {
+      if (!music.paused) {
+        music.pause();
+        speaker.classList.remove("playing");
+        return;
+      }
       music.src = `music/party-${next + 1}.mp3`;
       next = (next + 1) % clips;
       music.play().then(() => speaker.classList.add("playing")).catch(() => {});
