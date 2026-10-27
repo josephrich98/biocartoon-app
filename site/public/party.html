@@ -31,11 +31,17 @@
     header .name { font-weight: 650; font-size: 17px; color: var(--text); }
     header .name:hover { text-decoration: none; }
     header .back { margin-left: auto; font-size: 15px; }
+    /* The figure fills the first screen (header aside), growing past the page column when the window
+       allows, so the credits only come into view on scrolling down. 64px is the header's height. */
+    body { overflow-x: clip; }
+    .stage { min-height: calc(100svh - 64px); padding-bottom: 24px; display: flex; align-items: center; }
     .party {
-      display: block; width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--border);
+      display: block; height: auto; border-radius: 12px; border: 1px solid var(--border);
       box-shadow: 0 12px 40px rgba(0, 0, 0, .12);
+      width: min(100vw - 32px, (100svh - 90px) * 960 / 672);
+      flex: none; margin-left: 50%; translate: -50%;
     }
-    .credits { color: var(--dim); font-size: 13px; margin: 14px 0 0; padding: 0; list-style: none; }
+    .credits { color: var(--dim); font-size: 13px; margin: 0; padding: 0; list-style: none; }
     .credits li { margin-bottom: 2px; }
     footer { color: var(--dim); font-size: 14px; padding: 28px 0 40px; margin-top: 32px; border-top: 1px solid var(--border); }
 
@@ -59,8 +65,10 @@
     </header>
 
     <main>
-      <img class="party" src="party.svg" width="960" height="672"
-           alt="Mice and rats in party hats on a wooden floor, around a table of cheese and pie, under a mirror ball. A mouse says: Great to see you! Join the party!" />
+      <div class="stage">
+        <img class="party" src="party.svg" width="960" height="672"
+             alt="Mice and rats in party hats on a wooden floor, around a table of cheese and pie, under a mirror ball. A mouse says: Great to see you! Join the party!" />
+      </div>
       <ul class="credits">
         <li>"rat grooming" by Scidraw, <a href="https://scidraw.io/drawing/rat-grooming-5a137f21">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
         <li>"standing_rat" by Yu Kang, <a href="https://scidraw.io/drawing/standing_rat-99683ece">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>

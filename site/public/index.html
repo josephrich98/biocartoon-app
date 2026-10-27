@@ -122,10 +122,10 @@
        there, and body clips the overhang. */
     body { overflow-x: clip; }
     .tail {
-      flex: 1 0 140px; align-self: center; display: flex; justify-content: flex-end;
+      flex: 1 0 70px; align-self: center; display: flex; justify-content: flex-end;
       margin-right: calc(-1 * max(16px, (100vw - 1008px) / 2));
     }
-    .tail img { width: 200px; height: auto; display: block; transform-origin: right center; }
+    .tail img { width: 90px; height: auto; display: block; transform-origin: right center; }
     @media (prefers-reduced-motion: no-preference) {
       .tail:hover img { animation: tail-flick 0.6s ease-in-out; }
       @keyframes tail-flick { 30% { transform: rotate(-6deg); } 70% { transform: rotate(3deg); } }
@@ -361,7 +361,7 @@
       <div class="actions left">
         <a class="btn dark" href="https://github.com/josephrich98/biocartoon"><svg><use href="#i-github"/></svg><span>Database and CLI source code</span></a>
         <a class="btn dark" href="https://github.com/josephrich98/biocartoon-app"><svg><use href="#i-github"/></svg><span>Application and website source code</span></a>
-        <a class="tail" href="/party" title="Follow the mouse"><img src="mouse_tail.svg" alt="A mouse's tail, disappearing off the edge of the page" width="200" height="47" /></a>
+        <a class="tail" href="/party" title="Follow the mouse"><img src="mouse_tail.svg" alt="A mouse's tail, disappearing off the edge of the page" width="90" height="21" /></a>
       </div>
     </section>
 
