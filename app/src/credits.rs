@@ -287,7 +287,7 @@ impl BioCartoon {
 /// required ones stay just what the licenses ask for.
 fn shared_list(credits: &[Credit], only_required: bool) -> String {
     let lines = list(credits, only_required);
-    if only_required { lines } else { format!("{lines}\nFigure made in BioCartoon.") }
+    if only_required { lines } else { format!("{lines}\nMade in BioCartoon.") }
 }
 
 /// How long the "Image saved successfully" banner stays above the Attributions popup.

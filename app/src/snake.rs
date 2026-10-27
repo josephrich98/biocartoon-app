@@ -8,7 +8,7 @@ use crate::app::BioCartoon;
 use crate::assets::ImageCache;
 use crate::doc::{Item, ItemKind, Slide, DPI};
 use crate::theme;
-use egui::{Align2, Color32, Context, FontId, Painter, Pos2, Rect, RichText, Vec2};
+use egui::{Color32, Context, FontId, Painter, Pos2, Rect, RichText, Vec2};
 use std::collections::VecDeque;
 
 /// Page points per cell: an eighth of an inch.
@@ -249,7 +249,8 @@ impl Snake {
         }).collect();
     }
 
-    pub fn draw(&self, painter: &Painter, xf: &crate::canvas::Xform, page_s: Rect, bg: Color32, now: f64) {
+    /// Draws the game on the page, and the high score, score and time just above the page.
+    pub fn draw(&self, painter: &Painter, xf: &crate::canvas::Xform, page_s: Rect, bg: Color32, now: f64, best: u32) {
         let fg = contrast(bg);
         let z = xf.zoom;
         for &c in &self.body {
@@ -265,10 +266,16 @@ impl Snake {
             _ => 0.0,
         }
         .max(0.0) as u64;
-        let font = FontId::monospace((self.cell * z * 1.4).max(11.0));
-        let pad = self.cell * z;
-        let p = painter.with_clip_rect(page_s);
-        p.text(page_s.right_top() + Vec2::new(-pad, pad), Align2::RIGHT_TOP, format!("{}   {}:{:02}", self.score, secs / 60, secs % 60), font, fg);
+        // Snake-colored on a page-colored box, just above the page's top right, but kept on screen
+        // (below the ruler band) when the page runs off the canvas.
+        let galley = painter.layout_no_wrap(format!("High score {}   Score {}   {}:{:02}", best, self.score, secs / 60, secs % 60), FontId::monospace(14.0), fg);
+        let view = painter.clip_rect();
+        let size = galley.size();
+        let right = page_s.right().min(view.right() - 8.0);
+        let bottom = (page_s.top() - 8.0).max(view.top() + 16.0 * theme::text_scale() + 8.0 + size.y);
+        let r = Rect::from_min_max(Pos2::new(right - size.x, bottom - size.y), Pos2::new(right, bottom));
+        painter.rect_filled(r.expand2(Vec2::new(8.0, 3.0)), 4.0, bg);
+        painter.galley(r.min, galley, fg);
         if let Some(c) = self.crash {
             painter.rect_filled(xf.rect(self.cell_rect(c)), 0.0, Color32::from_rgb(230, 50, 50));
         }
@@ -339,7 +346,8 @@ impl BioCartoon {
         if let Some(wait) = snake.update(&self.doc.slides[self.cur_slide], now, &mut self.images) {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
-        snake.draw(painter, xf, page_s, bg, now);
+        self.snake_best = self.snake_best.max(snake.score);
+        snake.draw(painter, xf, page_s, bg, now, self.snake_best);
         if snake.over.is_none() {
             return;
         }

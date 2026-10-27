@@ -1089,6 +1089,8 @@ pub struct BioCartoon {
     pub stroke: Vec<Pos2>,
     /// The hidden snake game, while one is open on the canvas (see `snake.rs`).
     pub snake: Option<crate::snake::Snake>,
+    /// The best snake score since the project was opened or last changed.
+    pub snake_best: u32,
     /// The text box (or table) being typed into on the canvas.
     pub editing_text: Option<ItemId>,
     /// For a table in `editing_text`, the (row-major) cell being typed into.
@@ -1315,6 +1317,7 @@ impl BioCartoon {
             pen_width: 3.0,
             stroke: Vec::new(),
             snake: None,
+            snake_best: 0,
             editing_text: None,
             editing_cell: 0,
             text_edit_focus: false,
@@ -1558,6 +1561,7 @@ impl BioCartoon {
         }
         self.future.clear();
         self.dirty = true;
+        self.snake_best = 0;
     }
 
     pub fn undo(&mut self) {
@@ -1566,6 +1570,7 @@ impl BioCartoon {
             self.doc = d;
             self.cur_slide = s.min(self.doc.slides.len() - 1);
             self.prune_selection();
+            self.snake_best = 0;
         }
     }
 
@@ -1575,6 +1580,7 @@ impl BioCartoon {
             self.doc = d;
             self.cur_slide = s.min(self.doc.slides.len() - 1);
             self.prune_selection();
+            self.snake_best = 0;
         }
     }
 
@@ -3550,6 +3556,7 @@ impl BioCartoon {
         self.saved_doc = Some(doc.clone());
         self.doc = doc;
         self.project = project;
+        self.snake_best = 0;
         self.cur_slide = 0;
         self.selection.clear();
         self.selected_guide = None;
@@ -3765,6 +3772,8 @@ impl BioCartoon {
         self.project = None;
         self.saved_doc = None;
         self.doc = Document::default();
+        self.snake = None;
+        self.snake_best = 0;
         self.history.clear();
         self.future.clear();
         self.selection.clear();
@@ -6178,7 +6187,7 @@ impl BioCartoon {
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, gridsteps, spell, viewspell, dictionary, textedit, equation, tableedit, placetext,
-    /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
+    /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -6192,6 +6201,7 @@ impl BioCartoon {
                 match step {
                     "home" => self.screen = Screen::Home,
                     "lucky" => self.actions.push(Action::InsertRandom),
+                    "snake" => self.snake = Some(crate::snake::Snake::new(&self.doc.slides[self.cur_slide], self.doc.page_rect(), ctx.input(|i| i.time), &mut self.images, ctx)),
                     // A few projects in the (temporary) smoke-test store, two versions each.
                     "seedprojects" => {
                         for (i, name) in ["Medical Imaging Modalities", "Untitled", "T cell activation pathway with a long name that elides", "tmp"].iter().enumerate() {
