@@ -36,10 +36,24 @@
     body { overflow-x: clip; }
     .stage { min-height: calc(100svh - 64px); padding-bottom: 24px; display: flex; align-items: center; }
     .party {
-      display: block; height: auto; border-radius: 12px; border: 1px solid var(--border);
-      box-shadow: 0 12px 40px rgba(0, 0, 0, .12);
+      position: relative;
       width: min(100vw - 32px, (100svh - 90px) * 960 / 672);
       flex: none; margin-left: 50%; translate: -50%;
+    }
+    .party img {
+      display: block; width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--border);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, .12);
+    }
+    /* An invisible button over the speaker (x 606-674, y 0-96 of the 960x672 figure) that plays the
+       clips in music/, one per click. */
+    .speaker {
+      position: absolute; left: 63.125%; top: 0; width: 7.083%; height: 14.286%;
+      padding: 0; border: 0; border-radius: 8px; background: none; cursor: pointer;
+    }
+    .speaker:hover, .speaker:focus-visible { box-shadow: 0 0 0 2px rgba(255, 255, 255, .7); outline: none; }
+    @media (prefers-reduced-motion: no-preference) {
+      .speaker.playing { animation: 0.43s ease-out infinite thump; }
+      @keyframes thump { from { box-shadow: 0 0 0 0 rgba(255, 255, 255, .8); } to { box-shadow: 0 0 0 14px rgba(255, 255, 255, 0); } }
     }
     .credits { color: var(--dim); font-size: 13px; margin: 0; padding: 0; list-style: none; }
     .credits li { margin-bottom: 2px; }
@@ -66,8 +80,12 @@
 
     <main>
       <div class="stage">
-        <img class="party" src="party.svg" width="960" height="672"
-             alt="Mice and rats in party hats on a wooden floor, around a table of cheese and pie, under a mirror ball. A mouse says: Great to see you! Join the party!" />
+        <div class="party">
+          <img src="party.svg" width="960" height="672"
+               alt="Mice and rats in party hats on a wooden floor, around a table of cheese and pie, under a mirror ball. A mouse says: Great to see you! Join the party!" />
+          <button class="speaker" type="button" aria-label="Play party music" title="Play party music"></button>
+        </div>
+        <audio id="music" preload="none"></audio>
       </div>
       <ul class="credits">
         <li>"rat grooming" by Scidraw, <a href="https://scidraw.io/drawing/rat-grooming-5a137f21">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
@@ -89,10 +107,25 @@
         <li>"Grass", <a href="https://stock.adobe.com/search?k=grass+cartoon">Adobe Stock</a></li>
         <li>"Birthday hats set", <a href="https://www.magnific.com/free-vector/birthday-hats-set_9649055.htm">Magnific</a></li>
         <li>Figure made in <a href="https://app.biocartoon.com/">BioCartoon</a>.</li>
+        <li>Music (click the speaker): 10 second excerpts of "Disco con Tutti", "Who Likes to Party", "Funky Chunk", "Enter the Party" and "Beachfront Celebration" by Kevin MacLeod, <a href="https://incompetech.com/">incompetech.com</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
       </ul>
     </main>
 
     <footer>© 2026 <a href="https://joseph-rich.com">Joseph Rich</a> · <a href="/privacy">Privacy</a> · <a href="https://buymeacoffee.com/josephrich">Buy me a coffee</a></footer>
   </div>
+  <script>
+    // Each click on the speaker plays the next 10 second clip in music/, cycling back to the first
+    // after the last. A click mid-clip skips ahead.
+    const clips = 5;
+    const music = document.getElementById("music");
+    const speaker = document.querySelector(".speaker");
+    let next = 0;
+    speaker.addEventListener("click", () => {
+      music.src = `music/party-${next + 1}.mp3`;
+      next = (next + 1) % clips;
+      music.play().then(() => speaker.classList.add("playing")).catch(() => {});
+    });
+    music.addEventListener("ended", () => speaker.classList.remove("playing"));
+  </script>
 </body>
 </html>
