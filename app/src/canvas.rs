@@ -3,7 +3,7 @@
 
 use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, UploadTarget};
 use crate::assets::{ImageCache, ImgState, IMAGE_EXTS};
-use crate::doc::{c32, screen_font, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, ShapeKind, Slide, TextAlign, TextFlag, TextVAlign, Unit, DPI};
+use crate::doc::{c32, screen_font, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, Script, ShapeKind, Slide, TextAlign, TextFlag, TextVAlign, Unit, DPI};
 use crate::theme;
 use egui::emath::Rot2;
 use std::path::Path;
@@ -160,9 +160,17 @@ fn guide_shift(guides: &[Guide], vertical: bool, vals: &[f32], tol: f32) -> Opti
         .min_by(|a, b| a.abs().total_cmp(&b.abs()))
 }
 
-/// A point pulled onto nearby guides.
-fn snap_point_to_guides(guides: &[Guide], p: Pos2, tol: f32) -> Pos2 {
-    Pos2::new(p.x + guide_shift(guides, true, &[p.x], tol).unwrap_or(0.0), p.y + guide_shift(guides, false, &[p.y], tol).unwrap_or(0.0))
+/// The smallest shift (within `tol`) that puts one of `vals` on a gridline `g` apart.
+fn grid_shift(g: Option<f32>, vals: &[f32], tol: f32) -> Option<f32> {
+    let g = g?;
+    vals.iter().map(|v| snap(*v, g) - v).filter(|d| d.abs() <= tol).min_by(|a, b| a.abs().total_cmp(&b.abs()))
+}
+
+/// A point pulled onto nearby guides, or else onto nearby gridlines (`grid`: their spacing).
+fn snap_point_to_guides(guides: &[Guide], grid: Option<f32>, p: Pos2, tol: f32) -> Pos2 {
+    let dx = guide_shift(guides, true, &[p.x], tol).or_else(|| grid_shift(grid, &[p.x], tol));
+    let dy = guide_shift(guides, false, &[p.y], tol).or_else(|| grid_shift(grid, &[p.y], tol));
+    Pos2::new(p.x + dx.unwrap_or(0.0), p.y + dy.unwrap_or(0.0))
 }
 
 /// Corner points of an item's (possibly rotated) rect in document space, NW NE SE SW.
@@ -539,7 +547,11 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
                 }
             }
         }
-        ItemKind::Text { text, color, .. } => {
+        ItemKind::Text { text, color, fill, .. } => {
+            if fill[3] > 0 {
+                let pts = corners(it).map(|p| xf.to_screen(p));
+                painter.add(Shape::convex_polygon(pts.to_vec(), c32(*fill).gamma_multiply(op), Stroke::NONE));
+            }
             let col = c32(*color).gamma_multiply(op);
             let Some((galley, pos, c)) = text_layout(painter, xf, it, op) else { return };
             if let Some(job) = bold_overlay(&galley.job, &it.kind, text) {
@@ -690,16 +702,38 @@ pub(crate) fn text_job(ctx: &egui::Context, text: &str, kind: &ItemKind, zoom: f
     let font_id = font.font_id(px);
     let line_height = (*line_spacing != 1.0).then(|| ctx.fonts_mut(|f| f.row_height(&font_id)) * line_spacing.max(0.1));
     let line = (px / 14.0).max(1.0);
+    let sections = crate::doc::text_sections(kind, text);
+    // Superscripts and subscripts are smaller and, as egui places a section's baseline at its
+    // ascent plus its `valign` share of (row height - its line height), raised by sitting at the
+    // top of the row, or lowered by a fifth of the text's size through a shorter line height.
+    let small_id = font.font_id(screen_font(ctx, size * zoom * Script::SCALE));
+    let sub_line_height = sections.iter().any(|(_, l)| l.script == Some(Script::Sub)).then(|| {
+        let ascent = |id: &egui::FontId| {
+            let g = ctx.fonts_mut(|f| f.layout_no_wrap("x".into(), id.clone(), Color32::WHITE));
+            g.rows.first().and_then(|r| r.row.glyphs.first()).map_or(id.size * 0.9, |g| g.font_ascent)
+        };
+        let row = line_height.unwrap_or_else(|| ctx.fonts_mut(|f| f.row_height(&font_id)));
+        (ascent(&small_id) + row - ascent(&font_id) - px * 0.2).max(1.0)
+    });
     let mut job = egui::text::LayoutJob::default();
-    for (range, look) in crate::doc::text_sections(kind, text) {
+    for (range, look) in sections {
         let col = c32(look.color).gamma_multiply(op);
+        let (font_id, line_height, valign) = match look.script {
+            None => (font_id.clone(), line_height, egui::Align::BOTTOM),
+            Some(Script::Super) => (small_id.clone(), None, egui::Align::TOP),
+            Some(Script::Sub) => (small_id.clone(), sub_line_height, egui::Align::BOTTOM),
+        };
         let format = egui::TextFormat {
-            font_id: font_id.clone(),
+            font_id,
             color: col,
             italics: look.italic,
             underline: if look.underline { Stroke::new(line, col) } else { Stroke::NONE },
             strikethrough: if look.strike { Stroke::new(line, col) } else { Stroke::NONE },
             line_height,
+            valign,
+            background: look.highlight.map_or(Color32::TRANSPARENT, |h| c32(h).gamma_multiply(op)),
+            // Flush with the glyphs, as export draws it.
+            expand_bg: 0.0,
             ..Default::default()
         };
         job.append(&text[range], 0.0, format);
@@ -722,6 +756,7 @@ pub(crate) fn bold_overlay(job: &egui::text::LayoutJob, kind: &ItemKind, text: &
     for (sec, (_, look)) in job.sections.iter_mut().zip(&sections) {
         sec.format.underline = Stroke::NONE;
         sec.format.strikethrough = Stroke::NONE;
+        sec.format.background = Color32::TRANSPARENT;
         if !look.bold {
             sec.format.color = Color32::TRANSPARENT;
         }
@@ -824,8 +859,8 @@ pub fn draw_slide(painter: &egui::Painter, xf: &Xform, slide: &Slide, page: Rect
     draw_slide_except(painter, xf, slide, page, bg, images, None, true);
 }
 
-/// [`draw_slide`] leaving out `skip`: the text box being edited, or for a table the text of the
-/// cell being edited, which its editor draws.
+/// [`draw_slide`] leaving out `skip`: the text of the box being edited (its fill stays), or for a
+/// table the text of the cell being edited, which its editor draws.
 /// Unless `clip_to_page`, items hanging off the page stay visible (they just don't export).
 fn draw_slide_except(painter: &egui::Painter, xf: &Xform, slide: &Slide, page: Rect, bg: Color32, images: &mut ImageCache, skip: Option<(ItemId, usize)>, clip_to_page: bool) {
     let rs = xf.rect(page);
@@ -834,15 +869,20 @@ fn draw_slide_except(painter: &egui::Painter, xf: &Xform, slide: &Slide, page: R
     for it in &slide.items {
         match skip {
             Some((id, cell)) if id == it.id => {
-                if let ItemKind::Table { .. } = it.kind {
-                    let mut t = it.clone();
-                    if let ItemKind::Table { cells, .. } = &mut t.kind {
+                let mut t = it.clone();
+                match &mut t.kind {
+                    ItemKind::Table { cells, .. } => {
                         if let Some(c) = cells.get_mut(cell) {
                             c.clear();
                         }
                     }
-                    draw_item(&p, xf, &t, images, None);
+                    ItemKind::Text { text, runs, fill, .. } if fill[3] > 0 => {
+                        text.clear();
+                        runs.clear();
+                    }
+                    _ => continue,
                 }
+                draw_item(&p, xf, &t, images, None);
             }
             _ => draw_item(&p, xf, it, images, None),
         }
@@ -1363,7 +1403,9 @@ impl BioCartoon {
         let middle = ui.input(|i| i.pointer.middle_down());
         let g = self.settings.grid_size;
         let alt = ui.input(|i| i.modifiers.alt);
-        let snapping = self.settings.grid_snap && !alt;
+        // Grid steps round every position to the grid; grid snapping only pulls onto gridlines in reach.
+        let snapping = self.settings.grid_steps && !alt;
+        let grid = (self.settings.grid_snap && !self.settings.grid_steps && !alt).then_some(g);
         let guides: Vec<Guide> = if self.settings.guide_snap && !alt { self.doc.guides.clone() } else { Vec::new() };
         let tol = 6.0 / xf.zoom;
 
@@ -1478,7 +1520,10 @@ impl BioCartoon {
                     self.drag = Some(Drag::Guide(i));
                 } else if let Some(id) = self.item_at(d, tol) {
                     if !self.selection.contains(&id) {
-                        if shift {
+                        if alt {
+                            // Option adds just this item, even out of a group.
+                            self.selection.push(id);
+                        } else if shift {
                             self.selection.push(id);
                             self.expand_groups();
                         } else {
@@ -1513,7 +1558,7 @@ impl BioCartoon {
                         let i = *i;
                         if let Some(guide) = self.doc.guides.get_mut(i) {
                             let v = if guide.vertical { d.x } else { d.y };
-                            guide.pos = if snapping { snap(v, g) } else { v };
+                            guide.pos = if snapping { snap(v, g) } else { v + grid_shift(grid, &[v], tol).unwrap_or(0.0) };
                         }
                     }
                     Some(Drag::Marquee { current, .. }) => *current = d,
@@ -1548,8 +1593,9 @@ impl BioCartoon {
                         }
                         // A guide within reach of an edge or the centre wins over the grid.
                         let r = sel_rect.translate(dv);
-                        if let Some(s) = guide_shift(&guides, true, &[r.min.x, r.center().x, r.max.x], tol) { dv.x += s; }
-                        if let Some(s) = guide_shift(&guides, false, &[r.min.y, r.center().y, r.max.y], tol) { dv.y += s; }
+                        let (xs, ys) = ([r.min.x, r.center().x, r.max.x], [r.min.y, r.center().y, r.max.y]);
+                        if let Some(s) = guide_shift(&guides, true, &xs, tol).or_else(|| grid_shift(grid, &xs, tol)) { dv.x += s; }
+                        if let Some(s) = guide_shift(&guides, false, &ys, tol).or_else(|| grid_shift(grid, &ys, tol)) { dv.y += s; }
                         if shift {
                             if dv.x.abs() > dv.y.abs() { dv.y = 0.0 } else { dv.x = 0.0 }
                         }
@@ -1579,7 +1625,7 @@ impl BioCartoon {
                         if snapping {
                             q = Pos2::new(snap(q.x, g), snap(q.y, g));
                         }
-                        q = snap_point_to_guides(&guides, q, tol);
+                        q = snap_point_to_guides(&guides, grid, q, tol);
                         if let Some(it) = self.item_mut(id) {
                             if !path.is_empty() {
                                 set_freehand_path(it, &move_path_end(&path, end, q));
@@ -1610,7 +1656,7 @@ impl BioCartoon {
                             if snapping {
                                 lp = Pos2::new(snap(lp.x, g), snap(lp.y, g));
                             }
-                            lp = snap_point_to_guides(&guides, lp, tol);
+                            lp = snap_point_to_guides(&guides, grid, lp, tol);
                         }
                         let mut min = local_start.min;
                         let mut max = local_start.max;
@@ -1671,8 +1717,10 @@ impl BioCartoon {
 
         if response.drag_stopped() {
             if let Some(Drag::Marquee { start, current, additive }) = &self.drag {
+                // An item is caught only once the marquee covers its center, so grazing a big
+                // background shape doesn't pull it into the selection.
                 let r = Rect::from_two_pos(*start, *current);
-                let mut ids: Vec<ItemId> = self.slide().items.iter().filter(|i| r.intersects(i.rect())).map(|i| i.id).collect();
+                let mut ids: Vec<ItemId> = self.slide().items.iter().filter(|i| r.contains(i.rect().center())).map(|i| i.id).collect();
                 if *additive {
                     ids.extend(self.selection.iter().copied());
                     ids.dedup();
@@ -1690,7 +1738,8 @@ impl BioCartoon {
                     self.select_guide(i);
                 } else {
                     match self.item_at(d, tol) {
-                        Some(id) if shift => self.actions.push(Action::ToggleSelect(id)),
+                        Some(id) if alt => self.actions.push(Action::ToggleSelect(id, false)),
+                        Some(id) if shift => self.actions.push(Action::ToggleSelect(id, true)),
                         Some(id) => self.select_quietly(vec![id]),
                         None => self.select(Vec::new()),
                     }
@@ -1801,8 +1850,11 @@ impl BioCartoon {
         if ui.add(egui::Button::new(format!("{}  Show gridlines", ph::GRID_FOUR)).right_text(check(self.settings.show_grid))).clicked() {
             self.settings.show_grid = !self.settings.show_grid;
         }
-        if ui.add(egui::Button::new(format!("{}  Snap to grid", ph::MAGNET)).right_text(check(self.settings.grid_snap))).on_hover_text("Hold Alt (Option) while dragging to place freely").clicked() {
+        if ui.add(egui::Button::new(format!("{}  Snap to grid", ph::MAGNET)).right_text(check(self.settings.grid_snap))).on_hover_text("Edges and centers near a gridline jump onto it; hold Alt (Option) while dragging to place freely").clicked() {
             self.settings.grid_snap = !self.settings.grid_snap;
+        }
+        if ui.add(egui::Button::new(format!("{}  Grid increments only", ph::DOTS_NINE)).right_text(check(self.settings.grid_steps))).on_hover_text("Positions and sizes always land on the grid; hold Alt (Option) while dragging to place freely").clicked() {
+            self.settings.grid_steps = !self.settings.grid_steps;
         }
         ui.separator();
         if ui.button(format!("{}  Show credits", ph::QUOTES)).on_hover_text("Credits for the library artwork on this slide").clicked() {

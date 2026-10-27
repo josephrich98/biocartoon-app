@@ -731,6 +731,9 @@ pub enum ItemKind {
         /// Characters styled apart from the rest of the box (see [`TextRun`]).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         runs: Vec<TextRun>,
+        /// The box's own colour behind the text; alpha 0 (the default) leaves it clear.
+        #[serde(default)]
+        fill: [u8; 4],
     },
     Shape {
         shape: ShapeKind,
@@ -778,12 +781,26 @@ pub enum ItemKind {
 impl ItemKind {
     /// A plain text box: upright, sans, single-spaced, top-aligned.
     pub fn text(text: impl Into<String>, size: f32, color: [u8; 4], align: TextAlign, bold: bool) -> Self {
-        ItemKind::Text { text: text.into(), size, color, align, bold, italic: false, underline: false, strike: false, font: TextFont::Sans, line_spacing: 1.0, valign: TextVAlign::Top, runs: Vec::new() }
+        ItemKind::Text { text: text.into(), size, color, align, bold, italic: false, underline: false, strike: false, font: TextFont::Sans, line_spacing: 1.0, valign: TextVAlign::Top, runs: Vec::new(), fill: [0; 4] }
     }
 }
 
+/// Characters set smaller and raised (superscript) or lowered (subscript).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Script {
+    Super,
+    Sub,
+}
+
+impl Script {
+    /// Their size, as a share of the text's.
+    pub const SCALE: f32 = 0.65;
+}
+
 /// What some of a text box's characters set over the box's own bold, italic, underline,
-/// strikethrough and colour; `None` keeps the box's.
+/// strikethrough and colour; `None` keeps the box's. Superscript, subscript and highlight are
+/// only ever set on characters (`None` is on the baseline, unhighlighted).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunStyle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -796,6 +813,11 @@ pub struct RunStyle {
     pub strike: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[u8; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<Script>,
+    /// The colour behind the characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<[u8; 4]>,
 }
 
 /// Characters `start..end` (counted in chars, not bytes) of a text box, styled by `style`.
@@ -815,6 +837,8 @@ pub struct CharLook {
     pub underline: bool,
     pub strike: bool,
     pub color: [u8; 4],
+    pub script: Option<Script>,
+    pub highlight: Option<[u8; 4]>,
 }
 
 /// One style per character of a `len`-character text from its runs.
@@ -866,7 +890,7 @@ pub fn remap_runs(runs: &[TextRun], old: &str, new: &str) -> Vec<TextRun> {
 pub fn char_looks(kind: &ItemKind, text: &str) -> Vec<CharLook> {
     let ItemKind::Text { text: own, color, bold, italic, underline, strike, runs, .. } = kind else { return Vec::new() };
     let runs = if own == text { runs.clone() } else { remap_runs(runs, own, text) };
-    let base = CharLook { bold: *bold, italic: *italic, underline: *underline, strike: *strike, color: *color };
+    let base = CharLook { bold: *bold, italic: *italic, underline: *underline, strike: *strike, color: *color, script: None, highlight: None };
     expand_runs(&runs, text.chars().count())
         .into_iter()
         .map(|s| CharLook {
@@ -875,6 +899,8 @@ pub fn char_looks(kind: &ItemKind, text: &str) -> Vec<CharLook> {
             underline: s.underline.unwrap_or(base.underline),
             strike: s.strike.unwrap_or(base.strike),
             color: s.color.unwrap_or(base.color),
+            script: s.script,
+            highlight: s.highlight,
         })
         .collect()
 }
@@ -891,7 +917,7 @@ pub fn text_sections(kind: &ItemKind, text: &str) -> Vec<(std::ops::Range<usize>
         }
     }
     if out.is_empty() {
-        out.push((0..0, CharLook { bold: *bold, italic: *italic, underline: *underline, strike: *strike, color: *color }));
+        out.push((0..0, CharLook { bold: *bold, italic: *italic, underline: *underline, strike: *strike, color: *color, script: None, highlight: None }));
     }
     out
 }
@@ -903,6 +929,8 @@ pub enum TextFlag {
     Italic,
     Underline,
     Strike,
+    Superscript,
+    Subscript,
 }
 
 impl TextFlag {
@@ -912,6 +940,16 @@ impl TextFlag {
             TextFlag::Italic => l.italic,
             TextFlag::Underline => l.underline,
             TextFlag::Strike => l.strike,
+            TextFlag::Superscript => l.script == Some(Script::Super),
+            TextFlag::Subscript => l.script == Some(Script::Sub),
+        }
+    }
+
+    fn script(self) -> Option<Script> {
+        match self {
+            TextFlag::Superscript => Some(Script::Super),
+            TextFlag::Subscript => Some(Script::Sub),
+            _ => None,
         }
     }
 
@@ -921,6 +959,7 @@ impl TextFlag {
             TextFlag::Italic => &mut s.italic,
             TextFlag::Underline => &mut s.underline,
             TextFlag::Strike => &mut s.strike,
+            TextFlag::Superscript | TextFlag::Subscript => unreachable!("set_flag sets scripts itself"),
         }
     }
 }
@@ -956,6 +995,24 @@ pub fn color_at(kind: &ItemKind, range: Option<std::ops::Range<usize>>) -> [u8; 
     }
 }
 
+/// The highlight of the first character of `range` (of the whole box for `None`).
+pub fn highlight_at(kind: &ItemKind, range: Option<std::ops::Range<usize>>) -> Option<[u8; 4]> {
+    looks_in(kind, range).first().and_then(|l| l.highlight)
+}
+
+/// Highlight the characters in `range` (every one in the box for `None`) in `c`, or clear their
+/// highlight for `None`.
+pub fn set_highlight(kind: &mut ItemKind, range: Option<std::ops::Range<usize>>, c: Option<[u8; 4]>) {
+    let ItemKind::Text { text, runs, .. } = kind else { return };
+    let n = text.chars().count();
+    let r = range.unwrap_or(0..n);
+    let mut styles = expand_runs(runs, n);
+    for s in styles.iter_mut().take(r.end.min(n)).skip(r.start) {
+        s.highlight = c;
+    }
+    *runs = pack_runs(&styles);
+}
+
 /// Change the style of the characters in `range` of text box `kind` with `f`, which gets the
 /// box's look so it can leave out what matches it. With `None` the box's own style changes
 /// instead (`whole`) and `f` clears every run's say over it.
@@ -977,6 +1034,19 @@ fn restyle(kind: &mut ItemKind, range: Option<std::ops::Range<usize>>, whole: im
 
 /// Turn `flag` on or off for the characters in `range` (the whole box for `None`).
 pub fn set_flag(kind: &mut ItemKind, range: Option<std::ops::Range<usize>>, flag: TextFlag, on: bool) {
+    // The box has no script of its own: for the whole box it goes on every character, and
+    // turning one on turns the other off.
+    if let Some(script) = flag.script() {
+        let ItemKind::Text { text, runs, .. } = kind else { return };
+        let n = text.chars().count();
+        let r = range.unwrap_or(0..n);
+        let mut styles = expand_runs(runs, n);
+        for s in styles.iter_mut().take(r.end.min(n)).skip(r.start) {
+            s.script = on.then_some(script);
+        }
+        *runs = pack_runs(&styles);
+        return;
+    }
     let whole = range.is_none();
     restyle(
         kind,
@@ -988,6 +1058,7 @@ pub fn set_flag(kind: &mut ItemKind, range: Option<std::ops::Range<usize>>, flag
                     TextFlag::Italic => italic,
                     TextFlag::Underline => underline,
                     TextFlag::Strike => strike,
+                    TextFlag::Superscript | TextFlag::Subscript => unreachable!("set above"),
                 } = on;
             }
         },

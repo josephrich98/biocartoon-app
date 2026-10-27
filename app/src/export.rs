@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,18 +150,25 @@ pub struct ExportJob {
 }
 
 /// Files written so far out of how many, updated by the worker as it goes. `total` is 0 until the
-/// images are loaded and the file count is known.
+/// images are loaded and the file count is known. `cancel` asks the worker to stop.
 #[derive(Default)]
 pub struct Progress {
     pub done: AtomicUsize,
     pub total: AtomicUsize,
+    pub cancel: AtomicBool,
 }
 
 impl Progress {
     pub fn get(&self) -> (usize, usize) {
         (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed))
     }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
+
+const CANCELLED: &str = "Export cancelled";
 
 /// Run an export on a worker thread. The receiver yields a status message when it is done.
 #[cfg(not(target_arch = "wasm32"))]
@@ -217,10 +224,29 @@ pub fn start(ctx: egui::Context, job: ExportJob) -> Receiver<Result<String, Stri
 }
 
 pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
+    let mut saved = Vec::new();
     let out = render(ctx, &job, None, &mut |path, bytes, _| {
+        // Encoding a file can take a while; don't write it if the export was cancelled meanwhile.
+        if job.progress.cancelled() {
+            return Err(CANCELLED.into());
+        }
         // A download in the browser.
-        crate::platform::write_output(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
-    })?;
+        crate::platform::write_output(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        saved.push(path.to_path_buf());
+        Ok(())
+    });
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => {
+            // Don't leave half an export behind (browser downloads can't be taken back).
+            if job.progress.cancelled() && !cfg!(target_arch = "wasm32") {
+                for f in &saved {
+                    let _ = std::fs::remove_file(f);
+                }
+            }
+            return Err(e);
+        }
+    };
     let mut msg = match out.files.as_slice() {
         [] => format!("Exported {} slides to {}", out.pages, job.path.display()),
         [one] => format!("Exported {}", one.display()),
@@ -274,6 +300,9 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
     let mut images: HashMap<String, Picture> = HashMap::new();
     let mut missing = 0;
     for (key, req) in &job.requests {
+        if job.progress.cancelled() {
+            return Err(CANCELLED.into());
+        }
         let full = match job.downloads.get(key) {
             // Web build: `start` already downloaded the original.
             Some(b) => Picture::from_bytes(b),
@@ -313,11 +342,17 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
     job.progress.total.store(total, Ordering::Relaxed);
     let mut pages = Vec::new();
     for (n, slide) in &job.slides {
+        if job.progress.cancelled() {
+            return Err(CANCELLED.into());
+        }
         let bg = if transparent { None } else { Some(slide.background.unwrap_or(job.background)) };
         let stem = if multi { format!("{stem}-slide{n}") } else { stem.clone() };
         if opts.individual {
             let pics: Vec<&Item> = slide.items.iter().filter(|it| matches!(it.kind, ItemKind::Image { .. })).collect();
             for (i, it) in pics.iter().enumerate() {
+                if job.progress.cancelled() {
+                    return Err(CANCELLED.into());
+                }
                 let region = item_bounds(it);
                 let svg = svg_document(ctx, &[it], region, bg, &images, raster);
                 let name = crate::app::BioCartoon::slugify(&it.name);
@@ -607,7 +642,7 @@ fn row_markup(font: TextFont, s: &str, xs: &[f32]) -> String {
 /// row whose characters look alike, carrying its own colour and decoration when they are not
 /// the box's (`op` is the item's opacity).
 fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item, op: f32) {
-    let ItemKind::Text { text, color, align, font, .. } = &it.kind else { return };
+    let ItemKind::Text { text, color, align, font, size, .. } = &it.kind else { return };
     let r = it.rect();
     let job = crate::canvas::text_job(ctx, text, &it.kind, 1.0, r.width(), 1.0);
     let galley = ctx.fonts_mut(|f| f.layout_job(job));
@@ -634,6 +669,19 @@ fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item, op: f32) {
             } else {
                 String::new()
             };
+            // The highlight goes behind the stretch, from its glyphs' top to their bottom.
+            if let Some(h) = look.and_then(|l| l.highlight) {
+                let top = g0.logical_rect().top();
+                let _ = writeln!(
+                    out,
+                    r#"<rect x="{}" y="{}" width="{}" height="{}" {}/>"#,
+                    n(x),
+                    n(o.y + prow.pos.y + top),
+                    n(g1.max_x() - g0.pos.x),
+                    n(g0.logical_rect().height()),
+                    paint("fill", h, op)
+                );
+            }
             let mut style = String::new();
             if let Some(l) = look {
                 if l.color != *color {
@@ -646,6 +694,10 @@ fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item, op: f32) {
                 let deco: Vec<&str> = [(l.underline, "underline"), (l.strike, "line-through")].into_iter().filter(|d| d.0).map(|d| d.1).collect();
                 if !deco.is_empty() {
                     let _ = write!(style, r#" text-decoration="{}""#, deco.join(" "));
+                }
+                // The layout already raised or lowered it; it is only smaller.
+                if l.script.is_some() {
+                    let _ = write!(style, r#" font-size="{}""#, n(size * crate::doc::Script::SCALE));
                 }
                 // Slant rather than font-style="italic": the bundled font has no italic face.
                 if l.italic {
@@ -845,7 +897,10 @@ fn svg_document(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[
                     base64::engine::general_purpose::STANDARD.encode(png)
                 );
             }
-            ItemKind::Text { size, color, font, .. } => {
+            ItemKind::Text { size, color, font, fill, .. } => {
+                if fill[3] > 0 {
+                    let _ = writeln!(s, r#"<rect x="{}" y="{}" width="{}" height="{}" {}{}/>"#, n(r.min.x), n(r.min.y), n(r.width()), n(r.height()), paint("fill", *fill, op), rotate_attr(it, c));
+                }
                 let family = match font {
                     TextFont::Sans => family.clone(),
                     TextFont::Mono => "Hack, Menlo, Consolas, monospace".into(),

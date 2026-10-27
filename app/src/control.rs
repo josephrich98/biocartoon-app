@@ -234,7 +234,7 @@ fn name_of<T: std::fmt::Debug>(v: T) -> String {
 /// Item fields `update_item` and the `insert_*` commands take (see [`patch_item`]).
 const ITEM_ARGS: &[&str] = &[
     "x", "y", "width", "height", "x1", "y1", "x2", "y2", "rotation", "flip_h", "flip_v", "locked", "opacity", "name", "crop", "overlay",
-    "text", "font_size", "color", "bold", "italic", "underline", "strikethrough", "font", "line_spacing", "align", "valign", "shape", "fill", "stroke",
+    "text", "font_size", "color", "highlight", "bold", "italic", "underline", "strikethrough", "superscript", "subscript", "font", "line_spacing", "align", "valign", "shape", "fill", "stroke",
     "stroke_width", "line_kind", "line_style", "line_width", "header", "cells", "code", "language", "theme", "line_numbers", "window", "rounded",
 ];
 
@@ -318,7 +318,7 @@ pub fn item_json(it: &Item) -> Value {
                 o.insert("layers".into(), json!(layers));
             }
         }
-        ItemKind::Text { text, size, color, align, bold, italic, underline, strike, font, line_spacing, valign, runs } => {
+        ItemKind::Text { text, size, color, align, bold, italic, underline, strike, font, line_spacing, valign, runs, fill } => {
             o.insert("text".into(), json!(text));
             o.insert("font_size".into(), json!(size));
             o.insert("color".into(), json!(color));
@@ -333,6 +333,7 @@ pub fn item_json(it: &Item) -> Value {
             }
             o.insert("font".into(), json!(name_of(font)));
             o.insert("line_spacing".into(), json!(line_spacing));
+            o.insert("fill".into(), json!(fill));
         }
         ItemKind::Shape { shape, fill, stroke, stroke_width } => {
             o.insert("shape".into(), json!(name_of(shape)));
@@ -403,7 +404,8 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
     if matches!(it.kind, ItemKind::Text { .. }) {
         // The whole box's colour and decoration, over any its letters had of their own.
         if let Some(v) = color(args, "color") { crate::doc::set_color(&mut it.kind, None, v); }
-        for (key, flag) in [("bold", TextFlag::Bold), ("italic", TextFlag::Italic), ("underline", TextFlag::Underline), ("strikethrough", TextFlag::Strike)] {
+        if let Some(v) = color(args, "highlight") { crate::doc::set_highlight(&mut it.kind, None, (v[3] > 0).then_some(v)); }
+        for (key, flag) in [("bold", TextFlag::Bold), ("italic", TextFlag::Italic), ("underline", TextFlag::Underline), ("strikethrough", TextFlag::Strike), ("superscript", TextFlag::Superscript), ("subscript", TextFlag::Subscript)] {
             if let Some(v) = b(args, key) { crate::doc::set_flag(&mut it.kind, None, flag, v); }
         }
     }
@@ -417,7 +419,8 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
             }
             if let Some(c) = color(args, "overlay") { *overlay = c; }
         }
-        ItemKind::Text { text, size, align, font, line_spacing, valign, runs, .. } => {
+        ItemKind::Text { text, size, align, font, line_spacing, valign, runs, fill, .. } => {
+            if let Some(v) = color(args, "fill") { *fill = v; }
             if let Some(v) = s(args, "text") {
                 let old = std::mem::replace(text, v.to_string());
                 *runs = crate::doc::remap_runs(runs, &old, text);
@@ -845,6 +848,18 @@ mod tests {
         assert!(check_args("state", &json!([1])).is_err());
         // Unknown commands are left to fail on their own.
         assert!(check_args("nope", &json!({"anything": 1})).is_ok());
+    }
+
+    /// A highlight goes on every character, and a clear one takes it off.
+    #[test]
+    fn patches_highlight() {
+        let kind = ItemKind::text("abc", 20.0, [0, 0, 0, 255], TextAlign::Left, false);
+        let mut it = Item::new(1, "Text", kind, Pos2::ZERO, Vec2::new(100.0, 40.0));
+        patch_item(&mut it, &json!({"highlight": [250, 204, 21]})).unwrap();
+        assert_eq!(crate::doc::highlight_at(&it.kind, Some(2..3)), Some([250, 204, 21, 255]));
+        patch_item(&mut it, &json!({"highlight": [0, 0, 0, 0]})).unwrap();
+        let ItemKind::Text { runs, .. } = &it.kind else { unreachable!() };
+        assert!(runs.is_empty());
     }
 
     /// Every argument a canvas_<cmd> MCP tool offers is one <cmd> accepts.

@@ -225,8 +225,13 @@ fn fetch_decode_web(req: Request, done: Box<dyn FnOnce(Result<Loaded, String>) +
 }
 
 /// Whether `bytes` are an SVG (plain or gzipped) rather than a raster image. The root may carry
-/// a namespace prefix (`<ns0:svg`, as Python's ElementTree writes it), not only `<svg`.
+/// a namespace prefix (`<ns0:svg`, as Python's ElementTree writes it), not only `<svg`. A file
+/// with a raster signature is never one, even when its metadata embeds an SVG (ChatGPT PNGs
+/// carry a C2PA manifest with an SVG logo in its first few hundred bytes).
 pub fn is_svg(bytes: &[u8]) -> bool {
+    if image::guess_format(bytes).is_ok() {
+        return false;
+    }
     if bytes.starts_with(&[0x1f, 0x8b]) {
         return true;
     }
@@ -836,6 +841,37 @@ mod tests {
         assert!(l.svg.is_none());
     }
 
+    /// A file is cached by path; once forgotten (as uploading it again does) it is read afresh,
+    /// so an edited file shows its new contents.
+    #[test]
+    fn forgotten_file_reloads() {
+        let dir = std::env::temp_dir().join(format!("biocartoon-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cheese-bowl.svg");
+        let p = path.display().to_string();
+        let ctx = egui::Context::default();
+        let mut cache = ImageCache::new(String::new(), None);
+        let load = |cache: &mut ImageCache| {
+            for _ in 0..500 {
+                if let ImgState::Ready { size, .. } = cache.file(&p) {
+                    return *size;
+                }
+                cache.poll(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("{p} did not load");
+        };
+        let svg = |w, h| format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><rect width="{w}" height="{h}" fill="red"/></svg>"#);
+        std::fs::write(&path, svg(40, 20)).unwrap();
+        let first = load(&mut cache);
+        std::fs::write(&path, svg(20, 40)).unwrap();
+        assert_eq!(load(&mut cache), first, "cached until forgotten");
+        cache.forget(&format!("file:{p}"));
+        let second = load(&mut cache);
+        assert!(first[0] > first[1] && second[0] < second[1], "{first:?} then {second:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An SVG whose root carries a namespace prefix (as Python's ElementTree writes NIAID
     /// BioArt files, e.g. Low Friction Flask) is still an SVG; text that merely mentions one
     /// is not.
@@ -848,6 +884,11 @@ mod tests {
         assert!(is_svg(b"<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg\"/>"));
         assert!(!is_svg(b"<svgfoo/>"));
         assert!(!is_svg(b"<html>svg</html>"));
+        // A PNG whose C2PA metadata embeds an SVG is still a PNG.
+        let mut png = crate::ICON_PNG[..33].to_vec();
+        png.extend_from_slice(b"\0\0\0\x40caBXjumb image/svg+xml <svg xmlns=\"http://www.w3.org/2000/svg\"/>");
+        png.extend_from_slice(&crate::ICON_PNG[33..]);
+        assert!(!is_svg(&png));
         let l = decode(prefixed).unwrap();
         assert_eq!((l.width, l.height), (MAX_SIDE, MAX_SIDE / 2));
         assert!(l.svg.is_some());

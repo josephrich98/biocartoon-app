@@ -127,6 +127,9 @@ pub struct HomeState {
     /// The account menu's popup, so the backup reminder can open it.
     pub account_popup: Option<egui::Id>,
     pub confirm_account_delete: bool,
+    /// Set once the list has been shown this session. egui persists scroll offsets, so without
+    /// this a reload reopens the list partway down with "+ New" cut off.
+    pub scroll_reset: bool,
 }
 
 const GAP: f32 = 24.0;
@@ -175,7 +178,11 @@ impl BioCartoon {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 16, right: 16, top: 8, bottom: 16 });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             let projects = self.visible_projects();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if !std::mem::replace(&mut self.home.scroll_reset, true) {
+                scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            scroll.show(ui, |ui| {
                 self.backup_banner(ui);
                 match self.settings.home_view {
                     HomeView::List => self.project_list(ui, &projects),

@@ -60,7 +60,7 @@ fn obj(v: Value) -> Map<String, Value> {
 
 /// Appearance fields `canvas_update_item` and the `insert_*` tools accept.
 fn style_props() -> Map<String, Value> {
-    obj(json!({
+    let mut props = obj(json!({
         "name": str_prop("Layer name."),
         "rotation": num_prop("Rotation in degrees, clockwise."),
         "flip_h": bool_prop("Mirror horizontally."),
@@ -68,21 +68,23 @@ fn style_props() -> Map<String, Value> {
         "locked": bool_prop("Lock against editing in the UI."),
         "opacity": num_prop("0 (invisible) to 1."),
         "crop": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "Images: crop as [left, top, right, bottom] in 0..1 of the image (uncropped is [0, 0, 1, 1])."},
-        "overlay": color_prop("Images: colour tint; the alpha is the strength (0 = none)"),
+        "overlay": color_prop("Images: color tint; the alpha is the strength (0 = none)"),
         "text": str_prop("Text items: the text."),
         "font_size": num_prop("Text and tables: font size in page pixels."),
-        "color": color_prop("Text and lines: colour"),
+        "color": color_prop("Text and lines: color"),
         "bold": bool_prop("Text: bold."),
         "italic": bool_prop("Text: italic."),
         "underline": bool_prop("Text: underlined."),
         "strikethrough": bool_prop("Text: struck through."),
+        "superscript": bool_prop("Text: every character raised and smaller (turns subscript off)."),
+        "subscript": bool_prop("Text: every character lowered and smaller (turns superscript off)."),
         "font": str_prop(&font_help()),
         "line_spacing": num_prop("Text: multiple of the natural line height (1, 1.15, 1.5, 2...)."),
         "align": str_prop("Text: left, center, right or justify."),
         "valign": str_prop("Text: where the text sits in its box: top, middle or bottom."),
         "shape": str_prop("Shapes: rectangle, rounded_rectangle, ellipse, triangle, diamond, hexagon, star, block_arrow."),
-        "fill": color_prop("Shapes: fill"),
-        "stroke": color_prop("Shapes: outline colour"),
+        "fill": color_prop("Shapes: fill. Text: the box's color behind the text; alpha 0 leaves it clear"),
+        "stroke": color_prop("Shapes: outline color"),
         "stroke_width": num_prop("Shapes: outline width."),
         "line_kind": str_prop("Lines: straight, arrow, reverse_arrow, double_arrow, inhibitor, equilibrium, reverse_equilibrium, bent, bent_arrow, bent_reverse_arrow, bent_double_arrow, bent_inhibitor, spline, spline_arrow, spline_reverse_arrow, spline_double_arrow, circular, circular_arrow, circular_reverse_arrow, circular_double_arrow."),
         "line_style": str_prop("Lines: solid, dashed or dotted."),
@@ -96,7 +98,10 @@ fn style_props() -> Map<String, Value> {
         "line_numbers": {"type": "boolean", "description": "Code blocks: show line numbers."},
         "window": {"type": "boolean", "description": "Code blocks: show the title bar with window dots."},
         "rounded": {"type": "boolean", "description": "Code blocks: rounded corners (default square)."},
-    }))
+    }));
+    // Past what one json! can hold.
+    props.insert("highlight".into(), color_prop("Text: color behind every character; alpha 0 removes it"));
+    props
 }
 
 /// The editor's own tools (templates and canvas), without the catalog's.
@@ -121,12 +126,12 @@ fn editor_tools() -> Vec<Value> {
         tool("template_image", "The thumbnail of a saved or shared template (built-in layouts have none).", json!({"id": str_prop("Template id.")}), &["id"]),
         tool("canvas_state", "What is open in the editor: page size, current slide and every item on it (ids, type, position, size, asset). Call it before editing and after inserting.", json!({}), &[]),
         tool("canvas_render", "A picture of a slide as it looks now (PNG), to check the layout visually.", json!({"slide": int_prop("Slide index (default: the current one)."), "max_side": int_prop("Longest side in pixels (default 1024).")}), &[]),
-        tool("canvas_insert_asset", "Place a catalog asset on the current slide (centred unless x/y given; sized to a quarter of the page unless width/height given). Returns the new item, including its id.", with_geometry(insert_asset), &["id"]),
+        tool("canvas_insert_asset", "Place a catalog asset on the current slide (centered unless x/y given; sized to a quarter of the page unless width/height given). Returns the new item, including its id.", with_geometry(insert_asset), &["id"]),
         tool("canvas_insert_template", "Add a template's slide after the current one, scaled to the page (builtin:N layouts or a saved / shared template id from list_templates).", json!({"id": str_prop("Template id.")}), &["id"]),
         tool("canvas_insert_text", "Add a text box.", with_geometry(insert_text), &["text"]),
         tool("canvas_insert_shape", "Add a shape.", with_geometry(insert_shape), &[]),
         tool("canvas_insert_code", "Add a syntax-highlighted code block, sized to fit the code unless width/height given.", with_geometry(insert_code), &["code"]),
-        tool("canvas_insert_line", "Add a line or arrow (x1/y1 to x2/y2, or centred by default).", with_geometry(insert_line), &[]),
+        tool("canvas_insert_line", "Add a line or arrow (x1/y1 to x2/y2, or centered by default).", with_geometry(insert_line), &[]),
         tool("canvas_update_item", "Change an item's geometry or appearance (any subset of the fields). Returns the item.", with_geometry(update), &["id"]),
         tool("canvas_move_items", "Move items: absolute x/y places the group's top-left corner, dx/dy shifts them.", json!({"ids": ids_prop(), "x": num_prop("New left edge."), "y": num_prop("New top edge."), "dx": num_prop("Shift right (negative: left)."), "dy": num_prop("Shift down (negative: up).")}), &["ids"]),
         tool("canvas_delete_items", "Remove items from the slide.", json!({"ids": ids_prop()}), &["ids"]),
@@ -137,7 +142,7 @@ fn editor_tools() -> Vec<Value> {
         tool("canvas_slides", "List the document's slides.", json!({}), &[]),
         tool("canvas_go_slide", "Switch to a slide.", json!({"index": int_prop("0-based slide index.")}), &["index"]),
         tool("canvas_add_slide", "Add an empty slide after the current one and switch to it.", json!({}), &[]),
-        tool("canvas_set_page", "Change the page size or background.", json!({"width": num_prop("Page width in `unit`."), "height": num_prop("Page height in `unit`."), "unit": str_prop("inch, cm or px (default: the document's)."), "background": color_prop("Page colour of the current slide")}), &[]),
+        tool("canvas_set_page", "Change the page size or background.", json!({"width": num_prop("Page width in `unit`."), "height": num_prop("Page height in `unit`."), "unit": str_prop("inch, cm or px (default: the document's)."), "background": color_prop("Page color of the current slide")}), &[]),
         tool("canvas_undo", "Undo the last edit.", json!({}), &[]),
         tool("canvas_redo", "Redo.", json!({}), &[]),
         tool("canvas_save", "Save the document as a project in the editor.", json!({}), &[]),

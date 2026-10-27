@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<!-- biocartoon.com/party. Where the mouse tail after index.html's source code links leads. Same look
+     as index.html. party.svg is a figure made in BioCartoon; its credits are under it. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Party · BioCartoon</title>
+  <meta name="description" content="Join the party! A figure made in BioCartoon." />
+  <link rel="icon" href="logo.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <meta property="og:image" content="https://biocartoon.com/logo.png" />
+  <meta property="og:image:width" content="1024" />
+  <meta property="og:image:height" content="1024" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:image" content="https://biocartoon.com/logo.png" />
+  <style>
+    :root { --bg: #f6f7f9; --border: #dfe2e7; --text: #1c1d21; --dim: #5d6370; --accent: #2f80ed; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #1b1b1b; --border: #3a3a3e; --text: #e8e8ea; --dim: #a0a0a8; } }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body {
+      background: var(--bg); color: var(--text);
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+    header { display: flex; align-items: center; gap: 10px; padding: 16px 0; }
+    header img { width: 32px; height: 32px; display: block; }
+    header .name { font-weight: 650; font-size: 17px; color: var(--text); }
+    header .name:hover { text-decoration: none; }
+    header .back { margin-left: auto; font-size: 15px; }
+    .party {
+      display: block; width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--border);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, .12);
+    }
+    .credits { color: var(--dim); font-size: 13px; margin: 14px 0 0; padding: 0; list-style: none; }
+    .credits li { margin-bottom: 2px; }
+    footer { color: var(--dim); font-size: 14px; padding: 28px 0 40px; margin-top: 32px; border-top: 1px solid var(--border); }
+
+    /* Arriving from index.html, the home page slides off to the left and the party comes in from the
+       right, as if following the mouse. index.html styles the trip back. */
+    @view-transition { navigation: auto; }
+    @media (prefers-reduced-motion: no-preference) {
+      ::view-transition-old(root) { animation: 0.45s ease-in-out both slide-to-left; }
+      ::view-transition-new(root) { animation: 0.45s ease-in-out both slide-from-right; }
+      @keyframes slide-to-left { to { transform: translateX(-100%); } }
+      @keyframes slide-from-right { from { transform: translateX(100%); } }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a href="/"><img src="logo.svg" alt="" /></a>
+      <a class="name" href="/">BioCartoon</a>
+      <a class="back" href="/#source">← Back</a>
+    </header>
+
+    <main>
+      <img class="party" src="party.svg" width="960" height="672"
+           alt="Mice and rats in party hats on a wooden floor, around a table of cheese and pie, under a mirror ball. A mouse says: Great to see you! Join the party!" />
+      <ul class="credits">
+        <li>"rat grooming" by Scidraw, <a href="https://scidraw.io/drawing/rat-grooming-5a137f21">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
+        <li>"standing_rat" by Yu Kang, <a href="https://scidraw.io/drawing/standing_rat-99683ece">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
+        <li>"standing_rat_2" by Yu Kang, <a href="https://scidraw.io/drawing/standing_rat_2-2771f6cb">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
+        <li>"Adult_Hooded_Rat_Hunching" by Antonis Asiminas, <a href="https://scidraw.io/drawing/adult_hooded_rat_hunching-b65397ba">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
+        <li>"Lab Mouse" by Ryan Kissinger, <a href="https://bioart.niaid.nih.gov/bioart/279">NIAID NIH BioArt Source</a>, public domain</li>
+        <li>"Lab Mouse" by Ryan Kissinger, <a href="https://bioart.niaid.nih.gov/bioart/280">NIAID NIH BioArt Source</a>, public domain</li>
+        <li>"mouse rearing" by Tiago Branco, <a href="https://scidraw.io/drawing/mouse-rearing-2ddc2c33">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
+        <li>"CAST/EiJ founder mouse" by Lior Pachter, BioCartoon community contribution, CC0</li>
+        <li>"Table", <a href="https://smart.servier.com/smart_image/table/">Servier Medical Art</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
+        <li>"Mouse Running" by Véronique Chouinard, <a href="https://scidraw.io/drawing/mouse-running-f0cbd966">SciDraw</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
+        <li>"thought balloon" by Laura Humpfer, <a href="https://openmoji.org/library/emoji-1F4AD/">OpenMoji</a>, <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a></li>
+        <li>"T Maze Test Mouse Placed in One Arm with Food" by DBCLS, <a href="https://togotv.dbcls.jp/en/pics.html">Bioicons</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a></li>
+        <li>"left speech bubble" by Laura Humpfer, <a href="https://openmoji.org/library/emoji-1F5E8/">OpenMoji</a>, <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a></li>
+        <li>"desk job" by Servier, <a href="https://smart.servier.com/">Bioicons</a>, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a></li>
+        <li>"pie" by Miriam Vollmeier, <a href="https://openmoji.org/library/emoji-1F967/">OpenMoji</a>, <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a></li>
+        <li>"mirror ball" by Liz Bravo, <a href="https://openmoji.org/library/emoji-1FAA9/">OpenMoji</a>, <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a></li>
+        <li>"Grass", <a href="https://stock.adobe.com/search?k=grass+cartoon">Adobe Stock</a></li>
+        <li>"Birthday hats set", <a href="https://www.magnific.com/free-vector/birthday-hats-set_9649055.htm">Magnific</a></li>
+        <li>Figure made in <a href="https://app.biocartoon.com/">BioCartoon</a>.</li>
+      </ul>
+    </main>
+
+    <footer>© 2026 <a href="https://joseph-rich.com">Joseph Rich</a> · <a href="/privacy">Privacy</a> · <a href="https://buymeacoffee.com/josephrich">Buy me a coffee</a></footer>
+  </div>
+</body>
+</html>

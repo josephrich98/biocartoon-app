@@ -552,7 +552,8 @@ impl BioCartoon {
                     if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
                         self.icons.show_filters = !self.icons.show_filters;
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.icons.query).frame(egui::Frame::NONE).desired_width(ui.available_width())).on_hover_text(SEARCH_SYNTAX_TIP)
+                    search_help(ui);
+                    ui.add(egui::TextEdit::singleline(&mut self.icons.query).frame(egui::Frame::NONE).desired_width(ui.available_width()))
                 })
                 .inner
             })
@@ -595,11 +596,12 @@ impl BioCartoon {
                     if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
                         self.icons.mine_show_filters = !self.icons.mine_show_filters;
                     }
+                    search_help(ui);
                     if !self.icons.mine_query.is_empty() && ui.add(egui::Button::new(egui::RichText::new(ph::X).color(theme::text_dim())).frame(false)).on_hover_text("Clear").clicked() {
                         self.icons.mine_query.clear();
                         self.icons.typed_at = f64::NEG_INFINITY;
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.icons.mine_query).hint_text(hint).frame(egui::Frame::NONE).desired_width(ui.available_width())).on_hover_text(SEARCH_SYNTAX_TIP)
+                    ui.add(egui::TextEdit::singleline(&mut self.icons.mine_query).hint_text(hint).frame(egui::Frame::NONE).desired_width(ui.available_width()))
                 })
                 .inner
             })
@@ -1802,7 +1804,7 @@ impl BioCartoon {
                 egui::Grid::new("shape_presets").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     for (label, c) in [("Fill presets", fill), ("Stroke presets", stroke)] {
                         ui.label(label);
-                        if let Some(p) = color_presets(ui, *c) { *c = p; changed = true; }
+                        if let Some(p) = color_presets(ui, *c, true) { *c = p; changed = true; }
                         ui.end_row();
                     }
                 });
@@ -2025,8 +2027,11 @@ impl BioCartoon {
         if toggle_row(ui, ph::GRID_FOUR, "Show gridlines", self.settings.show_grid).clicked() {
             self.settings.show_grid = !self.settings.show_grid;
         }
-        if toggle_row(ui, ph::MAGNET, "Snap to grid", self.settings.grid_snap).on_hover_text("Hold Alt (Option) while dragging to place freely").clicked() {
+        if toggle_row(ui, ph::MAGNET, "Snap to grid", self.settings.grid_snap).on_hover_text("Edges and centers near a gridline jump onto it; hold Alt (Option) while dragging to place freely").clicked() {
             self.settings.grid_snap = !self.settings.grid_snap;
+        }
+        if toggle_row(ui, ph::DOTS_NINE, "Grid increments only", self.settings.grid_steps).on_hover_text("Positions and sizes always land on the grid; hold Alt (Option) while dragging to place freely").clicked() {
+            self.settings.grid_steps = !self.settings.grid_steps;
         }
         ui.add_space(4.0);
         let g = self.settings.grid_size;
@@ -2688,14 +2693,16 @@ fn code_editor(ui: &mut egui::Ui, code: &mut String, language: CodeLang, theme: 
 /// indices) when letters are selected in the box, and to the whole box otherwise.
 fn text_style_ui(ui: &mut egui::Ui, kind: &mut ItemKind, sel: Option<std::ops::Range<usize>>) -> bool {
     let mut color = crate::doc::color_at(kind, sel.clone());
-    let flags = [TextFlag::Bold, TextFlag::Italic, TextFlag::Underline, TextFlag::Strike].map(|f| crate::doc::flag_all(kind, sel.clone(), f));
-    let (mut new_color, mut toggled) = (None, None);
-    let ItemKind::Text { text, size, align, font, line_spacing, valign, .. } = kind else { return false };
+    let highlight = crate::doc::highlight_at(kind, sel.clone());
+    const FLAGS: [TextFlag; 6] = [TextFlag::Bold, TextFlag::Italic, TextFlag::Underline, TextFlag::Strike, TextFlag::Superscript, TextFlag::Subscript];
+    let flags = FLAGS.map(|f| crate::doc::flag_all(kind, sel.clone(), f));
+    let (mut new_color, mut new_highlight, mut toggled, mut from_latex) = (None, None, None, false);
+    let ItemKind::Text { text, size, align, font, line_spacing, valign, fill, .. } = kind else { return false };
     let color = &mut color;
     let mut changed = false;
     ui.label(egui::RichText::new("Text").strong());
     if sel.is_some() {
-        ui.label(egui::RichText::new("Color and decoration go to the selected letters.").small().color(theme::text_dim()));
+        ui.label(egui::RichText::new("Color, highlight and decoration go to the selected letters.").small().color(theme::text_dim()));
     }
     // Each font's name is written in that font.
     let px = egui::TextStyle::Body.resolve(ui.style()).size;
@@ -2703,7 +2710,7 @@ fn text_style_ui(ui: &mut egui::Ui, kind: &mut ItemKind, sel: Option<std::ops::R
     let text_w = |ui: &egui::Ui, t: egui::WidgetText| t.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x;
     // The fields fill the column beside the labels, and are never narrower than the font
     // dropdown needs for its longest name, so every row lines up with it.
-    let labels = ["Font", "Size", "Color", "Presets", "Line spacing", "Horizontal align", "Vertical align", "List style", "Decoration"];
+    let labels = ["Font", "Size", "Text color", "Presets", "Textbox color", "Highlight", "Line spacing", "Horizontal align", "Vertical align", "List style", "Decoration", "Equation"];
     let label_w = labels.iter().map(|l| text_w(ui, (*l).into())).fold(0.0, f32::max);
     let sp = ui.spacing();
     let combo_extra = sp.icon_spacing + sp.icon_width + 2.0 * sp.button_padding.x;
@@ -2732,35 +2739,44 @@ fn text_style_ui(ui: &mut egui::Ui, kind: &mut ItemKind, sel: Option<std::ops::R
         });
         ui.end_row();
 
-        ui.label("Color");
-        ui.horizontal(|ui| {
-            let mut col = *color;
-            if crate::color::edit_button(ui, &mut col).changed() {
-                new_color = Some(col);
-            }
-            // Keep what is being typed while the field has focus; show the colour otherwise.
-            let id = ui.make_persistent_id("text_hex");
-            let current = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
-            let mut hex = ui.data(|d| d.get_temp::<String>(id)).unwrap_or(current);
-            let r = ui.add(egui::TextEdit::singleline(&mut hex).id(id.with("edit")).desired_width(ui.available_width().min(w - 48.0)).char_limit(7));
-            if r.changed() {
-                if let Some(c) = parse_hex(&hex) {
-                    new_color = Some([c[0], c[1], c[2], color[3]]);
-                }
-            }
-            let focused = r.has_focus();
-            ui.data_mut(|d| {
-                if focused {
-                    d.insert_temp(id, hex);
-                } else {
-                    d.remove::<String>(id);
-                }
-            });
-        });
+        ui.label("Text color");
+        new_color = text_color_field(ui, "text_hex", *color, w, 0.0, |_| {});
         ui.end_row();
 
         ui.label("Presets");
-        new_color = color_presets(ui, *color).or(new_color);
+        new_color = color_presets(ui, *color, false).or(new_color);
+        ui.end_row();
+
+        // The whole box's colour, behind the text; clear by default, and picking a colour from
+        // there makes it opaque.
+        ui.label("Textbox color");
+        let picked = text_color_field(ui, "text_fill_hex", *fill, w, 0.0, |_| {}).map(|c| if c[3] == 0 { [c[0], c[1], c[2], 255] } else { c });
+        if let Some(c) = picked.filter(|c| c != fill) {
+            *fill = c;
+            changed = true;
+        }
+        ui.end_row();
+
+        ui.label("");
+        if let Some(c) = color_presets(ui, *fill, true).filter(|c| c != fill) {
+            *fill = c;
+            changed = true;
+        }
+        ui.end_row();
+
+        // No highlight shows as clear, and picking a colour from there makes it opaque.
+        ui.label("Highlight");
+        let shown = highlight.unwrap_or([255, 255, 255, 0]);
+        let mut cleared = false;
+        let picked = text_color_field(ui, "text_highlight_hex", shown, w, 40.0, |ui| {
+            cleared = ui.add_enabled(highlight.is_some(), egui::Button::new(ph::PROHIBIT)).on_hover_text("No highlight").clicked();
+        });
+        let picked = picked.map(|c| if c[3] == 0 { [c[0], c[1], c[2], 255] } else { c });
+        new_highlight = if cleared { Some(None) } else { picked.map(Some) };
+        ui.end_row();
+
+        ui.label("");
+        new_highlight = color_presets(ui, shown, false).map(Some).or(new_highlight);
         ui.end_row();
 
         ui.label("Line spacing");
@@ -2825,21 +2841,83 @@ fn text_style_ui(ui: &mut egui::Ui, kind: &mut ItemKind, sel: Option<std::ops::R
             }
         });
         ui.end_row();
+
+        // Below the other four, cells the same width.
+        ui.label("");
+        segmented(ui, w, 4, |ui, cell| {
+            for (i, icon, tip) in [(4, ph::TEXT_SUPERSCRIPT, "Superscript"), (5, ph::TEXT_SUBSCRIPT, "Subscript")] {
+                if seg_toggle(ui, cell, icon, flags[i], tip).clicked() {
+                    toggled = Some(i);
+                }
+            }
+        });
+        ui.end_row();
+
+        ui.label("Equation");
+        let tip = "Read the box's text as LaTeX math and write it out: x^2, H_2O, \\alpha, \\rightarrow, \\frac{a}{b}, \\sqrt{x} \
+                   become x², H₂O, α, →, a/b, √x, with real superscripts and subscripts";
+        from_latex = ui.add_sized([w.min(120.0), ui.spacing().interact_size.y], egui::Button::new("LaTeX")).on_hover_text(tip).clicked();
+        ui.end_row();
     });
     if let Some(c) = new_color.filter(|c| *c != *color) {
         crate::doc::set_color(kind, sel.clone(), c);
         changed = true;
     }
-    if let Some(i) = toggled {
-        let flag = [TextFlag::Bold, TextFlag::Italic, TextFlag::Underline, TextFlag::Strike][i];
-        crate::doc::set_flag(kind, sel, flag, !flags[i]);
+    if let Some(h) = new_highlight.filter(|h| *h != highlight) {
+        crate::doc::set_highlight(kind, sel.clone(), h);
         changed = true;
+    }
+    if let Some(i) = toggled {
+        crate::doc::set_flag(kind, sel, FLAGS[i], !flags[i]);
+        changed = true;
+    }
+    if from_latex {
+        if let ItemKind::Text { text, runs, .. } = kind {
+            let (t, r) = crate::latex::to_text(text);
+            if t != *text || r != *runs {
+                (*text, *runs) = (t, r);
+                changed = true;
+            }
+        }
     }
     changed
 }
 
-/// The common colours as a row of swatches, the one matching `current` ringed; the one clicked.
-pub(crate) fn color_presets(ui: &mut egui::Ui, current: [u8; 4]) -> Option<[u8; 4]> {
+/// A colour button and its hex field, `w` wide, with `extra` (`extra_w` wide) after them; the
+/// colour picked or typed. `id` keeps what is being typed while the field has focus.
+fn text_color_field(ui: &mut egui::Ui, id: &str, color: [u8; 4], w: f32, extra_w: f32, extra: impl FnOnce(&mut egui::Ui)) -> Option<[u8; 4]> {
+    let mut out = None;
+    ui.horizontal(|ui| {
+        let mut col = color;
+        if crate::color::edit_button(ui, &mut col).changed() {
+            out = Some(col);
+        }
+        // Keep what is being typed while the field has focus; show the colour otherwise.
+        let id = ui.make_persistent_id(id);
+        let current = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
+        let mut hex = ui.data(|d| d.get_temp::<String>(id)).unwrap_or(current);
+        let r = ui.add(egui::TextEdit::singleline(&mut hex).id(id.with("edit")).desired_width(ui.available_width().min(w - 48.0 - extra_w)).char_limit(7));
+        if r.changed() {
+            if let Some(c) = parse_hex(&hex) {
+                out = Some([c[0], c[1], c[2], color[3]]);
+            }
+        }
+        let focused = r.has_focus();
+        ui.data_mut(|d| {
+            if focused {
+                d.insert_temp(id, hex);
+            } else {
+                d.remove::<String>(id);
+            }
+        });
+        extra(ui);
+    });
+    out
+}
+
+/// The common colours as a row of swatches, the one matching `current` ringed (none when it is
+/// clear, unless `transparent` adds a last swatch for clear); the one clicked.
+pub(crate) fn color_presets(ui: &mut egui::Ui, current: [u8; 4], transparent: bool) -> Option<[u8; 4]> {
     const PRESETS: [(&str, [u8; 3]); 11] = [
         ("White", [255, 255, 255]),
         ("Pink", [244, 143, 177]),
@@ -2858,12 +2936,25 @@ pub(crate) fn color_presets(ui: &mut egui::Ui, current: [u8; 4]) -> Option<[u8; 
         ui.spacing_mut().item_spacing = Vec2::splat(4.0);
         for (name, [r, g, b]) in PRESETS {
             let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-            let on = current[..3] == [r, g, b];
+            let on = current[3] > 0 && current[..3] == [r, g, b];
             let ring = if on { Stroke::new(2.0, theme::accent()) } else if resp.hovered() { Stroke::new(1.5, theme::text()) } else { Stroke::new(1.0, theme::border()) };
             ui.painter().rect(rect, 4.0, Color32::from_rgb(r, g, b), ring, StrokeKind::Inside);
             if resp.on_hover_text(name).clicked() {
                 // Keep the colour's transparency.
                 picked = Some([r, g, b, if current[3] == 0 { 255 } else { current[3] }]);
+            }
+        }
+        if transparent {
+            // White crossed out in red, as clear is shown elsewhere.
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+            let on = current[3] == 0;
+            let ring = if on { Stroke::new(2.0, theme::accent()) } else if resp.hovered() { Stroke::new(1.5, theme::text()) } else { Stroke::new(1.0, theme::border()) };
+            ui.painter().rect_filled(rect, 4.0, Color32::WHITE);
+            let d = rect.shrink(3.0);
+            ui.painter().line_segment([d.left_bottom(), d.right_top()], Stroke::new(1.5, Color32::from_rgb(220, 38, 38)));
+            ui.painter().rect_stroke(rect, 4.0, ring, StrokeKind::Inside);
+            if resp.on_hover_text("Transparent").clicked() {
+                picked = Some([current[0], current[1], current[2], 0]);
             }
         }
     });
@@ -3000,10 +3091,31 @@ enum Dim {
 
 /// Whether a loaded asset passes Favorites' or Your library's box (`q`, lowercase: in its title,
 /// description, category or tags) and filters, as the catalog's search would, leaving out `skip`.
-/// The search boxes' hover text: their advanced syntax (see [`syntax`]).
-const SEARCH_SYNTAX_TIP: &str = "Search by field: database:, author:, category:, subcategory:, database_category:, license:, \
-file_type:, tags:, id: (e.g. author:\"Jane Doe\")\nCombine with AND, OR, NOT and parentheses, \
-e.g. (mouse OR rat) AND file_type:svg NOT database:servier";
+/// The question mark in a search box, and the popup it opens on a click (so it works on a phone
+/// too) that explains the advanced syntax (see [`syntax`]).
+fn search_help(ui: &mut egui::Ui) {
+    let btn = ui.add(egui::Button::new(egui::RichText::new(ph::QUESTION).color(theme::text_dim())).frame(false)).on_hover_text("Search syntax");
+    egui::Popup::menu(&btn).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.set_width(300.0);
+        // Left-aligned: a menu justifies wrapped text, which spaces the field list out.
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            let dim = |t: &str| egui::RichText::new(t).color(theme::text_dim());
+            let code = |ui: &mut egui::Ui, q: &str, what: &str| {
+                ui.label(egui::RichText::new(q).monospace());
+                ui.label(dim(what));
+                ui.add_space(4.0);
+            };
+            ui.label(egui::RichText::new("Search syntax").strong());
+            ui.add_space(4.0);
+            code(ui, "(mouse OR rat) AND file_type:svg", "Mouse or rat icons with a vector version");
+            code(ui, "author:\"Jane Doe\"", "Quotes keep words together");
+            code(ui, "neuron NOT database:servier", "Neurons from any database but Servier");
+            ui.add_space(4.0);
+            ui.label(dim("Fields: database, author, category, subcategory, database_category, license, file_type, tags, id. \
+    Combine with AND, OR, NOT (in capitals) and parentheses; words side by side must all match."));
+        });
+    });
+}
 
 /// Whether a record passes the search box's `q` (as typed): a plain query as a part of its
 /// `text` or `tags`, an advanced one (see [`syntax`]) term by term, `field` matching a field term.

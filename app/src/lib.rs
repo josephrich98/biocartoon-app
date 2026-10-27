@@ -18,6 +18,7 @@ pub mod control;
 pub mod doc;
 pub mod export;
 pub mod home;
+pub mod latex;
 pub mod library;
 pub mod offline;
 pub mod panels;

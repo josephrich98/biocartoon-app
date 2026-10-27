@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// Public URL of the R2 bucket: images at `<url>/<png_key>`, the catalog under `<url>/catalog/`.
 pub use biocartoon_catalog::DEFAULT_ASSET_URL;
 /// Bumped when stored path settings must be reset to the new defaults.
-const SETTINGS_VERSION: u32 = 4;
+const SETTINGS_VERSION: u32 = 5;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -59,7 +59,10 @@ pub struct Settings {
     /// Edits are saved to the project as they happen. Off: only Cmd+S saves, and leaving the
     /// project or quitting asks first.
     pub autosave: bool,
+    /// Moved and resized items are pulled onto gridlines within reach.
     pub grid_snap: bool,
+    /// Moves and resizes go in whole grid steps: positions are rounded to the grid.
+    pub grid_steps: bool,
     /// Moved and resized items snap to guides.
     pub guide_snap: bool,
     pub show_grid: bool,
@@ -139,6 +142,7 @@ impl Default for Settings {
             pending_stars: Vec::new(),
             autosave: true,
             grid_snap: false,
+            grid_steps: false,
             guide_snap: true,
             show_grid: false,
             show_rulers: true,
@@ -870,7 +874,8 @@ pub enum Action {
     LibraryFilePicked(PathBuf),
     SubmitUpload,
     Select(Vec<ItemId>),
-    ToggleSelect(ItemId),
+    /// Add or remove an item; `false` leaves the rest of its group alone (Option-click).
+    ToggleSelect(ItemId, bool),
     ClearSelection,
     Delete,
     Duplicate,
@@ -1181,10 +1186,13 @@ pub struct BioCartoon {
 
 /// Grid spacings offered in the Page panel, besides a custom one.
 pub const GRID_PRESETS: &[(&str, f32, Unit)] = &[
+    ("1/16 in", 0.0625, Unit::Inch),
     ("1/8 in", 0.125, Unit::Inch),
     ("1/4 in", 0.25, Unit::Inch),
     ("1/2 in", 0.5, Unit::Inch),
     ("1 in", 1.0, Unit::Inch),
+    ("0.1 cm", 0.1, Unit::Cm),
+    ("0.25 cm", 0.25, Unit::Cm),
     ("0.5 cm", 0.5, Unit::Cm),
     ("1 cm", 1.0, Unit::Cm),
 ];
@@ -1224,6 +1232,10 @@ impl BioCartoon {
         // Snapping became off by default in version 4.
         if settings.version < 4 {
             settings.grid_snap = false;
+        }
+        // Until version 5, "Snap to grid" rounded every position to the grid; that is now its own setting.
+        if settings.version < 5 && settings.grid_snap {
+            settings.grid_steps = true;
         }
         settings.version = SETTINGS_VERSION;
         // In the browser, an absolute path inside crate::storage (user assets are stored by absolute path).
@@ -1687,7 +1699,7 @@ impl BioCartoon {
         } else {
             item.pos = [center.x - size.x / 2.0, center.y - size.y / 2.0];
         }
-        if self.settings.grid_snap {
+        if self.settings.grid_steps {
             let g = self.settings.grid_size;
             item.pos = [(item.pos[0] / g).round() * g, (item.pos[1] / g).round() * g];
         }
@@ -1857,15 +1869,22 @@ impl BioCartoon {
         }
     }
 
+    /// Remember a picked or dropped file in Uploads. It is read afresh, so a file uploaded again
+    /// after being changed on disk shows its new contents rather than the cached ones.
+    fn add_upload(&mut self, f: &Path) {
+        let s = f.display().to_string();
+        self.images.forget(&format!("file:{s}"));
+        if !self.settings.uploads.contains(&s) {
+            self.settings.uploads.push(s);
+        }
+    }
+
     /// Images dropped on the canvas: remembered in Uploads and placed on the page, fanned out
     /// around `at` when given, then all selected.
     fn drop_images(&mut self, files: &[PathBuf], at: Option<Pos2>) {
         let mut placed = Vec::new();
         for (i, f) in files.iter().enumerate() {
-            let s = f.display().to_string();
-            if !self.settings.uploads.contains(&s) {
-                self.settings.uploads.push(s);
-            }
+            self.add_upload(f);
             self.insert_file(f);
             let Some(&id) = self.selection.first() else { continue };
             placed.push(id);
@@ -1995,7 +2014,7 @@ impl BioCartoon {
         let target = if self.selection.len() > 1 { sel_rect } else { page };
         self.commit();
         let sel = self.selection.clone();
-        let g = self.settings.grid_snap;
+        let g = self.settings.grid_steps;
         let gs = self.settings.grid_size;
         let snap = |v: f32| if g { (v / gs).round() * gs } else { v };
         match kind {
@@ -4500,7 +4519,7 @@ impl BioCartoon {
             ("Title + figure", "Heading at the top, large figure area"),
             ("Two panels", "A and B panels side by side with labels"),
             ("Pathway", "Three steps connected by arrows"),
-            ("Four-panel grid", "2 x 2 labelled panels"),
+            ("Four-panel grid", "2 x 2 labeled panels"),
             ("Figure with legend", "Figure area with a legend table"),
         ]
     }
@@ -4781,13 +4800,15 @@ impl BioCartoon {
             }
             Action::UseTemplate(i) => self.use_template(i),
             Action::Select(ids) => self.select(ids),
-            Action::ToggleSelect(id) => {
+            Action::ToggleSelect(id, whole_group) => {
                 if let Some(i) = self.selection.iter().position(|x| *x == id) {
                     self.selection.remove(i);
                 } else {
                     self.selection.push(id);
                 }
-                self.expand_groups();
+                if whole_group {
+                    self.expand_groups();
+                }
             }
             Action::ClearSelection => self.select(Vec::new()),
             Action::Delete => self.delete_selection(),
@@ -4968,10 +4989,7 @@ impl BioCartoon {
                 });
             }
             Action::LibraryFilePicked(f) => {
-                let s = f.display().to_string();
-                if !self.settings.uploads.contains(&s) {
-                    self.settings.uploads.push(s);
-                }
+                self.add_upload(&f);
                 self.open_upload_dialog(UploadTarget::File(f), false);
             }
             Action::SubmitUpload => self.submit_upload(),
@@ -5030,10 +5048,7 @@ impl BioCartoon {
             }
             Action::AddUploads(files) => {
                 for f in files {
-                    let s = f.display().to_string();
-                    if !self.settings.uploads.contains(&s) {
-                        self.settings.uploads.push(s);
-                    }
+                    self.add_upload(&f);
                 }
             }
             Action::DropImages(files, at) => self.drop_images(&files, at),
@@ -5462,7 +5477,8 @@ impl BioCartoon {
 
     /// While an export runs, a card above the toasts: a bar with the time left once more than one
     /// file is being written (each takes about as long), otherwise a spinner and the time so far.
-    fn export_progress_ui(&self, ctx: &egui::Context) {
+    /// The X on its left cancels the export.
+    fn export_progress_ui(&mut self, ctx: &egui::Context) {
         let Some((progress, started)) = &self.export_progress else { return };
         // The email preview is quick and has its own flow.
         if self.pending_email.is_some() {
@@ -5477,21 +5493,34 @@ impl BioCartoon {
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
         let (done, total) = progress.get();
         let secs = |s: f64| if s < 60.0 { format!("{:.0} s", s.max(1.0)) } else { format!("{}:{:02} min", s as u64 / 60, s as u64 % 60) };
-        egui::Area::new(egui::Id::new("export_progress")).anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -96.0)).order(egui::Order::Tooltip).interactable(false).show(ctx, |ui| {
+        let mut cancel = false;
+        egui::Area::new(egui::Id::new("export_progress")).anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -96.0)).order(egui::Order::Tooltip).show(ctx, |ui| {
             egui::Frame::new().fill(theme::toast()).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 8)).stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
-                if total > 1 {
-                    let frac = done as f32 / total as f32;
-                    let left = if done == 0 { "estimating time left".to_string() } else { format!("about {} left", secs(elapsed * (total - done) as f64 / done as f64)) };
-                    ui.label(format!("Exporting {} of {total} · {left}", (done + 1).min(total)));
-                    ui.add(egui::ProgressBar::new(frac).desired_width(280.0).show_percentage());
-                } else {
-                    ui.horizontal(|ui| {
+                ui.horizontal(|ui| {
+                    cancel = ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).on_hover_text("Cancel export").clicked();
+                    if total > 1 {
+                        ui.vertical(|ui| {
+                            let frac = done as f32 / total as f32;
+                            let left = if done == 0 { "estimating time left".to_string() } else { format!("about {} left", secs(elapsed * (total - done) as f64 / done as f64)) };
+                            ui.label(format!("Exporting {} of {total} · {left}", (done + 1).min(total)));
+                            ui.add(egui::ProgressBar::new(frac).desired_width(280.0).show_percentage());
+                        });
+                    } else {
                         ui.spinner();
                         ui.label(format!("Exporting... {}", secs(elapsed)));
-                    });
-                }
+                    }
+                });
             });
         });
+        if cancel {
+            // The worker stops at the next file and removes what it already wrote; the card goes
+            // now rather than when it gets there.
+            progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.export_job = None;
+            self.export_progress = None;
+            self.export_credits = None;
+            self.toast("Export cancelled");
+        }
     }
 
     fn toasts_ui(&mut self, ctx: &egui::Context) {
@@ -6148,7 +6177,7 @@ impl BioCartoon {
     /// Headless-ish smoke test: `BIOCARTOON_SCREENSHOT=out.png` captures the window after a
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
-    /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, spell, viewspell, dictionary, textedit, tableedit, placetext,
+    /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, gridsteps, spell, viewspell, dictionary, textedit, equation, tableedit, placetext,
     /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
@@ -6269,6 +6298,7 @@ impl BioCartoon {
                         crate::doc::set_flag(&mut kind, Some(31..34), crate::doc::TextFlag::Strike, true);
                         crate::doc::set_color(&mut kind, Some(39..45), [37, 99, 235, 255]);
                         crate::doc::set_flag(&mut kind, Some(39..45), crate::doc::TextFlag::Bold, true);
+                        crate::doc::set_highlight(&mut kind, Some(7..16), Some([250, 204, 21, 255]));
                         self.slide_mut().items.push(Item::new(id, "Text", kind, Pos2::new(160.0, 140.0), Vec2::new(460.0, 200.0)));
                         self.select(vec![id]);
                         self.start_text_edit(id);
@@ -6276,6 +6306,28 @@ impl BioCartoon {
                         let mut state = egui::text_edit::TextEditState::default();
                         state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(39), egui::text::CCursor::new(45))));
                         state.store(&self.ctx, te);
+                    }
+                    // Superscripts and subscripts set from the Edit panel and from LaTeX, the first
+                    // box selected.
+                    "equation" => {
+                        self.show_settings = false;
+                        self.view.fit_requested = false;
+                        self.view.zoom = 1.0;
+                        self.view.pan = Vec2::new(180.0, 0.0);
+                        let id = self.doc.alloc_id();
+                        let mut kind = ItemKind::text("ADP + Pi → ATP, Ca2+ and x2", 32.0, [30, 30, 30, 255], TextAlign::Left, false);
+                        crate::doc::set_flag(&mut kind, Some(7..8), crate::doc::TextFlag::Subscript, true);
+                        crate::doc::set_flag(&mut kind, Some(18..20), crate::doc::TextFlag::Superscript, true);
+                        crate::doc::set_flag(&mut kind, Some(26..27), crate::doc::TextFlag::Subscript, true);
+                        self.slide_mut().items.push(Item::new(id, "Text", kind, Pos2::new(160.0, 140.0), Vec2::new(520.0, 60.0)));
+                        let lid = self.doc.alloc_id();
+                        let (text, runs) = crate::latex::to_text("\\Delta G^\\circ = -RT\\ln K_{eq}, \\quad e^{i\\pi} + 1 = 0, \\quad \\frac{d[A]}{dt} = -k[A]");
+                        let mut kind = ItemKind::text(text, 32.0, [30, 30, 30, 255], TextAlign::Left, false);
+                        if let ItemKind::Text { runs: r, .. } = &mut kind {
+                            *r = runs;
+                        }
+                        self.slide_mut().items.push(Item::new(lid, "Text", kind, Pos2::new(160.0, 260.0), Vec2::new(620.0, 120.0)));
+                        self.select(vec![id]);
                     }
                     // A table with a cell being typed into on the canvas, with its Edit panel open.
                     "tableedit" => {
@@ -6400,6 +6452,7 @@ impl BioCartoon {
                     "dark" => self.settings.theme = theme::ThemeMode::Dark,
                     "grid" => self.settings.show_grid = true,
                     "snap" => self.settings.grid_snap = true,
+                    "gridsteps" => self.settings.grid_steps = true,
                     "settings" => self.open_settings(SettingsTab::General),
                     "noautosave" => self.settings.autosave = false,
                     "quitprompt" => self.leave_prompt = Some(None),
@@ -6772,6 +6825,7 @@ mod tests {
         let mut s = Settings::default();
         s.text_size = theme::TextSize::Large;
         s.grid_snap = true;
+        s.grid_steps = true;
         s.grid_size = 48.0;
         s.ai_prompts.generate = "mine".into();
         s.api_key = "key".into();
@@ -6780,7 +6834,7 @@ mod tests {
         s.contributor_name = "Ada".into();
         let r = s.restored_defaults();
         let d = Settings::default();
-        assert!(r.text_size == d.text_size && !r.grid_snap && r.grid_size == d.grid_size);
+        assert!(r.text_size == d.text_size && !r.grid_snap && !r.grid_steps && r.grid_size == d.grid_size);
         assert_eq!(r.ai_prompts, d.ai_prompts);
         assert_eq!((r.api_key.as_str(), r.contributor_name.as_str()), ("key", "Ada"));
         assert_eq!((r.favorites, r.custom_words), (s.favorites, s.custom_words));

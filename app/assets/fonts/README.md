@@ -3,7 +3,7 @@
 The typefaces offered in a text box's Font menu besides egui's own Ubuntu and Hack
 (`TextFont::EMBEDDED` in `src/doc.rs`), compiled into the desktop app and loaded into the SVG /
 PDF / PNG exporter. The web build fetches them from `fonts/` at startup instead (index.html copies
-this folder into `dist/`), which keeps the .wasm under Cloudflare's 25 MiB limit. Regular weight only: bold and italic are synthesised, as for Ubuntu.
+this folder into `dist/`), which keeps the .wasm under Cloudflare's 25 MiB limit. Regular weight only: bold and italic are synthesized, as for Ubuntu.
 
 All are from [Google Fonts](https://fonts.google.com), unmodified (the static Regular instance the
 Google Fonts CSS API serves): Tinos, Roboto Slab and Permanent Marker under the Apache License 2.0,
