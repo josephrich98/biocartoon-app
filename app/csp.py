@@ -9,7 +9,7 @@ which Cloudflare's static assets apply to every response.
 Keep connect-src in step with the hosts the app fetches from: DEFAULT_ASSET_URL (biocartoon
 catalog/src/lib.rs), DEFAULT_SUBMIT_URL (src/submit.rs) and the AI providers (src/ai.rs). A custom
 asset or submission URL set in Settings is blocked on the web build, as is a vLLM server anywhere
-but localhost.
+but localhost. Both pages also allow GoatCounter's script and the endpoint it reports visits to.
 """
 import base64
 import hashlib
@@ -30,20 +30,24 @@ APP_HOSTS = [
 # A vLLM server on the user's own machine (src/ai.rs); under trunk serve, also a local Worker
 # (wrangler dev).
 LOCAL_HOSTS = ["http://localhost:*", "http://127.0.0.1:*"]
+# GoatCounter visit counting (the <script> in index.html and download.html): count.js from
+# gc.zgo.at, which reports to /count by sendBeacon, or an <img> where that's unavailable.
+GOATCOUNTER_SCRIPT = "https://gc.zgo.at"
+GOATCOUNTER = "https://biocartoon-app.goatcounter.com"
 # trunk serve: trunk's own reload socket.
 DEV_HOSTS = ["ws://localhost:*", "ws://127.0.0.1:*"] if DEBUG else []
 
 # 'wasm-unsafe-eval' lets the page compile its own .wasm; it doesn't allow eval() of strings.
 POLICIES = {
     "index.html": {
-        "script-src": ["'self'", "'wasm-unsafe-eval'"],
-        "connect-src": ["'self'", *APP_HOSTS, *LOCAL_HOSTS, *DEV_HOSTS],
-        "img-src": ["'self'", "data:", "blob:"],
+        "script-src": ["'self'", "'wasm-unsafe-eval'", GOATCOUNTER_SCRIPT],
+        "connect-src": ["'self'", *APP_HOSTS, *LOCAL_HOSTS, *DEV_HOSTS, GOATCOUNTER],
+        "img-src": ["'self'", "data:", "blob:", GOATCOUNTER],
     },
     "download.html": {
-        "script-src": [],
-        "connect-src": ["https://api.github.com"],
-        "img-src": ["'self'", "data:"],
+        "script-src": [GOATCOUNTER_SCRIPT],
+        "connect-src": ["https://api.github.com", GOATCOUNTER],
+        "img-src": ["'self'", "data:", GOATCOUNTER],
     },
 }
 COMMON = {
