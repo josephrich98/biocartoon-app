@@ -100,17 +100,19 @@ fn assets(w: &Worker, req_id: u64, rows: Vec<AssetRow>, more: bool, total: i64) 
 }
 
 /// One more than `limit` ids of the user's own uploads from `offset` (to tell whether there are
-/// more), and how many there are in all. Popular falls back to newest first.
+/// more), and how many there are in all. Popular is most starred first, then newest first.
 fn library(w: &Worker, offset: usize, limit: usize, sort: IconSort) -> rusqlite::Result<(Vec<String>, i64)> {
-    let own = "source='user' AND png_local IS NOT NULL AND png_key IS NOT NULL";
+    let own = "a.source='user' AND a.png_local IS NOT NULL AND a.png_key IS NOT NULL";
     let order = match sort {
-        IconSort::Alphabetical => "lower(coalesce(title,'')), id",
-        IconSort::ReverseAlphabetical => "lower(coalesce(title,'')) DESC, id",
-        _ => "rowid DESC",
+        IconSort::Alphabetical => "lower(coalesce(a.title,'')), a.id".to_string(),
+        IconSort::ReverseAlphabetical => "lower(coalesce(a.title,'')) DESC, a.id".to_string(),
+        IconSort::Popular => format!("{} DESC, a.rowid DESC", w.star_count()),
+        IconSort::Relevance => "a.rowid DESC".to_string(),
     };
-    let mut st = w.conn.prepare(&format!("SELECT id FROM assets WHERE {own} ORDER BY {order} LIMIT ?1 OFFSET ?2"))?;
+    let stars_join = w.stars_join();
+    let mut st = w.conn.prepare(&format!("SELECT a.id FROM assets a {stars_join} WHERE {own} ORDER BY {order} LIMIT ?1 OFFSET ?2"))?;
     let ids = st.query_map(rusqlite::params![limit as i64 + 1, offset as i64], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
-    let total = w.conn.query_row(&format!("SELECT count(*) FROM assets WHERE {own}"), [], |r| r.get(0))?;
+    let total = w.conn.query_row(&format!("SELECT count(*) FROM assets a WHERE {own}"), [], |r| r.get(0))?;
     Ok((ids, total))
 }
 

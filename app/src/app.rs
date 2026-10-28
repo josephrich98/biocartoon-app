@@ -50,7 +50,7 @@ pub struct Settings {
     /// library, so none is submitted twice.
     pub submitted: Vec<String>,
     pub uploads: Vec<String>,
-    /// Ids of the assets the user starred (their favorites), most recent first. This is what
+    /// Ids of the assets and templates the user starred (their favorites), most recent first. This is what
     /// counts as "mine": the star counts on the Worker follow it (see `pending_stars`).
     pub favorites: Vec<String>,
     /// Star changes the Worker has not confirmed yet (asset id, starred), sent again when it can
@@ -163,7 +163,7 @@ impl Default for Settings {
             home_ascending: false,
             home_view: HomeView::LargeTiles,
             icon_sort: IconSort::Alphabetical,
-            search_sort: IconSort::Relevance,
+            search_sort: IconSort::Popular,
             submit_url: String::new(),
             contributor_name: String::new(),
             contributor_email: String::new(),
@@ -300,7 +300,7 @@ pub enum IconsMode {
     Home,
     Search,
     Generate,
-    /// Icons the user starred as favorites (kept in [`Settings::favorites`]).
+    /// Icons and templates the user starred as favorites (kept in [`Settings::favorites`]).
     Favorites,
     /// "Your library": the user's own uploads and saved templates.
     Library,
@@ -450,6 +450,9 @@ pub struct IconsState {
     pub include: Include,
     /// Scroll the Icons panel to its top (`Min`) or bottom (`Max`) next frame.
     pub scroll_to: Option<egui::Align>,
+    /// The search's sort was picked by hand since the search opened; until then it follows the
+    /// query (Popular with nothing typed, Relevance once something is).
+    pub sort_picked: bool,
 }
 
 impl Default for IconsState {
@@ -480,6 +483,7 @@ impl Default for IconsState {
             error: None,
             include: Include::Both,
             scroll_to: None,
+            sort_picked: false,
         }
     }
 }
@@ -1027,6 +1031,9 @@ pub struct BioCartoon {
     pub stars: StarsClient,
     /// Assets whose star change is on its way to the Worker.
     pub stars_in_flight: HashSet<String>,
+    /// Everyone's stars on each template, as the Worker last reported them (templates are not in
+    /// the catalog, so their counts are kept here rather than on a row).
+    pub template_stars: HashMap<String, i64>,
     /// The stars from before favorites were kept in Settings have been carried over.
     stars_migrated: bool,
     /// Web: the optional account that keeps projects and Your library online.
@@ -1279,6 +1286,7 @@ impl BioCartoon {
             catalog: CatalogClient::new(PathBuf::new(), PathBuf::new()),
             stars: StarsClient::new(Some(cc.egui_ctx.clone())),
             stars_in_flight: HashSet::new(),
+            template_stars: HashMap::new(),
             stars_migrated: false,
             account: crate::account::Account::new(app_dir.join("account.json"), cc.egui_ctx.clone()),
             library: crate::library::Library::open(app_dir.join("library.json")),
@@ -2321,6 +2329,7 @@ impl BioCartoon {
                         self.stars_migrated = true;
                         self.catalog.send(Req::MyStars);
                         self.sync_stars();
+                        self.fetch_template_stars();
                     }
                 }
                 Resp::MyStars { ids, .. } => self.adopt_stars(ids),
@@ -2386,6 +2395,20 @@ impl BioCartoon {
         }
     }
 
+    /// The same for every template.
+    fn fetch_template_stars(&mut self) {
+        if let Some(url) = self.submit_url() {
+            let ids = self.template_rows.iter().map(|r| r.meta.id.clone()).collect();
+            self.stars.fetch(&url, &self.settings.client_id, ids);
+        }
+    }
+
+    /// List the templates again (one was saved, removed or published), with their counts.
+    fn reload_templates(&mut self) {
+        self.template_rows = self.templates.list();
+        self.fetch_template_stars();
+    }
+
     fn poll_stars(&mut self) {
         for m in self.stars.poll() {
             match m {
@@ -2437,10 +2460,15 @@ impl BioCartoon {
                 r.starred = u.mine;
             }
         }
+        for u in &updates {
+            if self.template_rows.iter().any(|t| t.meta.id == u.id) {
+                self.template_stars.insert(u.id.clone(), u.n);
+            }
+        }
         self.catalog.send(Req::SetStars { updates });
     }
 
-    /// Star the asset `id` (add it to Favorites), or take the star back. Favorites are kept in
+    /// Star the asset or template `id` (add it to Favorites), or take the star back. Favorites are kept in
     /// Settings, so this works offline; the Worker's count follows now, or once it can be reached.
     fn toggle_favorite(&mut self, id: String) {
         if id.is_empty() {
@@ -2456,6 +2484,9 @@ impl BioCartoon {
         if let Some(r) = self.icons.results.iter().chain(&self.variants).find(|r| r.id == id) {
             let u = StarUpdate { id: id.clone(), n: (r.stars + if on { 1 } else { -1 }).max(0), mine: on };
             self.apply_stars(vec![u]);
+        } else if self.template_rows.iter().any(|t| t.meta.id == id) {
+            let n = self.template_stars.get(&id).copied().unwrap_or(0);
+            self.apply_stars(vec![StarUpdate { id: id.clone(), n: (n + if on { 1 } else { -1 }).max(0), mine: on }]);
         }
         if self.icons.mode == IconsMode::Favorites {
             if on {
@@ -2491,6 +2522,10 @@ impl BioCartoon {
     }
 
     pub fn request_search(&mut self) {
+        let empty = self.icons.query.trim().is_empty();
+        if !self.icons.sort_picked || (empty && self.settings.search_sort == IconSort::Relevance) {
+            self.settings.search_sort = if empty { IconSort::Popular } else { IconSort::Relevance };
+        }
         self.icons.browse_offset = 0;
         // A new search starts from the top of its results.
         self.icons.scroll_to = Some(egui::Align::Min);
@@ -3460,7 +3495,7 @@ impl BioCartoon {
                             log::warn!("templates merge: {e}");
                         }
                         crate::templates::remove_download(&file);
-                        self.template_rows = self.templates.list();
+                        self.reload_templates();
                     }
                     Ok(None) => {}
                     Err(e) => log::warn!("template sync: {e}"),
@@ -3514,7 +3549,7 @@ impl BioCartoon {
                                 Some(Err(e)) => self.toast_err(format!("Template \"{title}\" is saved here but was not submitted: {e}")),
                             }
                         }
-                        self.template_rows = self.templates.list();
+                        self.reload_templates();
                     }
                     Err(e) => self.toast_err(format!("Template not saved: {e}")),
                 },
@@ -5047,7 +5082,7 @@ impl BioCartoon {
             }
             Action::RemoveTemplate(id) => {
                 self.remove_saved_template(&id);
-                self.template_rows = self.templates.list();
+                self.reload_templates();
             }
             Action::PickUploads => {
                 let tx = self.action_tx.clone();
@@ -5272,6 +5307,9 @@ impl BioCartoon {
         }
         if self.images.loads_in_flight > 0 || self.ai.busy > 0 || self.icons.loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if self.icons.mode != IconsMode::Search {
+            self.icons.sort_picked = false;
         }
         // Debounced search: a filter change runs at once, typing once it pauses.
         if self.settings.show_icons && self.icons.mode == IconsMode::Search {

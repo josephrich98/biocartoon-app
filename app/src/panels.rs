@@ -283,20 +283,23 @@ impl BioCartoon {
         }
         let rows = self.template_rows.iter();
         match self.icons.mode {
-            IconsMode::Search => {
-                let f = &self.icons.filter;
+            // Favorites: the starred ones, under Favorites' box and filters.
+            IconsMode::Search | IconsMode::Favorites => {
+                let fav = self.icons.mode == IconsMode::Favorites;
+                let f = if fav { &self.icons.mine_filter } else { &self.icons.filter };
                 // Templates are slides, not image files, so a file type leaves them out.
                 if !f.formats.is_empty() {
                     return Vec::new();
                 }
                 let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
-                let q = self.icons.query.trim();
+                let q = if fav { self.icons.mine_query.trim() } else { self.icons.query.trim() };
                 let authors = f.authors();
                 let tags = f.tags();
                 // A template's category is free text: it matches a picked category or subcategory by name.
                 let places: Vec<&str> = f.cats.iter().map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
                 // Each is in BioCartoon or User-generated: another database's filter leaves it out.
-                rows.filter(|r| any_source || f.sources.is_empty() || f.sources.iter().any(|s| s == r.source()))
+                rows.filter(|r| !fav || self.settings.favorites.contains(&r.meta.id))
+                    .filter(|r| any_source || f.sources.is_empty() || f.sources.iter().any(|s| s == r.source()))
                     .filter(|r| template_match(r, q))
                     .filter(|r| authors.is_empty() || authors.iter().any(|a| r.meta.author.to_lowercase().contains(a)))
                     .filter(|r| tags.is_empty() || tags.iter().any(|t| r.meta.tags.iter().any(|x| eq(x, t))))
@@ -361,7 +364,7 @@ impl BioCartoon {
         };
         let f = if mine { &self.icons.mine_filter } else { &self.icons.filter };
         let in_facet = |list: &[(String, i64)], v: &str| facets.as_ref().map(|_| list.iter().find(|(k, _)| k == v).map_or(0, |(_, n)| *n));
-        // The templates under the query and the other filters (Favorites are icons only).
+        // The templates under the query and the other filters (Favorites' counts are of its icons).
         let templates = if mine { Vec::new() } else { self.templates_matching(true) };
         let dbs: Vec<(String, String)> = self
             .databases()
@@ -413,7 +416,7 @@ impl BioCartoon {
         // Each database's own categories, "BA: Viruses", in the order of the databases. BioCartoon's
         // and User-generated's include their templates' categories.
         let mut own: Vec<(String, String, Option<i64>)> = facets.as_ref().map_or(Vec::new(), |fc| fc.db_cats.iter().map(|(s, c, n)| (s.clone(), c.clone(), Some(*n))).collect());
-        // (Favorites are icons only.)
+        // (Favorites' are of its icons.)
         if !mine {
             let picked = |src: &str| f.sources.is_empty() || f.sources.iter().any(|s| s == src);
             for (src, c) in self.template_rows.iter().map(|r| (r.source(), r.meta.category.trim())).filter(|(src, c)| !c.is_empty() && picked(src)) {
@@ -732,7 +735,7 @@ impl BioCartoon {
             IconsMode::Suggest => self.suggest_panel(ui),
             IconsMode::Favorites => {
                 if self.settings.favorites.is_empty() {
-                    ui.label(egui::RichText::new("No favorites yet. Right-click an icon and pick Favorite.").color(theme::text_dim()));
+                    ui.label(egui::RichText::new("No favorites yet. Click the star on an icon or template, or right-click it and pick Favorite.").color(theme::text_dim()));
                 } else {
                     self.mine_filters(ui);
                     self.results_grid(ui);
@@ -799,7 +802,9 @@ impl BioCartoon {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Sort").small().color(theme::text_dim()));
             let (sort, options): (&mut IconSort, &[IconSort]) = if self.icons.mode == IconsMode::Search {
-                (&mut self.settings.search_sort, &IconSort::SEARCH)
+                // Relevance only means something once a query is typed.
+                let options: &[IconSort] = if self.icons.query.trim().is_empty() { &IconSort::SEARCH[1..] } else { &IconSort::SEARCH };
+                (&mut self.settings.search_sort, options)
             } else {
                 (&mut self.settings.icon_sort, &IconSort::ALL)
             };
@@ -810,6 +815,7 @@ impl BioCartoon {
                 }
             });
             if *sort != before {
+                self.icons.sort_picked = self.icons.mode == IconsMode::Search;
                 self.reload_results();
             }
             ui.label(egui::RichText::new("Include").small().color(theme::text_dim()));
@@ -1060,11 +1066,16 @@ impl BioCartoon {
         });
     }
 
-    /// One template's thumbnail in the results grid; clicking it adds its slide.
+    /// One template's thumbnail in the results grid; clicking it adds its slide, and clicking its
+    /// star stars it (makes it a favorite), as on an icon.
     fn template_tile(&mut self, ui: &mut egui::Ui, size: f32, row: &TemplateRow) {
         let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
         let (abbr, col, _) = theme::source_badge(row.source());
         let r = tile(ui, size, &row.meta.title, state, self.settings.tile_database.then_some((abbr, col, "Template")));
+        let fav = self.settings.favorites.contains(&row.meta.id);
+        let stars = self.template_stars.get(&row.meta.id).copied().unwrap_or(0);
+        let star_rect = star_corner(ui, r.rect, stars, fav, self.settings.tile_stars, r.hover_pos());
+        let on_star = (self.settings.tile_stars || fav) && r.interact_pointer_pos().is_some_and(|q| star_rect.contains(q));
         // Laid out like an icon's: "Eukaryotic cell  ·  Template", the description and category,
         // "BioCartoon  ·  CC0-1.0  ·  AI unknown", the ID, and the credit line in grey.
         let info = |ui: &mut egui::Ui| {
@@ -1080,21 +1091,23 @@ impl BioCartoon {
             ui.label(format!("Template ID: {}", row.meta.id));
             ui.label(egui::RichText::new(crate::credits::template_row_credit(&row.meta)).small().color(theme::text_dim()));
         };
-        // A long press opens the context menu when there is one, so the info goes there.
-        let r = if row.json_local.is_some() { r.on_hover_ui(info) } else { info_ui(r, info) };
+        // A long press opens the context menu too, so the info goes there for touch screens.
+        let r = r.on_hover_ui(info);
         if r.clicked() {
-            self.actions.push(Action::UseSavedTemplate(row.clone()));
+            self.actions.push(if on_star { Action::ToggleFavorite(row.meta.id.clone()) } else { Action::UseSavedTemplate(row.clone()) });
         }
-        if row.json_local.is_some() {
-            r.context_menu(|ui| {
-                info(ui);
-                ui.separator();
-                if ui.button("Remove from this computer").clicked() {
-                    self.actions.push(Action::RemoveTemplate(row.meta.id.clone()));
-                    ui.close();
-                }
-            });
-        }
+        r.context_menu(|ui| {
+            info(ui);
+            ui.separator();
+            if ui.button(format!("{}  {}", ph::STAR, if fav { "Unfavorite" } else { "Favorite" })).clicked() {
+                self.actions.push(Action::ToggleFavorite(row.meta.id.clone()));
+                ui.close();
+            }
+            if row.json_local.is_some() && ui.button("Remove from this computer").clicked() {
+                self.actions.push(Action::RemoveTemplate(row.meta.id.clone()));
+                ui.close();
+            }
+        });
     }
 
     /// Thumbnail of a built-in slide format, as shown in the new-slide dropdown.
@@ -2409,17 +2422,6 @@ fn star_corner(ui: &egui::Ui, rect: Rect, stars: i64, starred: bool, count: bool
         p.galley(Pos2::new(b.max.x - 5.0 - galley.size().x, b.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
     }
     b
-}
-
-/// `r.on_hover_ui(info)`, and the same info in a popup on a long press, since touch screens
-/// (the web app on a phone) have no hover. The popup closes on the next tap.
-fn info_ui(r: egui::Response, info: impl Fn(&mut egui::Ui)) -> egui::Response {
-    egui::Popup::from_response(&r)
-        .id(r.id.with("hold_info"))
-        .open_memory(r.long_touched().then_some(egui::SetOpenCommand::Bool(true)))
-        .width(260.0)
-        .show(|ui| info(ui));
-    r.on_hover_ui(info)
 }
 
 /// One tile of the Icons panel's results: icons and templates share one grid.
