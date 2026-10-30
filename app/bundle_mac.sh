@@ -29,8 +29,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>BioCartoon</string>
   <key>CFBundleDisplayName</key><string>BioCartoon</string>
   <key>CFBundleIdentifier</key><string>com.biocartoon.app</string>
-  <key>CFBundleVersion</key><string>0.4.1</string>
-  <key>CFBundleShortVersionString</key><string>0.4.1</string>
+  <key>CFBundleVersion</key><string>0.4.3</string>
+  <key>CFBundleShortVersionString</key><string>0.4.3</string>
   <key>NSHumanReadableCopyright</key><string>© 2026 Joseph Rich. Licensed under the GNU AGPL v3.0.</string>
   <key>CFBundleExecutable</key><string>biocartoon-app</string>
   <key>CFBundleIconFile</key><string>BioCartoon</string>

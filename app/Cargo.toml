@@ -1,6 +1,6 @@
 [package]
 name = "biocartoon"
-version = "0.4.1"
+version = "0.4.3"
 edition = "2021"
 # cargo-packager writes this into the .deb's Maintainer field.
 authors = ["Joseph Rich <josephrich98@gmail.com>"]
