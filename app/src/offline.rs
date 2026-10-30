@@ -1,14 +1,19 @@
 //! Offline packs and bulk downloads.
 //!
-//! Desktop: images live under `<app data>/offline/assets/<png_key>`. The image loader writes
-//! every PNG it fetches there and reads from there before the network, so anything used once
-//! keeps working without internet; a pack fills the folder for whole collections up front and
-//! adds `assets.sqlite` (a copy of the catalog) and `README.md` next to it.
+//! Desktop: images live under `<app data>/offline/assets/<key>` (an icon's PNG, and its SVG when
+//! it has one). The image loader writes every image it fetches there and reads from there before
+//! the network, so anything used once keeps working without internet; a pack fills the folder for
+//! whole collections up front and adds `assets.sqlite` (a copy of the catalog) and `README.md`
+//! next to it. Templates go there too: their JSON, thumbnail and every image they use.
+//!
+//! An icon is downloaded once all its files are there, a template once it and its images are;
+//! that is what Settings > Offline counts and the Downloads filter lists.
 //!
 //! Web: the browser can't keep a folder, so the same pack is downloaded as a .zip with the
 //! same layout under `biocartoon-offline/`. The zip is assembled in a Blob a few files at a
 //! time, so a pack of a gigabyte or more never sits in wasm memory.
 
+use crate::templates::TemplateRow;
 use rusqlite::Connection;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -22,7 +27,10 @@ const ZIP_ROOT: &str = "biocartoon-offline";
 /// Attempts per image before it counts as failed (connections drop on long downloads).
 const TRIES: u32 = 4;
 
-/// One collection of the catalog, and how much of it is downloaded.
+/// The Templates row of Settings > Offline, which is not a collection of the catalog.
+pub const TEMPLATES: &str = "templates";
+
+/// One collection of the catalog (or [`TEMPLATES`]), and how much of it is downloaded.
 #[derive(Clone, Debug, Default)]
 pub struct Collection {
     pub source: String,
@@ -30,9 +38,11 @@ pub struct Collection {
     pub count: usize,
     pub bytes: u64,
     pub licenses: String,
-    /// Images already on this computer (always 0 in the browser).
+    /// Icons (or templates) already on this computer (always 0 in the browser).
     pub have: usize,
     pub have_bytes: u64,
+    /// Some sizes aren't known, so `bytes` is short: a template's is known once it is downloaded.
+    pub more: bool,
 }
 
 impl Collection {
@@ -85,6 +95,20 @@ fn open_catalog(db: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Whether the catalog's `assets` table has `col` (catalogs from before SVGs don't).
+fn has_col(conn: &Connection, col: &str) -> bool {
+    conn.query_row("SELECT count(*) FROM pragma_table_info('assets') WHERE name = ?1", [col], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false)
+}
+
+/// The SQL for a row's SVG key (NULL when it has none) and for the bytes of all its files.
+fn file_cols(conn: &Connection) -> (&'static str, &'static str) {
+    match (has_col(conn, "svg_key"), has_col(conn, "svg_bytes")) {
+        (true, true) => ("nullif(svg_key, '')", "coalesce(png_bytes, 0) + coalesce(svg_bytes, 0)"),
+        (true, false) => ("nullif(svg_key, '')", "coalesce(png_bytes, 0)"),
+        _ => ("NULL", "coalesce(png_bytes, 0)"),
+    }
+}
+
 /// The collection a row belongs to: uploads accepted to BioCartoon count as BioCartoon (see
 /// [`crate::theme::asset_source`]).
 fn source_sql() -> String {
@@ -95,9 +119,10 @@ fn source_sql() -> String {
 /// Every collection (User-generated always listed, even when empty): BioCartoon first, then
 /// the rest in order of the databases' two-letter badges.
 fn collections(conn: &Connection) -> Result<Vec<Collection>, String> {
+    let (_, bytes) = file_cols(conn);
     let mut st = conn
         .prepare(&format!(
-            "SELECT {} AS src, max(source_name), count(*), coalesce(sum(png_bytes), 0), group_concat(DISTINCT license) \
+            "SELECT {} AS src, max(source_name), count(*), coalesce(sum({bytes}), 0), group_concat(DISTINCT license) \
              FROM assets WHERE png_key IS NOT NULL AND png_key != '' GROUP BY src",
             source_sql()
         ))
@@ -110,8 +135,7 @@ fn collections(conn: &Connection) -> Result<Vec<Collection>, String> {
                 count: r.get::<_, i64>(2)? as usize,
                 bytes: r.get::<_, i64>(3)? as u64,
                 licenses: r.get::<_, Option<String>>(4)?.unwrap_or_default().replace(',', ", "),
-                have: 0,
-                have_bytes: 0,
+                ..Default::default()
             })
         })
         .map_err(|e| e.to_string())?;
@@ -129,19 +153,37 @@ fn collections(conn: &Connection) -> Result<Vec<Collection>, String> {
     Ok(cols)
 }
 
+/// One icon: its PNG (`key`), its SVG when it has one, and the bytes of both.
 struct Item {
     source: String,
     key: String,
+    svg: Option<String>,
     bytes: u64,
 }
 
-/// Every image of `sources` (all collections when empty).
+impl Item {
+    fn files(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.key.as_str()).chain(self.svg.as_deref())
+    }
+
+    /// All its files are under `dir`.
+    fn complete(&self, dir: &Path) -> bool {
+        self.files().all(|k| have_file(dir, k))
+    }
+}
+
+fn have_file(dir: &Path, key: &str) -> bool {
+    cache_path(dir, key).is_some_and(|p| p.is_file())
+}
+
+/// Every icon of `sources` (all collections when empty).
 fn items(conn: &Connection, sources: &[String]) -> Result<Vec<Item>, String> {
+    let (svg, bytes) = file_cols(conn);
     let mut st = conn
-        .prepare(&format!("SELECT {} AS src, png_key, coalesce(png_bytes, 0) FROM assets WHERE png_key IS NOT NULL AND png_key != '' ORDER BY src, png_key", source_sql()))
+        .prepare(&format!("SELECT {} AS src, png_key, {svg}, {bytes} FROM assets WHERE png_key IS NOT NULL AND png_key != '' ORDER BY src, png_key", source_sql()))
         .map_err(|e| e.to_string())?;
     let rows = st
-        .query_map([], |r| Ok(Item { source: r.get(0)?, key: r.get(1)?, bytes: r.get::<_, i64>(2)? as u64 }))
+        .query_map([], |r| Ok(Item { source: r.get(0)?, key: r.get(1)?, svg: r.get(2)?, bytes: r.get::<_, i64>(3)? as u64 }))
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for r in rows {
@@ -151,6 +193,121 @@ fn items(conn: &Connection, sources: &[String]) -> Result<Vec<Item>, String> {
         }
     }
     Ok(out)
+}
+
+// ---------- templates ----------
+
+/// The images a template's slide draws from the bucket: each one's PNG key, and SVG key when it has one.
+fn template_images(t: &crate::templates::TemplateFile) -> Vec<(String, Option<String>)> {
+    use crate::doc::{ImageSource, ItemKind};
+    t.slide
+        .items
+        .iter()
+        .filter_map(|it| match &it.kind {
+            ItemKind::Image { source: ImageSource::Asset { key, svg, .. }, .. } if !key.is_empty() => Some((key.clone(), svg.clone().filter(|s| !s.is_empty()))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Where a template's JSON and thumbnail are on this computer: its own files when it was made
+/// here, else their places under `dir`.
+fn template_files(dir: &Path, row: &TemplateRow) -> (Option<PathBuf>, Option<PathBuf>) {
+    let json = row.json_local.as_deref().map(PathBuf::from).or_else(|| cache_path(dir, &row.json_key));
+    let thumb = row.thumb_local.as_deref().map(PathBuf::from).or_else(|| cache_path(dir, &row.meta.thumb_key));
+    (json, thumb)
+}
+
+/// The Templates row: how many of `rows` are downloaded under `dir` (none in the browser), and
+/// their ids. `sizes` are the catalog icons' bytes by PNG key.
+fn scan_templates(dir: Option<&Path>, rows: &[TemplateRow], sizes: &std::collections::HashMap<&str, u64>) -> (Collection, Vec<String>) {
+    let mut c = Collection { source: TEMPLATES.into(), name: "Templates".into(), count: rows.len(), ..Default::default() };
+    let mut ids = Vec::new();
+    let file_len = |p: Option<PathBuf>| p.and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+    for row in rows {
+        let Some(dir) = dir else {
+            c.more = true;
+            continue;
+        };
+        let (json, thumb) = template_files(dir, row);
+        // Its images are only known from its JSON.
+        let Some(t) = json.and_then(|p| crate::storage::read(&p).ok()).and_then(|b| crate::templates::parse(&b).ok().map(|t| (t, b.len() as u64))) else {
+            c.more = true;
+            continue;
+        };
+        let (t, json_bytes) = t;
+        let mut complete = row.meta.thumb_key.is_empty() && row.thumb_local.is_none() || thumb.as_ref().is_some_and(|p| p.is_file());
+        let mut bytes = json_bytes + file_len(thumb);
+        for (png, svg) in template_images(&t) {
+            complete &= have_file(dir, &png) && svg.as_deref().is_none_or(|k| have_file(dir, k));
+            bytes += sizes.get(png.as_str()).copied().unwrap_or_else(|| {
+                // The template's own images aren't in the catalog: their size on disk, if there.
+                std::iter::once(&png).chain(svg.as_ref()).map(|k| file_len(cache_path(dir, k))).sum()
+            });
+        }
+        c.bytes += bytes;
+        if complete {
+            c.have += 1;
+            c.have_bytes += bytes;
+            ids.push(row.meta.id.clone());
+        }
+    }
+    (c, ids)
+}
+
+/// Desktop: put `key`'s file under `dir` unless it is there already, fetching it from `base`
+/// (trying again when the connection drops). The bytes fetched.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn ensure(base: &str, dir: &Path, key: &str, cancel: &AtomicBool) -> Result<u64, String> {
+    let path = cache_path(dir, key).ok_or_else(|| format!("bad key {key:?}"))?;
+    if path.is_file() {
+        return Ok(0);
+    }
+    let req = crate::assets::Request::Url(format!("{}/{key}", base.trim_end_matches('/')));
+    let mut res = crate::assets::fetch(&req);
+    for n in 1..TRIES {
+        if res.is_ok() || cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500 << n));
+        res = crate::assets::fetch(&req);
+    }
+    let b = res?;
+    // An error page served with a 200 is not the file.
+    let ok = if key.ends_with(".json") { std::str::from_utf8(&b).is_ok() } else { b.starts_with(b"\x89PNG") || crate::assets::is_svg(&b) };
+    if !ok {
+        return Err(format!("{key}: unexpected response"));
+    }
+    store(dir, key, &b);
+    Ok(b.len() as u64)
+}
+
+/// Desktop: download a template for offline use into `dir` (the offline folder's `assets/`):
+/// its JSON and thumbnail, and every image it uses with its SVG. The bytes fetched.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn download_template(base: &str, dir: &Path, row: &TemplateRow, cancel: &AtomicBool) -> Result<u64, String> {
+    if base.is_empty() {
+        return Err("No asset URL configured.".into());
+    }
+    let mut got = 0;
+    let json = match &row.json_local {
+        Some(p) => crate::storage::read(Path::new(p)).map_err(|e| format!("{p}: {e}"))?,
+        None => {
+            got += ensure(base, dir, &row.json_key, cancel)?;
+            crate::storage::read(&cache_path(dir, &row.json_key).unwrap_or_default()).map_err(|e| e.to_string())?
+        }
+    };
+    let t = crate::templates::parse(&json)?;
+    if row.thumb_local.is_none() && !row.meta.thumb_key.is_empty() {
+        got += ensure(base, dir, &row.meta.thumb_key, cancel)?;
+    }
+    for (png, svg) in template_images(&t) {
+        got += ensure(base, dir, &png, cancel)?;
+        if let Some(svg) = svg {
+            got += ensure(base, dir, &svg, cancel)?;
+        }
+    }
+    Ok(got)
 }
 
 /// The catalog's version, from its file name (`assets-<version>.sqlite`).
@@ -163,7 +320,12 @@ fn scope_label(sources: &[String], all: &[Collection]) -> String {
     if sources.is_empty() {
         return "all collections".into();
     }
-    let names: Vec<String> = sources.iter().map(|s| all.iter().find(|c| &c.source == s).map(|c| c.name.clone()).unwrap_or_else(|| s.clone())).collect();
+    let name = |s: &String| match all.iter().find(|c| &c.source == s) {
+        Some(c) => c.name.clone(),
+        None if s == TEMPLATES => "Templates".into(),
+        None => s.clone(),
+    };
+    let names: Vec<String> = sources.iter().map(name).collect();
     names.join(", ")
 }
 
@@ -175,7 +337,7 @@ fn readme(included: &[Collection], version: &str, base_url: &str, zip: bool) -> 
         "Made {} from {base_url} (catalog version {version}).\n\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M")
     ));
-    s.push_str("## Contents\n\n| Collection | Images | Size | Licenses |\n|---|---|---|---|\n");
+    s.push_str("## Contents\n\n| Collection | Icons | Size | Licenses |\n|---|---|---|---|\n");
     let (mut n, mut b) = (0, 0);
     for c in included.iter().filter(|c| c.have > 0) {
         let partial = if c.have < c.count { format!(" (of {})", c.count) } else { String::new() };
@@ -190,7 +352,8 @@ fn readme(included: &[Collection], version: &str, base_url: &str, zip: bool) -> 
          - `assets.sqlite`: the icon catalog (SQLite), one row per image in the `assets` table, with its \
          `title`, `tags`, `category`, `license`, `credit`, `source_url` and `png_key`. It lists every \
          collection in the catalog, including any whose images are not in this pack.\n\
-         - `assets/<png_key>`: the PNG of each row, for example `assets/bioart/2_626557.png`.\n\n\
+         - `assets/<png_key>`: the PNG of each row, for example `assets/bioart/2_626557.png`, and \
+         `assets/<svg_key>` its SVG when it has one.\n\n\
          ## Licenses and credit\n\n\
          Every image keeps the license of the collection it came from (the `license` and `license_url` \
          columns). Where `attribution_required` is 1, credit the author with the ready-made `credit` line \
@@ -243,45 +406,69 @@ impl Job {
 }
 
 /// Read the catalog's collections and how much of each is under `cache_dir` (desktop) .
-pub fn scan(db: PathBuf, cache_dir: Option<PathBuf>) -> Receiver<Result<Vec<Collection>, String>> {
+/// What a scan of the offline folder found.
+#[derive(Default)]
+pub struct Scanned {
+    /// The catalog's collections with what is downloaded of each.
+    pub cols: Vec<Collection>,
+    /// The PNG keys of the icons downloaded.
+    pub keys: Vec<String>,
+    /// The Templates row, and the ids of the templates downloaded.
+    pub templates: Collection,
+    pub template_ids: Vec<String>,
+}
+
+pub fn scan(db: PathBuf, cache_dir: Option<PathBuf>, templates: Vec<TemplateRow>) -> Receiver<Result<Scanned, String>> {
     let (tx, rx) = channel();
     crate::platform::spawn("offline-scan", move || {
-        let _ = tx.send(scan_now(&db, cache_dir.as_deref()));
+        let _ = tx.send(scan_all(&db, cache_dir.as_deref(), &templates));
     });
     rx
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn scan_now(db: &Path, cache_dir: Option<&Path>) -> Result<Vec<Collection>, String> {
+    scan_all(db, cache_dir, &[]).map(|s| s.cols)
+}
+
+fn scan_all(db: &Path, cache_dir: Option<&Path>, templates: &[TemplateRow]) -> Result<Scanned, String> {
     let conn = open_catalog(db)?;
     let mut cols = collections(&conn)?;
+    let mut keys = Vec::new();
+    let all = items(&conn, &[])?;
     if let Some(dir) = cache_dir {
-        for it in items(&conn, &[])? {
-            if cache_path(dir, &it.key).is_some_and(|p| p.is_file()) {
+        for it in &all {
+            if it.complete(dir) {
                 if let Some(c) = cols.iter_mut().find(|c| c.source == it.source) {
                     c.have += 1;
                     c.have_bytes += it.bytes;
                 }
+                keys.push(it.key.clone());
             }
         }
     }
-    Ok(cols)
+    let sizes = all.iter().map(|it| (it.key.as_str(), it.bytes)).collect();
+    let (templates, template_ids) = scan_templates(cache_dir, templates, &sizes);
+    Ok(Scanned { cols, keys, templates, template_ids })
 }
 
-/// Desktop: download every missing image of `sources` (all when empty) into `offline/assets`,
-/// then refresh `offline/assets.sqlite` and `offline/README.md`.
+/// Desktop: download every missing file of `sources`' icons (all collections when empty) into
+/// `offline/assets`, and `templates` when `sources` is empty or names [`TEMPLATES`]; then refresh
+/// `offline/assets.sqlite` and `offline/README.md`.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn start(ctx: egui::Context, db: PathBuf, base_url: String, offline_dir: PathBuf, sources: Vec<String>, all: &[Collection]) -> Job {
+pub fn start(ctx: egui::Context, db: PathBuf, base_url: String, offline_dir: PathBuf, sources: Vec<String>, all: &[Collection], templates: Vec<TemplateRow>) -> Job {
     let label = scope_label(&sources, all);
     let progress = Arc::new(Progress::default());
     let (tx, rx) = channel();
     let p = progress.clone();
     let what = label.clone();
     crate::platform::spawn("offline-pack", move || {
-        let r = download_pack(&db, &base_url, &offline_dir, &sources, &p).map(|(got, failed)| {
+        let templates = if sources.is_empty() || sources.iter().any(|s| s == TEMPLATES) { templates } else { Vec::new() };
+        let r = download_pack(&db, &base_url, &offline_dir, &sources, &templates, &p).map(|(got, failed)| {
             if p.cancel.load(Ordering::Relaxed) {
-                return format!("Offline download stopped; the {got} images downloaded so far are kept");
+                return format!("Offline download stopped; the {got} downloaded so far are kept");
             }
-            let mut msg = format!("Offline pack ready: {what} ({got} images downloaded)");
+            let mut msg = format!("Offline pack ready: {what} ({got} downloaded)");
             if failed > 0 {
                 msg.push_str(&format!("; {failed} failed, run it again to retry"));
             }
@@ -293,24 +480,31 @@ pub fn start(ctx: egui::Context, db: PathBuf, base_url: String, offline_dir: Pat
     Job { label, progress, rx }
 }
 
+/// One thing a pack downloads.
 #[cfg(not(target_arch = "wasm32"))]
-fn download_pack(db: &Path, base_url: &str, offline_dir: &Path, sources: &[String], p: &Progress) -> Result<(usize, usize), String> {
+enum Task<'a> {
+    Icon(Item),
+    Template(&'a TemplateRow),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn download_pack(db: &Path, base_url: &str, offline_dir: &Path, sources: &[String], templates: &[TemplateRow], p: &Progress) -> Result<(usize, usize), String> {
     use std::sync::Mutex;
     if base_url.is_empty() {
         return Err("No asset URL configured.".into());
     }
     let assets_dir = offline_dir.join("assets");
-    let todo: Vec<Item> = {
+    let todo: Vec<Task> = {
         let conn = open_catalog(db)?;
         let all = items(&conn, sources)?;
-        p.total.store(all.len(), Ordering::Relaxed);
-        let (have, missing): (Vec<Item>, Vec<Item>) = all.into_iter().partition(|it| cache_path(&assets_dir, &it.key).is_some_and(|p| p.is_file()));
+        let (have, missing): (Vec<Item>, Vec<Item>) = all.into_iter().partition(|it| it.complete(&assets_dir));
+        // A template's images are only known once its JSON is here, so each is checked as it goes.
+        p.total.store(have.len() + missing.len() + templates.len(), Ordering::Relaxed);
         p.done.store(have.len(), Ordering::Relaxed);
-        missing
+        missing.into_iter().map(Task::Icon).chain(templates.iter().map(Task::Template)).collect()
     };
     let next = AtomicUsize::new(0);
     let got = AtomicUsize::new(0);
-    let base = base_url.trim_end_matches('/');
     let first_error: Mutex<Option<String>> = Mutex::new(None);
     std::thread::scope(|s| {
         for _ in 0..8 {
@@ -319,24 +513,17 @@ fn download_pack(db: &Path, base_url: &str, offline_dir: &Path, sources: &[Strin
                     break;
                 }
                 let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(it) = todo.get(i) else { break };
-                let req = crate::assets::Request::Url(format!("{base}/{}", it.key));
-                let mut res = crate::assets::fetch(&req);
-                for n in 1..TRIES {
-                    if res.is_ok() || p.cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500 << n));
-                    res = crate::assets::fetch(&req);
-                }
+                let Some(task) = todo.get(i) else { break };
+                let res = match task {
+                    Task::Icon(it) => it.files().try_fold(0, |n, k| ensure(base_url, &assets_dir, k, &p.cancel).map(|b| n + b)),
+                    Task::Template(row) => download_template(base_url, &assets_dir, row, &p.cancel),
+                };
                 match res {
-                    Ok(b) if b.starts_with(b"\x89PNG") => {
-                        store(&assets_dir, &it.key, &b);
-                        p.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-                        got.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(_) => {
-                        p.failed.fetch_add(1, Ordering::Relaxed);
+                    Ok(b) => {
+                        p.bytes.fetch_add(b, Ordering::Relaxed);
+                        if b > 0 {
+                            got.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
                         p.failed.fetch_add(1, Ordering::Relaxed);
@@ -351,7 +538,7 @@ fn download_pack(db: &Path, base_url: &str, offline_dir: &Path, sources: &[Strin
     let failed = p.failed.load(Ordering::Relaxed);
     if got == 0 && failed > 0 {
         let e = first_error.into_inner().unwrap().unwrap_or_else(|| "unexpected response".into());
-        return Err(format!("couldn't download the images ({e})"));
+        return Err(format!("couldn't download the files ({e})"));
     }
     write_extras(db, base_url, offline_dir)?;
     Ok((got, failed))
@@ -374,10 +561,12 @@ fn write_extras(db: &Path, base_url: &str, offline_dir: &Path) -> Result<(), Str
     crate::storage::write(&offline_dir.join("README.md"), text.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// Desktop: delete the downloaded images of `sources` (all, with the catalog copy and README,
-/// when empty). Only removes what a pack writes, since `offline_dir` may be a folder the user chose.
+/// Desktop: delete the downloaded files of `sources` (all, with the catalog copy and README,
+/// when empty). [`TEMPLATES`] deletes the templates' JSON, thumbnails and own images, but not the
+/// catalog icons they use. Only removes what a pack writes, since `offline_dir` may be a folder
+/// the user chose.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn remove(db: &Path, base_url: &str, offline_dir: &Path, sources: &[String]) -> Result<(), String> {
+pub fn remove(db: &Path, base_url: &str, offline_dir: &Path, sources: &[String], templates: &[TemplateRow]) -> Result<(), String> {
     if sources.is_empty() {
         let gone = |r: std::io::Result<()>| match r {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
@@ -389,9 +578,24 @@ pub fn remove(db: &Path, base_url: &str, offline_dir: &Path, sources: &[String])
     }
     let assets_dir = offline_dir.join("assets");
     let conn = open_catalog(db)?;
-    for it in items(&conn, sources)? {
-        if let Some(p) = cache_path(&assets_dir, &it.key) {
+    let rm = |key: &str| {
+        if let Some(p) = cache_path(&assets_dir, key) {
             let _ = std::fs::remove_file(p);
+        }
+    };
+    for it in items(&conn, sources)? {
+        it.files().for_each(rm);
+    }
+    if sources.iter().any(|s| s == TEMPLATES) {
+        for row in templates.iter().filter(|r| r.json_local.is_none()) {
+            if let Some(t) = cache_path(&assets_dir, &row.json_key).and_then(|p| crate::storage::read(&p).ok()).and_then(|b| crate::templates::parse(&b).ok()) {
+                // Its own images (`templates/<id>/img-<n>.png`) go with it; catalog icons stay.
+                for (png, svg) in template_images(&t) {
+                    std::iter::once(png).chain(svg).filter(|k| k.starts_with("templates/")).for_each(|k| rm(&k));
+                }
+            }
+            rm(&row.json_key);
+            rm(&row.meta.thumb_key);
         }
     }
     for s in sources {
@@ -485,7 +689,7 @@ impl ZipWriter {
 
 /// Web: download `sources` (all when empty) as one .zip.
 #[cfg(target_arch = "wasm32")]
-pub fn start(ctx: egui::Context, db: PathBuf, base_url: String, _offline_dir: PathBuf, sources: Vec<String>, all: &[Collection]) -> Job {
+pub fn start(ctx: egui::Context, db: PathBuf, base_url: String, _offline_dir: PathBuf, sources: Vec<String>, all: &[Collection], _templates: Vec<TemplateRow>) -> Job {
     let label = scope_label(&sources, all);
     let progress = Arc::new(Progress::default());
     let (tx, rx) = channel();
@@ -545,8 +749,15 @@ mod web {
         p.pending_bytes = 0;
     }
 
+    /// One file of the zip: an icon's PNG (`png`, which is what counts it), or its SVG.
+    struct File {
+        source: String,
+        key: String,
+        png: bool,
+    }
+
     struct State {
-        items: Vec<Item>,
+        items: Vec<File>,
         next: usize,
         in_flight: usize,
         /// Failed fetches waiting out their back-off, and those ready to try again.
@@ -572,7 +783,13 @@ mod web {
         if PARTS.with(|p| p.borrow().is_some()) {
             return Err("A download is already running".into());
         }
-        let items = items(&open_catalog(db)?, &sources)?;
+        let items: Vec<File> = items(&open_catalog(db)?, &sources)?
+            .into_iter()
+            .flat_map(|it| {
+                let svg = it.svg.map(|key| File { source: it.source.clone(), key, png: false });
+                std::iter::once(File { source: it.source, key: it.key, png: true }).chain(svg)
+            })
+            .collect();
         progress.total.store(items.len(), Ordering::Relaxed);
         let mut cols: Vec<Collection> = all.into_iter().filter(|c| sources.is_empty() || sources.contains(&c.source)).collect();
         for c in &mut cols {
@@ -619,10 +836,10 @@ mod web {
             };
             s.tries[i] += 1;
             s.in_flight += 1;
-            let url = format!("{}/{}", s.base, s.items[i].key);
+            let (url, png) = (format!("{}/{}", s.base, s.items[i].key), s.items[i].png);
             let st = state.clone();
             ehttp::fetch(ehttp::Request::get(&url), move |res| {
-                let bytes = res.ok().filter(|r| r.ok).map(|r| r.bytes).filter(|b| b.starts_with(b"\x89PNG"));
+                let bytes = res.ok().filter(|r| r.ok).map(|r| r.bytes).filter(|b| if png { b.starts_with(b"\x89PNG") } else { crate::assets::is_svg(b) });
                 {
                     let mut s = st.lock().unwrap();
                     s.in_flight -= 1;
@@ -652,7 +869,7 @@ mod web {
                                     push(&b);
                                     s.progress.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
                                     if let Some(c) = s.cols.iter_mut().find(|c| c.source == source) {
-                                        c.have += 1;
+                                        c.have += usize::from(png);
                                         c.have_bytes += b.len() as u64;
                                     }
                                 }
@@ -696,7 +913,7 @@ mod web {
         let got: usize = s.cols.iter().map(|c| c.have).sum();
         let failed = s.progress.failed.load(Ordering::Relaxed);
         if got == 0 {
-            return Err(format!("couldn't download any of the {failed} images"));
+            return Err(format!("couldn't download any of the {failed} files"));
         }
         let mut parts = parts.ok_or("download state lost")?;
         let catalog = crate::storage::read(&s.db).map_err(|e| format!("catalog: {e}"))?;
@@ -711,7 +928,7 @@ mod web {
         fold(&mut parts);
         let blob = parts.blob.ok_or("couldn't assemble the zip")?;
         crate::platform::download_blob(&s.file, &blob)?;
-        let mut msg = format!("Downloaded {} ({got} images)", s.file);
+        let mut msg = format!("Downloaded {} ({got} icons)", s.file);
         if failed > 0 {
             msg.push_str(&format!("; {failed} couldn't be fetched"));
         }
@@ -721,10 +938,10 @@ mod web {
 
 /// Desktop: delete downloaded images (see [`remove`]) off the UI thread, then rescan.
 #[cfg(not(target_arch = "wasm32"))]
-fn remove_and_scan(db: PathBuf, base_url: String, offline_dir: PathBuf, sources: Vec<String>) -> Receiver<Result<Vec<Collection>, String>> {
+fn remove_and_scan(db: PathBuf, base_url: String, offline_dir: PathBuf, sources: Vec<String>, templates: Vec<TemplateRow>) -> Receiver<Result<Scanned, String>> {
     let (tx, rx) = channel();
     crate::platform::spawn("offline-remove", move || {
-        let r = remove(&db, &base_url, &offline_dir, &sources).and_then(|_| scan_now(&db, Some(&offline_dir.join("assets"))));
+        let r = remove(&db, &base_url, &offline_dir, &sources, &templates).and_then(|_| scan_all(&db, Some(&offline_dir.join("assets")), &templates));
         let _ = tx.send(r);
     });
     rx
@@ -748,8 +965,16 @@ fn show_folder(dir: &Path) {
 pub struct OfflineState {
     pub job: Option<Job>,
     collections: Vec<Collection>,
+    /// The Templates row.
+    templates: Collection,
+    /// The templates downloaded (the Downloads filter).
+    pub(crate) template_ids: std::collections::HashSet<String>,
     error: Option<String>,
-    scan: Option<Receiver<Result<Vec<Collection>, String>>>,
+    scan: Option<Receiver<Result<Scanned, String>>>,
+    /// The image loader kept new files in the folder since the last scan, and when that was
+    /// (`egui` time, seconds).
+    stale: bool,
+    scanned_at: f64,
     /// The catalog file `collections` was read from.
     scanned: Option<PathBuf>,
     /// Sync pressed: a catalog check is running and its result should be reported.
@@ -775,14 +1000,17 @@ impl crate::app::BioCartoon {
         Some(dir)
     }
 
-    fn offline_rescan(&mut self) {
+    /// Recount what is downloaded, and tell the catalog (the Downloads filter).
+    pub(crate) fn offline_rescan(&mut self) {
+        self.offline.stale = false;
+        self.offline.scanned_at = self.ui_ctx().input(|i| i.time);
         let db = self.catalog.db_path.clone();
         self.offline.scanned = Some(db.clone());
         if db.as_os_str().is_empty() {
             self.offline.error = Some("The icon catalog hasn't downloaded yet.".into());
             return;
         }
-        self.offline.scan = Some(scan(db, self.images.cache_dir()));
+        self.offline.scan = Some(scan(db, self.images.cache_dir(), self.template_rows.clone()));
     }
 
     /// Fetch the catalog's current version from the asset URL (installing it if it is newer) and
@@ -798,14 +1026,32 @@ impl crate::app::BioCartoon {
 
     /// Collect scan and download results. Call once per frame.
     pub(crate) fn poll_offline(&mut self, ctx: &egui::Context) {
+        // Files the image loader keeps in the folder may complete an icon or template: count again,
+        // at most every few seconds.
+        if !self.images.take_stored().is_empty() {
+            self.offline.stale = true;
+        }
+        let now = ctx.input(|i| i.time);
+        if self.offline.stale && self.offline.scan.is_none() && self.offline.job.is_none() && now - self.offline.scanned_at > 5.0 && !self.catalog.db_path.as_os_str().is_empty() {
+            self.offline_rescan();
+        }
         if let Some(rx) = &self.offline.scan {
             match rx.try_recv() {
                 Ok(r) => {
                     self.offline.scan = None;
                     match r {
-                        Ok(c) => {
-                            self.offline.collections = c;
+                        Ok(found) => {
+                            self.offline.collections = found.cols;
+                            self.offline.templates = found.templates;
+                            self.offline.template_ids = found.template_ids.into_iter().collect();
                             self.offline.error = None;
+                            if self.images.cache_dir().is_some() {
+                                self.catalog.send(crate::catalog::Req::SetDownloads { keys: found.keys });
+                                // The Downloads filter's results follow.
+                                if self.icons.filter.downloads {
+                                    self.icons.last_sent_query = "\u{0}".into();
+                                }
+                            }
                         }
                         Err(e) => self.offline.error = Some(e),
                     }
@@ -833,7 +1079,7 @@ impl crate::app::BioCartoon {
         if self.offline.job.is_some() {
             return self.toast("A download is already running");
         }
-        let job = start(self.ui_ctx(), self.catalog.db_path.clone(), self.settings.asset_base_url.clone(), self.offline_dir(), sources, &self.offline.collections);
+        let job = start(self.ui_ctx(), self.catalog.db_path.clone(), self.settings.asset_base_url.clone(), self.offline_dir(), sources, &self.offline.collections, self.template_rows.clone());
         self.offline.job = Some(job);
     }
 
@@ -846,9 +1092,9 @@ impl crate::app::BioCartoon {
         }
         let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
         ui.label(if web {
-            "Download collections as a .zip: every image as a PNG, the icon catalog (assets.sqlite) and a README with license and credit details."
+            "Download collections as a .zip: every icon as a PNG, and as an SVG when it has one, the icon catalog (assets.sqlite) and a README with license and credit details."
         } else {
-            "Download collections to use BioCartoon without internet. Images you have used are kept automatically; a pack downloads whole collections ahead of time, with a copy of the icon catalog (assets.sqlite) and a README."
+            "Download collections to use BioCartoon without internet. Images you have used are kept automatically; a pack downloads whole collections ahead of time (each icon's PNG and SVG, and templates with the icons they use), with a copy of the icon catalog (assets.sqlite) and a README."
         });
         ui.add_space(8.0);
         if let Some(e) = &self.offline.error {
@@ -874,10 +1120,16 @@ impl crate::app::BioCartoon {
                 ui.label("");
             }
             ui.end_row();
-            for c in &self.offline.collections {
-                ui.label(&c.name).on_hover_text(format!("{} · {}", c.source, c.licenses));
+            // Templates after the icons' collections (not in the browser, whose zips are of icons).
+            let templates = (!web && self.offline.templates.count > 0).then_some(&self.offline.templates);
+            for c in self.offline.collections.iter().chain(templates) {
+                let tip = if c.source == TEMPLATES { "Each template, its thumbnail and the icons it uses".to_string() } else { format!("{} · {}", c.source, c.licenses) };
+                ui.label(&c.name).on_hover_text(tip);
                 ui.label(if web { c.count.to_string() } else { format!("{} / {}", c.have, c.count) });
-                ui.label(human_bytes(c.bytes));
+                let size = ui.label(format!("{}{}", human_bytes(c.bytes), if c.more { "+" } else { "" }));
+                if c.more {
+                    size.on_hover_text("A template's size is known once it is downloaded");
+                }
                 let download = if web {
                     egui::Button::new(format!("{}  .zip", ph::DOWNLOAD_SIMPLE))
                 } else if c.complete() {
@@ -891,21 +1143,28 @@ impl crate::app::BioCartoon {
                 if r.clicked() {
                     start_with = Some(vec![c.source.clone()]);
                 }
-                if !web && ui.add_enabled(!busy && c.have > 0, egui::Button::new(format!("{}  Delete", ph::TRASH)).small()).on_hover_text("Delete the downloaded images").clicked() {
+                if !web && ui.add_enabled(!busy && c.have > 0, egui::Button::new(format!("{}  Delete", ph::TRASH)).small()).on_hover_text("Delete the downloaded files").clicked() {
                     remove_these = Some(vec![c.source.clone()]);
                 }
                 ui.end_row();
             }
+            // The count is of icons; the size and the buttons take in the templates too.
             let (count, bytes): (usize, u64) = self.offline.collections.iter().fold((0, 0), |(n, b), c| (n + c.count, b + c.bytes));
+            let bytes = bytes + templates.map_or(0, |t| t.bytes);
+            let more = templates.is_some_and(|t| t.more);
             let have: usize = self.offline.collections.iter().map(|c| c.have).sum();
-            let all_done = !web && have >= count;
-            // A line across the grid, between the collections and their total. The cursor is at
-            // the new row's top; half the row spacing above it is between the rows.
+            let all_done = !web && have >= count && templates.is_none_or(|t| t.have >= t.count);
+            let any = have > 0 || templates.is_some_and(|t| t.have > 0);
+            // A double line across the grid, between the collections and their total. The cursor is
+            // at the new row's top; the row spacing above it is between the rows.
             let span = ui.min_rect().x_range();
-            ui.painter().hline(span, ui.cursor().top() - 3.0, egui::Stroke::new(1.0, theme::border()));
+            let y = ui.cursor().top() - 3.0;
+            for dy in [-1.5, 1.5] {
+                ui.painter().hline(span, y + dy, egui::Stroke::new(1.0, theme::text()));
+            }
             ui.label(egui::RichText::new("All").strong());
             ui.label(egui::RichText::new(if web { count.to_string() } else { format!("{have} / {count}") }).strong());
-            ui.label(egui::RichText::new(human_bytes(bytes)).strong());
+            ui.label(egui::RichText::new(format!("{}{}", human_bytes(bytes), if more { "+" } else { "" })).strong());
             let download = if web {
                 egui::Button::new(format!("{}  .zip", ph::DOWNLOAD_SIMPLE))
             } else if all_done {
@@ -925,13 +1184,13 @@ impl crate::app::BioCartoon {
                     start_with = Some(Vec::new());
                 }
             }
-            if !web && ui.add_enabled(!busy && have > 0, egui::Button::new(format!("{}  Delete", ph::TRASH)).small()).on_hover_text("Delete every downloaded image, the catalog copy and the README").clicked() {
+            if !web && ui.add_enabled(!busy && any, egui::Button::new(format!("{}  Delete", ph::TRASH)).small()).on_hover_text("Delete every downloaded file, the catalog copy and the README").clicked() {
                 remove_these = Some(Vec::new());
             }
             ui.end_row();
         });
         ui.add_space(8.0);
-        let have_bytes: u64 = self.offline.collections.iter().map(|c| c.have_bytes).sum();
+        let have_bytes: u64 = self.offline.collections.iter().map(|c| c.have_bytes).sum::<u64>() + self.offline.templates.have_bytes;
         ui.horizontal(|ui| {
             let syncing = self.offline.syncing || self.offline.scan.is_some();
             let sync = egui::Button::new(format!("{}  {}", ph::ARROWS_CLOCKWISE, if syncing { "Syncing..." } else { "Sync" }));
@@ -974,7 +1233,7 @@ impl crate::app::BioCartoon {
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(sources) = remove_these {
-            self.offline.scan = Some(remove_and_scan(self.catalog.db_path.clone(), self.settings.asset_base_url.clone(), self.offline_dir(), sources));
+            self.offline.scan = Some(remove_and_scan(self.catalog.db_path.clone(), self.settings.asset_base_url.clone(), self.offline_dir(), sources, self.template_rows.clone()));
             self.images.retry_failed();
         }
         #[cfg(target_arch = "wasm32")]
@@ -993,6 +1252,59 @@ mod tests {
         assert_eq!(cache_path(d, "../a.png"), None);
         assert_eq!(cache_path(d, "/etc/passwd"), None);
         assert_eq!(cache_path(d, ""), None);
+    }
+
+    /// A template is downloaded once its JSON, its thumbnail and each image it uses (with that
+    /// image's SVG) are in the folder; it opens from there, and deleting it keeps the icons.
+    #[test]
+    fn templates_are_downloaded_with_their_images() {
+        use crate::doc::{ImageSource, Item, ItemKind, Slide};
+        use crate::templates::{TemplateFile, TemplateMeta};
+        let dir = std::env::temp_dir().join(format!("cc-offline-templates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let assets = dir.join("assets");
+        let image = |key: &str, svg: Option<&str>| ItemKind::Image {
+            source: ImageSource::Asset { id: key.into(), key: key.into(), svg: svg.map(str::to_string), title: String::new(), source: String::new(), credit: String::new(), license: String::new() },
+            crop: [0.0, 0.0, 1.0, 1.0],
+            overlay: [255, 255, 255, 0],
+            layers: Vec::new(),
+        };
+        let items = vec![
+            Item::new(1, "cell", image("bioart/cell.png", Some("bioart/cell.svg")), egui::Pos2::ZERO, egui::Vec2::splat(10.0)),
+            Item::new(2, "own", image("templates/t/img-0.png", None), egui::Pos2::ZERO, egui::Vec2::splat(10.0)),
+        ];
+        let meta = TemplateMeta { id: "t".into(), title: "T".into(), thumb_key: "templates/t/thumb.png".into(), ..Default::default() };
+        let file = TemplateFile { meta: meta.clone(), width: 10.0, height: 10.0, background: [255; 4], slide: Slide { name: String::new(), items, comments: Vec::new(), background: None } };
+        let row = TemplateRow { meta, json_key: "templates/t/template.json".into(), json_local: None, thumb_local: None };
+        let put = |key: &str, b: &[u8]| store(&assets, key, b);
+        let sizes = std::collections::HashMap::from([("bioart/cell.png", 30)]);
+        let scanned = || scan_templates(Some(&assets), std::slice::from_ref(&row), &sizes);
+
+        // Not even its JSON yet: its size isn't known.
+        let (c, ids) = scanned();
+        assert_eq!((c.count, c.have, c.more), (1, 0, true));
+        assert!(ids.is_empty());
+        let json = serde_json::to_vec(&file).unwrap();
+        put(&row.json_key, &json);
+        put(&row.meta.thumb_key, b"\x89PNG thumb");
+        put("bioart/cell.png", b"\x89PNG");
+        put("templates/t/img-0.png", b"\x89PNG img");
+        // The icon's SVG is missing.
+        let (c, _) = scanned();
+        assert_eq!((c.have, c.more), (0, false));
+        assert_eq!(c.bytes, json.len() as u64 + 10 + 30 + 8);
+        put("bioart/cell.svg", b"<svg/>");
+        let (c, ids) = scanned();
+        assert_eq!((c.have, ids), (1, vec!["t".to_string()]));
+        assert_eq!(crate::templates::load(&row, "", Some(&assets)).unwrap().meta.id, "t");
+
+        let db = dir.join("assets.sqlite");
+        Connection::open(&db).unwrap().execute_batch("CREATE TABLE assets (id TEXT, source TEXT, source_name TEXT, author TEXT, license TEXT, png_key TEXT, png_bytes INTEGER);").unwrap();
+        remove(&db, "", &dir, &[TEMPLATES.to_string()], std::slice::from_ref(&row)).unwrap();
+        assert_eq!(scanned().0.have, 0);
+        assert!(have_file(&assets, "bioart/cell.png") && have_file(&assets, "bioart/cell.svg"));
+        assert!(!have_file(&assets, "templates/t/img-0.png") && !have_file(&assets, &row.json_key));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Export (`request_for`) and the canvas read the offline copy instead of the network.

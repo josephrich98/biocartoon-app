@@ -143,6 +143,8 @@ pub struct ImageCache {
     /// Desktop: the offline folder's `assets/` (see [`crate::offline`]). PNGs fetched from the
     /// network are kept there, and read from there first.
     cache_dir: Arc<RwLock<Option<PathBuf>>>,
+    /// Keys of the files kept in `cache_dir` since [`Self::take_stored`] last asked.
+    stored: Arc<Mutex<Vec<String>>>,
     pub loads_in_flight: usize,
 }
 
@@ -369,11 +371,13 @@ impl ImageCache {
         let queue = Arc::new(Queue::default());
         let (dtx, rx) = channel::<Decoded>();
         let cache_dir: Arc<RwLock<Option<PathBuf>>> = Arc::default();
+        let stored: Arc<Mutex<Vec<String>>> = Arc::default();
         #[cfg(not(target_arch = "wasm32"))]
         for i in 0..6 {
             let queue = queue.clone();
             let dtx = dtx.clone();
             let cache_dir = cache_dir.clone();
+            let stored = stored.clone();
             thread::Builder::new()
                 .name(format!("img-loader-{i}"))
                 .spawn(move || loop {
@@ -386,6 +390,7 @@ impl ImageCache {
                     let res = run(&work).map(|(l, fetched)| {
                         if let (Some(b), Some(dir), Some(k)) = (fetched, cache_dir.read().unwrap().clone(), key.strip_prefix("asset:")) {
                             crate::offline::store(&dir, k, &b);
+                            stored.lock().unwrap().push(k.to_string());
                         }
                         l
                     });
@@ -412,6 +417,7 @@ impl ImageCache {
             base_url,
             local_dir,
             cache_dir,
+            stored,
             loads_in_flight: 0,
         }
     }
@@ -432,6 +438,11 @@ impl ImageCache {
 
     pub fn cache_dir(&self) -> Option<PathBuf> {
         self.cache_dir.read().unwrap().clone()
+    }
+
+    /// The keys of the files kept in the offline folder since the last call.
+    pub fn take_stored(&self) -> Vec<String> {
+        std::mem::take(&mut *self.stored.lock().unwrap())
     }
 
     /// Retry images that failed to load (e.g. after going offline and downloading a pack).
@@ -462,7 +473,7 @@ impl ImageCache {
 
     /// Where to load a catalog image from: its SVG when it has one, else (or if that fails, as
     /// when offline with only the PNGs downloaded) its PNG.
-    fn request_for_image(&self, key: &str, svg: Option<&str>, local_rel: Option<&str>) -> Result<Request, String> {
+    pub fn request_for_image(&self, key: &str, svg: Option<&str>, local_rel: Option<&str>) -> Result<Request, String> {
         let png = self.request_for_asset(key, local_rel);
         // The user's own SVGs (drawings an AI model made) are on this computer, by absolute path.
         match (svg.map(|k| self.request_for_asset(k, is_local_path(k).then_some(k))), png) {

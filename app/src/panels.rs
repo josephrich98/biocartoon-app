@@ -6,7 +6,7 @@ use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, GeneratedImage, Ico
 use crate::templates::TemplateRow;
 use crate::assets::ImgState;
 use crate::canvas::{draw_slide, tool_button, Xform};
-use crate::catalog::{AssetRow, Facets, IconSort};
+use crate::catalog::{AssetRow, Facets, IconSort, LIBRARY_SOURCE};
 use biocartoon_catalog::syntax::{self, contains, Expr, Field};
 use crate::doc::{c32, c4, CodeLang, CodeTheme, ImageSource, Item, ItemKind, LayerStyle, LineFamily, LineKind, LineStyle, ShapeKind, TextAlign, TextFlag, TextFont, TextVAlign, Unit};
 use crate::stars::format_stars;
@@ -253,6 +253,9 @@ impl BioCartoon {
         if source == theme::BIOCARTOON_SOURCE {
             return "BioCartoon".into();
         }
+        if source == LIBRARY_SOURCE {
+            return "Your library".into();
+        }
         self.icons.sources.iter().find(|s| s.source == source).map(|s| s.name.clone()).unwrap_or_else(|| source.to_string())
     }
 
@@ -297,9 +300,11 @@ impl BioCartoon {
                 let tags = f.tags();
                 // A template's category is free text: it matches a picked category or subcategory by name.
                 let places: Vec<&str> = f.cats.iter().map(String::as_str).chain(f.subs.iter().map(|(_, s)| s.as_str())).collect();
-                // Each is in BioCartoon or User-generated: another database's filter leaves it out.
-                rows.filter(|r| !fav || self.settings.favorites.contains(&r.meta.id))
-                    .filter(|r| any_source || f.sources.is_empty() || f.sources.iter().any(|s| s == r.source()))
+                // Each is in BioCartoon or User-generated, and the saved ones in Your library too:
+                // another database's filter leaves it out.
+                rows.filter(|r| (!fav && !f.favorites) || self.settings.favorites.contains(&r.meta.id))
+                    .filter(|r| !f.downloads || self.offline.template_ids.contains(&r.meta.id))
+                    .filter(|r| any_source || f.sources.is_empty() || f.sources.iter().any(|s| s == r.source() || (s == LIBRARY_SOURCE && r.json_local.is_some())))
                     .filter(|r| template_match(r, q))
                     .filter(|r| authors.is_empty() || authors.iter().any(|a| r.meta.author.to_lowercase().contains(a)))
                     .filter(|r| tags.is_empty() || tags.iter().any(|t| r.meta.tags.iter().any(|x| eq(x, t))))
@@ -366,15 +371,19 @@ impl BioCartoon {
         let in_facet = |list: &[(String, i64)], v: &str| facets.as_ref().map(|_| list.iter().find(|(k, _)| k == v).map_or(0, |(_, n)| *n));
         // The templates under the query and the other filters (Favorites' counts are of its icons).
         let templates = if mine { Vec::new() } else { self.templates_matching(true) };
+        // Your library last: its icons and templates are also in the database they are listed under.
+        let library = (LIBRARY_SOURCE.to_string(), "", "Your library".to_string());
         let dbs: Vec<(String, String)> = self
             .databases()
             .into_iter()
+            .chain(std::iter::once(library))
             .filter_map(|(s, _, name)| {
                 let name = if s == "user" { "Community and user-generated".to_string() } else { name };
                 let n = in_facet(facets.as_ref().map_or(&[][..], |fc| &fc.sources), &s);
-                let t = templates.iter().filter(|r| r.source() == s).count() as i64;
+                let in_db = |r: &TemplateRow| if s == LIBRARY_SOURCE { r.json_local.is_some() } else { r.source() == s };
+                let t = templates.iter().filter(|r| in_db(r)).count() as i64;
                 // A database's templates are in it even when none of its icons are.
-                let keep = n != Some(0) || f.sources.contains(&s) || (!mine && self.template_rows.iter().any(|r| r.source() == s));
+                let keep = n != Some(0) || f.sources.contains(&s) || (!mine && self.template_rows.iter().any(in_db));
                 // "BioCartoon (1 icon, 6 templates)": templates only when there are some.
                 let parts: Vec<String> =
                     n.map(|n| counted(n, "icon")).into_iter().chain((t > 0).then(|| counted(t, "template"))).collect();
@@ -452,8 +461,9 @@ impl BioCartoon {
             egui::Grid::new("search_filters").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 if all {
                     ui.label("Database");
-                    if multi_select(ui, "filter_db", w, &mut f.sources, &dbs) && !f.sources.is_empty() {
-                        // Another database's own categories would find nothing.
+                    if multi_select(ui, "filter_db", w, &mut f.sources, &dbs) && !f.sources.is_empty() && !f.sources.iter().any(|s| s == LIBRARY_SOURCE) {
+                        // Another database's own categories would find nothing (Your library's
+                        // icons are in any of them).
                         let sources = f.sources.clone();
                         f.db_cats.retain(|(s, _)| sources.contains(s));
                     }
@@ -486,6 +496,53 @@ impl BioCartoon {
                 if all {
                     ui.label("Tags").on_hover_text("Icons and templates with one of these as a whole tag, any case");
                     ui.add(egui::TextEdit::singleline(&mut f.tags).hint_text("Any (commas for several)").desired_width(w));
+                    ui.end_row();
+                }
+                // Favorites' own filters are all favorites already.
+                if !mine {
+                    // Outlined even when off so they read as buttons; a narrow panel wraps the second.
+                    let toggle = |ui: &mut egui::Ui, on: &mut bool, text: String, tip: &str| {
+                        let b = egui::Button::new(text).selected(*on).stroke(Stroke::new(1.0, theme::border())).corner_radius(6);
+                        if ui.add(b).on_hover_text(tip).clicked() {
+                            *on = !*on;
+                        }
+                    };
+                    let fav = format!("{}  Favorites", ph::STAR);
+                    let dl = format!("{}  Downloads", ph::DOWNLOAD_SIMPLE);
+                    // horizontal_wrapped leaves a gap above the buttons once they wrap, so measure and
+                    // pick a row or a stack.
+                    let pad = ui.spacing().button_padding.x * 2.0;
+                    // The browser keeps no offline folder, so nothing in it is downloaded.
+                    let web = cfg!(target_arch = "wasm32");
+                    let shown: &[&String] = if web { &[&fav] } else { &[&fav, &dl] };
+                    let sizes: Vec<egui::Vec2> = shown.iter().map(|t| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size()).collect();
+                    let both = sizes.iter().map(|s| s.x + pad).sum::<f32>() + ui.spacing().item_spacing.x;
+                    if both <= w {
+                        ui.label("Show only");
+                    } else {
+                        // The grid centers a cell in its row; keep the label level with the first button.
+                        let button_h = (sizes[0].y + ui.spacing().button_padding.y * 2.0).max(ui.spacing().interact_size.y);
+                        ui.vertical(|ui| {
+                            ui.set_min_height(button_h * sizes.len() as f32 + 4.0);
+                            ui.allocate_ui_with_layout(egui::vec2(label_w, button_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.label("Show only");
+                            });
+                        });
+                    }
+                    let buttons = |ui: &mut egui::Ui| {
+                        toggle(ui, &mut f.favorites, fav, "Only icons and templates you starred");
+                        if !web {
+                            toggle(ui, &mut f.downloads, dl, "Only icons and templates downloaded for offline use (Settings > Offline, or right-click > Download)");
+                        }
+                    };
+                    if both <= w {
+                        ui.horizontal(buttons);
+                    } else {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            buttons(ui);
+                        });
+                    }
                     ui.end_row();
                 }
             });
@@ -527,6 +584,12 @@ impl BioCartoon {
         let tags = f.tags();
         if !tags.is_empty() {
             parts.push(format!("tagged {}", tags.join(", ")));
+        }
+        if f.favorites {
+            parts.push("Favorites".into());
+        }
+        if f.downloads {
+            parts.push("Downloads".into());
         }
         parts.join("  ·  ")
     }
@@ -657,6 +720,16 @@ impl BioCartoon {
                     }
                 }
             });
+        } else if let Some(sync) = self.catalog_sync.as_ref().filter(|s| s.downloading()) {
+            // Searches run on the cached copy until then, so newly published icons are missing.
+            ui.horizontal(|ui| {
+                ui.spinner();
+                let mb = sync.bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+                let text = if mb > 0.0 { format!("Updating the icon catalog... {mb:.1} MB") } else { "Updating the icon catalog...".to_string() };
+                ui.label(egui::RichText::new(text).small().color(theme::text_dim()))
+                    .on_hover_text("New icons will appear in searches once the download finishes");
+            });
+            ui.add_space(4.0);
         }
         match self.icons.mode {
             IconsMode::Home => {
@@ -881,6 +954,7 @@ impl BioCartoon {
                     Some(TileAct::RequestRemoval) => self.actions.push(Action::OpenRemovalRequest(row.clone())),
                     Some(TileAct::Share) => self.actions.push(Action::OpenUploadDialog(UploadTarget::Library(Box::new(row.clone())), true)),
                     Some(TileAct::Favorite) => self.actions.push(Action::ToggleFavorite(row.id.clone())),
+                    Some(TileAct::Download) => self.actions.push(Action::DownloadAsset(Box::new(row.clone()))),
                     None if r.clicked() => picked = Some(row.clone()),
                     None => {}
                 }
@@ -1101,6 +1175,10 @@ impl BioCartoon {
             ui.separator();
             if ui.button(format!("{}  {}", ph::STAR, if fav { "Unfavorite" } else { "Favorite" })).clicked() {
                 self.actions.push(Action::ToggleFavorite(row.meta.id.clone()));
+                ui.close();
+            }
+            if !cfg!(target_arch = "wasm32") && ui.button(format!("{}  Download", ph::DOWNLOAD_SIMPLE)).on_hover_text("Keep it, and the icons it uses, for offline use").clicked() {
+                self.actions.push(Action::DownloadTemplate(Box::new(row.clone())));
                 ui.close();
             }
             if row.json_local.is_some() && ui.button("Remove from this computer").clicked() {
@@ -2479,6 +2557,8 @@ const GOLD: Color32 = Color32::from_rgb(0xf5, 0xb3, 0x01);
 enum TileAct {
     /// Star / unstar it, i.e. Favorite / Unfavorite (the star count, or the right-click menu).
     Favorite,
+    /// Save its original file (SVG, else PNG).
+    Download,
     /// Remove from your library, on one of the user's own uploads.
     Remove,
     /// Request removal from BioCartoon library, on a published (or submitted) community icon.
@@ -2503,7 +2583,7 @@ struct TileMarks {
 /// A catalog asset's tile. `hold` draws it as still loading even if its image is ready. `colors`
 /// is how many colours it comes in (the colours are picked in Edit once it is placed); `marks`
 /// what to show on it. Clicking the star stars it, which makes it a favorite. Right-click
-/// (or a long press) opens its info with Favorite, Copy name and Copy credit.
+/// (or a long press) opens its info with Favorite, Download, Copy name and Copy credit.
 /// `unsent` says whether one of the user's own icons can still go to the BioCartoon library
 /// (asked only when its menu is open).
 #[allow(clippy::too_many_arguments)]
@@ -2563,6 +2643,10 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
         ui.separator();
         if ui.button(format!("{}  {}", ph::STAR, if fav { "Unfavorite" } else { "Favorite" })).clicked() {
             act = Some(TileAct::Favorite);
+            ui.close();
+        }
+        if ui.button(format!("{}  Download", ph::DOWNLOAD_SIMPLE)).clicked() {
+            act = Some(TileAct::Download);
             ui.close();
         }
         if ui.button(format!("{}  Copy name", ph::COPY)).clicked() {
@@ -3168,14 +3252,19 @@ fn local_match(row: &AssetRow, q: &str, f: &SearchFilter, skip: Option<Dim>) -> 
     });
     let authors = f.authors();
     let tags = f.tags();
-    let taxa = f.catalog().taxa;
-    text && (skip == Some(Dim::Source) || f.sources.is_empty() || f.sources.iter().any(|s| s == shown))
+    let taxa = f.catalog(&[]).taxa;
+    text && (skip == Some(Dim::Source) || f.sources.is_empty() || f.sources.iter().any(|s| s == shown || (s == LIBRARY_SOURCE && own_asset(row))))
         && (authors.is_empty() || authors.iter().any(|a| row.author.to_lowercase().contains(a)))
         && (skip == Some(Dim::Taxa) || taxa.is_empty() || taxa.iter().any(|(c, s)| row.taxa.iter().any(|(rc, rs)| rc == c && (s.is_empty() || rs == s))))
         && (skip == Some(Dim::DbCat) || f.db_cats.is_empty() || f.db_cats.iter().any(|(s, c)| s == shown && row.category.split(", ").any(|rc| eq(rc, c))))
         && (skip == Some(Dim::License) || f.licenses.is_empty() || f.licenses.iter().any(|l| l == &row.license))
         && (skip == Some(Dim::Format) || f.formats.is_empty() || f.formats.iter().any(|x| x == asset_format(row)))
         && (tags.is_empty() || tags.iter().any(|t| row.tags.iter().any(|x| eq(x, t))))
+}
+
+/// One of the user's own icons, in Your library (as the catalog's `LIBRARY_SOURCE` keeps them).
+fn own_asset(row: &AssetRow) -> bool {
+    row.source == "user" && row.png_local.is_some()
 }
 
 /// `catalog::FORMAT_SVG` when the asset has an SVG, else `catalog::FORMAT_PNG`.
@@ -3196,6 +3285,9 @@ fn local_facets(rows: &[AssetRow], q: &str, f: &SearchFilter) -> Facets {
     let mut fc = Facets { sources: Vec::new(), licenses: Vec::new(), taxa: Vec::new(), db_cats: Vec::new(), formats: Vec::new() };
     for r in under(Dim::Source) {
         tally(&mut fc.sources, theme::asset_source(r));
+        if own_asset(r) {
+            tally(&mut fc.sources, LIBRARY_SOURCE);
+        }
     }
     for r in under(Dim::License).filter(|r| !r.license.is_empty()) {
         tally(&mut fc.licenses, &r.license);

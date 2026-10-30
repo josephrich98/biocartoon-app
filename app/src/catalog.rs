@@ -4,12 +4,11 @@
 
 pub use biocartoon_catalog::catalog::{
     check_tags, parse_tags, tags_from_json, AssetLayer, AssetRow, MAX_TAGS, MAX_TAG_CHARS, CategoryInfo, Facets, Filter, IconSort, SourceInfo, StarUpdate, TaxonCount, Worker, FORMAT_PNG, FORMAT_SVG,
+    LIBRARY_SOURCE,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-#[cfg(target_arch = "wasm32")]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::Sender;
@@ -48,6 +47,9 @@ pub enum Req {
     /// Star counts the Worker reported (or the user's own click, ahead of the Worker's answer);
     /// remembered in `usage.stars`, where they override the catalog's snapshot.
     SetStars { updates: Vec<StarUpdate> },
+    /// A scan of the offline folder found these icons downloaded (their PNG keys), as
+    /// `usage.downloads` remembers (the Downloads filter, and `biocartoon search --downloads`).
+    SetDownloads { keys: Vec<String> },
 }
 
 pub enum Resp {
@@ -197,6 +199,12 @@ fn handle(w: &Worker, req_id: u64, req: Req) -> Resp {
             }
             Resp::Done { req_id }
         }
+        Req::SetDownloads { keys } => {
+            if let Err(e) = w.set_downloads(&keys) {
+                log::warn!("set downloads: {e}");
+            }
+            Resp::Done { req_id }
+        }
     }
 }
 
@@ -259,7 +267,17 @@ impl CatalogClient {
 pub struct CatalogSync {
     rx: Receiver<Result<Option<PathBuf>, String>>,
     pub bytes: Arc<AtomicU64>,
+    /// Set once a newer catalog than the cached one is being downloaded (on the desktop, the
+    /// download counting bytes says the same).
+    updating: Arc<AtomicBool>,
     pub running: bool,
+}
+
+impl CatalogSync {
+    /// True while a newer catalog is being downloaded, as opposed to only checking the version.
+    pub fn downloading(&self) -> bool {
+        self.running && (self.updating.load(Ordering::Relaxed) || self.bytes.load(Ordering::Relaxed) > 0)
+    }
 }
 
 /// The catalog file most recently downloaded into `dir`, if any.
@@ -282,7 +300,7 @@ impl CatalogSync {
                 let _ = tx.send(biocartoon_catalog::catalog::sync_catalog(&base, &dir, &b));
             })
             .expect("spawn catalog sync");
-        Self { rx, bytes, running: true }
+        Self { rx, bytes, updating: Default::default(), running: true }
     }
 
     /// `Some(Ok(Some(path)))` when a new catalog was installed, `Some(Ok(None))` when the cached
@@ -338,9 +356,11 @@ impl CatalogSync {
         let base = base_url.trim_end_matches('/').to_string();
         if base.is_empty() {
             let _ = tx.send(Err("No asset URL configured".into()));
-            return Self { rx, bytes, running: true };
+            return Self { rx, bytes, updating: Default::default(), running: true };
         }
         let b = bytes.clone();
+        let updating: Arc<AtomicBool> = Default::default();
+        let u = updating.clone();
         ehttp::fetch(ehttp::Request::get(format!("{base}/catalog/version.txt")), move |res| {
             let version = match http_ok(res) {
                 Ok(r) => r.text().unwrap_or_default().trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>(),
@@ -359,6 +379,7 @@ impl CatalogSync {
                 let _ = tx.send(Ok(None));
                 return;
             }
+            u.store(true, Ordering::Relaxed);
             ehttp::fetch(ehttp::Request::get(format!("{base}/catalog/assets.sqlite.gz")), move |res| {
                 let r = http_ok(res).map_err(|e| format!("catalog download: {e}")).and_then(|r| {
                     b.store(r.bytes.len() as u64, Ordering::Relaxed);
@@ -374,7 +395,7 @@ impl CatalogSync {
                 let _ = tx.send(r);
             });
         });
-        Self { rx, bytes, running: true }
+        Self { rx, bytes, updating, running: true }
     }
 
     pub fn poll(&mut self) -> Option<Result<Option<PathBuf>, String>> {

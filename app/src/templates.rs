@@ -209,12 +209,15 @@ impl TemplateStore {
         })
     }
 
+    /// Saved again, a template accepted to the official library stays there (only
+    /// [`Self::merge_published`] takes it out).
     pub fn insert(&self, row: &TemplateRow) -> Result<(), String> {
         let Some(c) = &self.conn else { return Err("template library unavailable".into()) };
         let m = &row.meta;
         c.execute(
             "INSERT OR REPLACE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, \
-             json_local, thumb_local, tags, generative_ai_used, official, credit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             json_local, thumb_local, tags, generative_ai_used, official, credit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+             ?14 OR coalesce((SELECT official FROM templates WHERE id = ?1), 0), ?15)",
             params![
                 m.id,
                 m.title,
@@ -250,7 +253,8 @@ impl TemplateStore {
     }
 
     /// Replace the published templates with those in `downloaded` (own templates are kept, and
-    /// win over a published copy with the same id). Removed-on-publish templates disappear.
+    /// win over a published copy with the same id, taking its place in the official library once
+    /// it is accepted there). Removed-on-publish templates disappear.
     pub fn merge_published(&self, downloaded: &Path, version: &str) -> Result<(), String> {
         let Some(c) = &self.conn else { return Err("template library unavailable".into()) };
         c.execute("ATTACH DATABASE ?1 AS pub", params![downloaded.display().to_string()]).map_err(|e| e.to_string())?;
@@ -261,7 +265,9 @@ impl TemplateStore {
         let r = c.execute_batch(&format!(
             "BEGIN; DELETE FROM templates WHERE json_local IS NULL; \
              INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, tags, generative_ai_used, official, credit) \
-             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags}, {ai}, {official}, {credit} FROM pub.templates; COMMIT;"
+             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags}, {ai}, {official}, {credit} FROM pub.templates; \
+             UPDATE templates SET official = (SELECT {official} FROM pub.templates p WHERE p.id = templates.id) \
+             WHERE json_local IS NOT NULL AND id IN (SELECT id FROM pub.templates); COMMIT;"
         ));
         if r.is_err() {
             let _ = c.execute_batch("ROLLBACK;");
@@ -490,14 +496,23 @@ fn submit_template(url: &str, meta: &SubmitMeta, mut file: TemplateFile, thumb_p
 }
 
 /// Fetch and parse a template (from its local copy when there is one).
-pub fn load(row: &TemplateRow, base_url: &str) -> Result<TemplateFile, String> {
-    let req = match row.json_local.as_deref().map(PathBuf::from).filter(|p| crate::storage::exists(p)) {
+/// A template's slide: its own copy when it was made here, else the one in the offline folder
+/// `cache_dir` (see [`crate::offline`]), else downloaded (and, on the desktop, kept there).
+pub fn load(row: &TemplateRow, base_url: &str, cache_dir: Option<&Path>) -> Result<TemplateFile, String> {
+    let cached = cache_dir.filter(|_| row.json_local.is_none()).and_then(|d| crate::offline::cache_path(d, &row.json_key)).filter(|p| p.is_file());
+    let req = match row.json_local.as_deref().map(PathBuf::from).filter(|p| crate::storage::exists(p)).or(cached) {
         Some(p) => crate::assets::Request::Path(p),
         None if !base_url.is_empty() => crate::assets::Request::Url(format!("{}/{}", base_url.trim_end_matches('/'), row.json_key)),
         None if row.json_local.is_some() => return Err(format!("its saved copy is missing ({})", row.json_local.as_deref().unwrap_or_default())),
         None => return Err("No asset URL configured.".into()),
     };
-    parse(&crate::assets::fetch(&req)?)
+    let bytes = crate::assets::fetch(&req)?;
+    let t = parse(&bytes)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if let (crate::assets::Request::Url(_), Some(dir)) = (&req, cache_dir) {
+        crate::offline::store(dir, &row.json_key, &bytes);
+    }
+    Ok(t)
 }
 
 /// Parse a template's JSON.
@@ -528,7 +543,7 @@ mod tests {
         let (row, submitted) = save(job).unwrap();
         assert!(submitted.is_none());
         assert!(Path::new(row.thumb_local.as_deref().unwrap()).exists());
-        let back = load(&row, "").unwrap();
+        let back = load(&row, "", None).unwrap();
         assert_eq!((back.width, back.slide.items.len(), back.meta.title.as_str()), (100.0, 1, "T"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -628,6 +643,17 @@ mod tests {
         store.merge_published(&dir.join("pub.sqlite"), "v1").unwrap();
         let got: Vec<(String, String, &str)> = store.list().into_iter().map(|r| (r.meta.id.clone(), r.meta.author.clone(), r.source())).collect();
         assert_eq!(got, [("accepted".into(), "Ann".into(), "biocartoon"), ("community".into(), "Bo".into(), "user"), ("own".into(), "BioCartoon".into(), "biocartoon")]);
+        // Saved here too, the accepted one keeps its own copy (in Your library) and is BioCartoon's.
+        store.insert(&TemplateRow { json_local: Some("/x/template.json".into()), ..row("accepted", "Ann", false) }).unwrap();
+        assert_eq!(store.list().iter().find(|r| r.meta.id == "accepted").unwrap().source(), "biocartoon");
+        store.merge_published(&dir.join("pub.sqlite"), "v2").unwrap();
+        let accepted: Vec<_> = store.list().into_iter().filter(|r| r.meta.id == "accepted").collect();
+        assert_eq!(accepted.len(), 1);
+        assert!(accepted[0].json_local.is_some());
+        assert_eq!(accepted[0].source(), "biocartoon");
+        store.insert(&accepted[0].clone()).unwrap();
+        store.insert(&TemplateRow { meta: TemplateMeta { official: false, ..accepted[0].meta.clone() }, ..accepted[0].clone() }).unwrap();
+        assert_eq!(store.list().iter().find(|r| r.meta.id == "accepted").unwrap().source(), "biocartoon");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -654,7 +680,7 @@ mod tests {
         // Nothing to point it at: left alone, and loading it says why.
         let gone = rows.iter().find(|r| r.meta.id == "gone").unwrap();
         assert_eq!(gone.json_local, row("gone").json_local);
-        assert!(load(gone, "").unwrap_err().contains("saved copy is missing"));
+        assert!(load(gone, "", None).unwrap_err().contains("saved copy is missing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

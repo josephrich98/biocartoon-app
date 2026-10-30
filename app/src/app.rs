@@ -341,6 +341,8 @@ impl Include {
 /// (none keeps everything), and a result has to pass all of them.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SearchFilter {
+    /// Databases, and `catalog::LIBRARY_SOURCE` for Your library (its icons and templates are
+    /// also in the database they are listed under).
     pub sources: Vec<String>,
     /// Parts of author names, separated by commas.
     pub authors: String,
@@ -355,6 +357,10 @@ pub struct SearchFilter {
     pub formats: Vec<String>,
     /// Tags, separated by commas: a result with any of them as one of its tags.
     pub tags: String,
+    /// Only the favorites.
+    pub favorites: bool,
+    /// Only the assets downloaded for offline use (their images are in the offline folder).
+    pub downloads: bool,
 }
 
 impl SearchFilter {
@@ -377,6 +383,8 @@ impl SearchFilter {
             !self.licenses.is_empty(),
             !self.formats.is_empty(),
             !self.tags().is_empty(),
+            self.favorites,
+            self.downloads,
         ]
             .iter()
             .filter(|&&on| on)
@@ -384,7 +392,8 @@ impl SearchFilter {
     }
 
     /// The catalog's form: a category with some of its subcategories picked is just those.
-    pub fn catalog(&self) -> Filter {
+    /// `favorites` are the ids [`Self::favorites`] keeps.
+    pub fn catalog(&self, favorites: &[String]) -> Filter {
         let mut taxa = Vec::new();
         for (cat, _) in crate::taxonomy::TAXONOMY {
             let subs: Vec<_> = self.subs.iter().filter(|(c, _)| c == cat).cloned().collect();
@@ -402,6 +411,10 @@ impl SearchFilter {
             db_cats: self.db_cats.clone(),
             formats: self.formats.clone(),
             tags: self.tags(),
+            // (the editor's own list rather than the usage file's)
+            ids: self.favorites.then(|| favorites.to_vec()),
+            downloads: self.downloads,
+            ..Filter::default()
         }
     }
 }
@@ -838,6 +851,16 @@ pub enum Action {
     RemoveUserAsset(AssetRow),
     /// Star the asset with this id (add it to Favorites), or take the star back.
     ToggleFavorite(String),
+    /// Download an asset's image files into the offline folder (in the browser, which has none,
+    /// save its original file instead).
+    DownloadAsset(Box<AssetRow>),
+    /// Desktop: download a template, and the icons it uses, into the offline folder.
+    DownloadTemplate(Box<TemplateRow>),
+    /// An icon or template is now in the offline folder.
+    Downloaded { title: String },
+    /// Web: an asset's file arrived; save it.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    SaveAsset { title: String, bytes: Vec<u8> },
     InsertFile(PathBuf),
     InsertText { text: String, size: f32, bold: bool },
     /// Arm (or disarm) the Text tool: the next click on the canvas places a text box.
@@ -1434,6 +1457,11 @@ impl BioCartoon {
             self.catalog.send(Req::Sources);
             // For the library dialog's category suggestions.
             self.catalog.send(Req::Categories { source: "user".into() });
+            // Which assets are downloaded, for the Downloads filter (the folder may have changed
+            // since the usage file last heard).
+            if !cfg!(target_arch = "wasm32") {
+                self.offline_rescan();
+            }
         }
     }
 
@@ -1443,9 +1471,12 @@ impl BioCartoon {
             None => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
             Some(Ok(Some(path))) => {
                 log::info!("catalog updated: {}", path.display());
+                let had = self.catalog.ok;
                 self.load_catalog(path);
-                if std::mem::take(&mut self.offline.syncing) {
-                    self.toast("Icon catalog updated");
+                // A background update replacing the cached copy is announced too: searches
+                // made before it could not see the new icons.
+                if std::mem::take(&mut self.offline.syncing) || had {
+                    self.toast("Icon catalog updated: new icons are available");
                 }
             }
             Some(Ok(None)) => {
@@ -2407,6 +2438,10 @@ impl BioCartoon {
     fn reload_templates(&mut self) {
         self.template_rows = self.templates.list();
         self.fetch_template_stars();
+        // Which are downloaded (Settings > Offline, the Downloads filter).
+        if !cfg!(target_arch = "wasm32") && !self.catalog.db_path.as_os_str().is_empty() {
+            self.offline_rescan();
+        }
     }
 
     fn poll_stars(&mut self) {
@@ -2466,6 +2501,90 @@ impl BioCartoon {
             }
         }
         self.catalog.send(Req::SetStars { updates });
+    }
+
+    /// Desktop: download `row`'s PNG, and its SVG when it has one, into the offline folder in the
+    /// background, as a pack does (Settings > Offline): they are drawn from there from then on,
+    /// and it is listed under the Downloads filter. [`Action::AssetDownloaded`] says when.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn download_asset(&mut self, row: &AssetRow) {
+        if row.png_local.is_some() {
+            return self.toast(format!("{} is already on this computer", row.title));
+        }
+        let Some(dir) = self.images.cache_dir() else { return self.toast_err("No offline folder (Settings > Offline)") };
+        let base = self.images.base_url.trim_end_matches('/').to_string();
+        let keys: Vec<String> = std::iter::once(row.png_key.clone()).chain(row.svg_key.clone()).filter(|k| !k.is_empty()).collect();
+        let (tx, title) = (self.action_tx.clone(), row.title.clone());
+        crate::platform::spawn("download asset", move || {
+            let cancel = Default::default();
+            let res = keys.iter().try_for_each(|k| crate::offline::ensure(&base, &dir, k, &cancel).map(drop));
+            let _ = tx.send(match res {
+                Ok(()) => Action::Downloaded { title },
+                Err(e) => Action::Toast(format!("Couldn't download {title}: {e}")),
+            });
+        });
+    }
+
+    /// Desktop: download `row` into the offline folder in the background, as a pack does: its JSON
+    /// and thumbnail, and every icon it uses (PNG and SVG). It opens from there from then on.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn download_template(&mut self, row: TemplateRow) {
+        let Some(dir) = self.images.cache_dir() else { return self.toast_err("No offline folder (Settings > Offline)") };
+        let (tx, base) = (self.action_tx.clone(), self.images.base_url.clone());
+        crate::platform::spawn("download template", move || {
+            let title = row.meta.title.clone();
+            let _ = tx.send(match crate::offline::download_template(&base, &dir, &row, &Default::default()) {
+                Ok(_) => Action::Downloaded { title },
+                Err(e) => Action::Toast(format!("Couldn't download {title}: {e}")),
+            });
+        });
+    }
+
+    /// Web: there is no offline folder, so fetch `row`'s original file (its SVG when it has one,
+    /// else its PNG); [`Action::SaveAsset`] brings it back to be saved.
+    #[cfg(target_arch = "wasm32")]
+    fn download_asset(&mut self, row: &AssetRow) {
+        let req = match self.images.request_for_image(&row.png_key, row.svg_key.as_deref(), row.png_local.as_deref()) {
+            Ok(req) => req,
+            Err(e) => return self.toast_err(format!("Couldn't download {}: {e}", row.title)),
+        };
+        let (tx, title) = (self.action_tx.clone(), row.title.clone());
+        crate::assets::fetch_web(
+            req,
+            Box::new(move |res| {
+                let _ = tx.send(match res {
+                    Ok(bytes) => Action::SaveAsset { title, bytes },
+                    Err(e) => Action::Toast(format!("Couldn't download {title}: {e}")),
+                });
+            }),
+        );
+    }
+
+    /// Web: save a downloaded asset's file under its title (a browser download).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn save_asset(&mut self, title: &str, bytes: Vec<u8>) {
+        // Catalog SVGs may be stored gzipped; the file saved is plain.
+        let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+            let mut out = Vec::new();
+            match std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut out) {
+                Ok(_) => out,
+                Err(e) => return self.toast_err(format!("Couldn't download {title}: {e}")),
+            }
+        } else {
+            bytes
+        };
+        let ext = if crate::assets::is_svg(&bytes) {
+            "svg"
+        } else {
+            image::guess_format(&bytes).ok().and_then(|f| f.extensions_str().first().copied()).unwrap_or("png")
+        };
+        let stem: String = title.chars().map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') { c } else { '_' }).collect();
+        let stem = if stem.trim().is_empty() { "asset" } else { stem.trim() };
+        let Some(path) = crate::platform::save_path(&ext.to_uppercase(), ext, &format!("{stem}.{ext}")) else { return };
+        if let Err(e) = crate::platform::write_output(&path, &bytes) {
+            return self.toast_err(format!("Couldn't save {title}: {e}"));
+        }
+        self.toast(format!("Downloaded {title}"));
     }
 
     /// Star the asset or template `id` (add it to Favorites), or take the star back. Favorites are kept in
@@ -2539,7 +2658,7 @@ impl BioCartoon {
         self.icons.loading = true;
         self.icons.results_req = self.catalog.send(Req::Search {
             query: self.icons.query.clone(),
-            filter: self.icons.filter.catalog(),
+            filter: self.icons.filter.catalog(&self.settings.favorites),
             offset: self.icons.browse_offset,
             limit: RESULTS_PAGE,
             sort: self.settings.search_sort,
@@ -2575,7 +2694,7 @@ impl BioCartoon {
     /// Ask which of the filters' choices find icons under the current query and filter.
     pub fn request_facets(&mut self) {
         let query = self.icons.query.trim().to_string();
-        self.icons.facets_req = self.catalog.send(Req::Facets { query: query.clone(), filter: self.icons.filter.catalog() });
+        self.icons.facets_req = self.catalog.send(Req::Facets { query: query.clone(), filter: self.icons.filter.catalog(&self.settings.favorites) });
         self.icons.facets_for = Some((query, self.icons.filter.clone()));
     }
 
@@ -2921,7 +3040,7 @@ impl BioCartoon {
         let rows: Vec<TemplateRow> = self.template_rows.iter().filter(|r| r.json_local.is_some() && saved.contains(&r.meta.id)).cloned().collect();
         for row in &rows {
             // A local file, so reading it here is quick.
-            match crate::templates::load(row, "") {
+            match crate::templates::load(row, "", None) {
                 Ok(t) => targets.push(UploadTarget::Template(Box::new(TemplateSlide { slide: t.slide, width: t.width, height: t.height, background: t.background, saved: Some(row.meta.clone()) }))),
                 Err(e) => self.toast_err(format!("\"{}\": {e}", row.meta.title)),
             }
@@ -3428,6 +3547,7 @@ impl BioCartoon {
 
     pub(crate) fn load_saved_template(&mut self, row: TemplateRow) {
         let (tx, ctx, base) = (self.library_tx.clone(), self.ctx.clone(), self.settings.asset_base_url.clone());
+        let cache = self.images.cache_dir();
         self.library_busy += 1;
         let own = row.json_local.is_some();
         // The browser can't block on a download, so a published template is fetched with ehttp.
@@ -3442,7 +3562,7 @@ impl BioCartoon {
             return;
         }
         crate::platform::spawn("template-load", move || {
-            let _ = tx.send(LibraryMsg::TemplateLoaded(crate::templates::load(&row, &base), own));
+            let _ = tx.send(LibraryMsg::TemplateLoaded(crate::templates::load(&row, &base, cache.as_deref()), own));
             ctx.request_repaint();
         });
     }
@@ -4675,6 +4795,17 @@ impl BioCartoon {
                 self.toast(format!("Removed \"{}\" from your library", row.title));
             }
             Action::ToggleFavorite(id) => self.toggle_favorite(id),
+            Action::DownloadAsset(row) => self.download_asset(&row),
+            #[cfg(not(target_arch = "wasm32"))]
+            Action::DownloadTemplate(row) => self.download_template(*row),
+            #[cfg(target_arch = "wasm32")]
+            Action::DownloadTemplate(_) => {}
+            Action::Downloaded { title } => {
+                // Recount Settings > Offline and the Downloads filter.
+                self.offline_rescan();
+                self.toast(format!("Downloaded {title} for offline use"));
+            }
+            Action::SaveAsset { title, bytes } => self.save_asset(&title, bytes),
             Action::InsertFile(p) => {
                 self.insert_file(&p);
                 self.hide_icons_on_phones(ctx);
