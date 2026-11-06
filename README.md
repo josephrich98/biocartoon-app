@@ -23,7 +23,7 @@ Install Desktop application: [app.biocartoon.com/download](https://app.biocartoo
 
 | source | icons | license | examples |
 |---|---|---|---|
-| [BioCartoon](https://www.biocartoon.com) | 520 | CC0 | <img src="https://assets.biocartoon.com/user/plasmid-3a840ac2ad.png" alt="Plasmid" title="Plasmid" height="32"> <img src="https://assets.biocartoon.com/user/t-cell-f603035c23.png" alt="T cell" title="T cell" height="32"> <img src="https://assets.biocartoon.com/user/human-heart-05aab1b2bd.png" alt="Heart" title="Heart" height="32"> <img src="https://assets.biocartoon.com/user/neuron-4f6c886f31.png" alt="Neuron" title="Neuron" height="32"> <img src="https://assets.biocartoon.com/user/woman-6ae68b5d9e.png" alt="Woman" title="Woman" height="32"> |
+| [BioCartoon](https://www.biocartoon.com) | 520 | CC0 | <img src="https://assets.biocartoon.com/user/plasmid-3a840ac2ad.png" alt="DNA" title="DNA" height="32"> <img src="https://assets.biocartoon.com/user/stem-cell-6e2b779265.png" alt="Cell" title="Cell" height="32"> <img src="https://assets.biocartoon.com/user/human-heart-05aab1b2bd.png" alt="Heart" title="Heart" height="32"> <img src="https://assets.biocartoon.com/user/c57bl-6j-founder-mouse-15cef9f2a0.png" alt="Mouse" title="Mouse" height="32"> <img src="https://assets.biocartoon.com/user/man-07d4d4bfe2.png" alt="Human male" title="Human male" height="32"> |
 | [Bioicons](https://bioicons.com) | 2,793 | CC BY / CC0 / CC BY-SA / MIT / BSD | <img src="https://assets.biocartoon.com/bioicons/cc-by-4.0/Nucleic_acids/DNA_colored.png" alt="DNA" title="DNA" height="32"> <img src="https://assets.biocartoon.com/bioicons/cc-by-4.0/Cell_types/Lymphocyte.png" alt="Lymphocyte" title="Lymphocyte" height="32"> <img src="https://assets.biocartoon.com/bioicons/cc-by-3.0/Human_physiology/heart.png" alt="Heart" title="Heart" height="32"> <img src="https://assets.biocartoon.com/bioicons/cc-by-4.0/Animals/Mouse.png" alt="Mouse" title="Mouse" height="32"> <img src="https://assets.biocartoon.com/bioicons/cc-by-4.0/Human_physiology/Human_male.png" alt="Human male" title="Human male" height="32"> |
 | [Health Icons](https://healthicons.org) | 808 | CC0 | <img src="https://assets.biocartoon.com/healthicons/filled/body/dna.png" alt="DNA" title="DNA" height="32"> <img src="https://assets.biocartoon.com/healthicons/filled/body/cell-nuclei.png" alt="Cell nuclei" title="Cell nuclei" height="32"> <img src="https://assets.biocartoon.com/healthicons/filled/body/heart-organ.png" alt="Heart" title="Heart" height="32"> <img src="https://assets.biocartoon.com/healthicons/filled/zoonoses/animal-rat.png" alt="Rat" title="Rat" height="32"> <img src="https://assets.biocartoon.com/healthicons/filled/people/person.png" alt="Person" title="Person" height="32"> |
 | [NIAID NIH BioArt Source](https://bioart.niaid.nih.gov) | 936 | Public Domain | <img src="https://assets.biocartoon.com/bioart/123_629265.png" alt="DNA" title="DNA" height="32"> <img src="https://assets.biocartoon.com/bioart/508_636258.png" alt="T cell" title="T cell" height="32"> <img src="https://assets.biocartoon.com/bioart/228_630872.png" alt="Heart" title="Heart" height="32"> <img src="https://assets.biocartoon.com/bioart/279_631480.png" alt="Mouse" title="Mouse" height="32"> <img src="https://assets.biocartoon.com/bioart/238_630972.png" alt="Human male" title="Human male" height="32"> |
@@ -35,10 +35,10 @@ Install Desktop application: [app.biocartoon.com/download](https://app.biocartoo
 <details><summary>Example icon credits</summary>
 
 - "Plasmid" by Joseph Rich, BioCartoon community contribution, CC0
-- "T Cell" by Joseph Rich, BioCartoon community contribution, CC0
+- "Stem Cell" by Joseph Rich, BioCartoon community contribution, CC0
 - "Human Heart" by Joseph Rich, BioCartoon community contribution, CC0
-- "Neuron" by Joseph Rich, BioCartoon community contribution, CC0
-- "Woman" by Joseph Rich, BioCartoon community contribution, CC0
+- "C57BL/6J founder mouse" by Lior Pachter, BioCartoon community contribution, CC0
+- "Man" by Joseph Rich, BioCartoon community contribution, CC0
 - "DNA colored" by DBCLS, Bioicons (https://togotv.dbcls.jp/en/pics.html), CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)
 - "Lymphocyte" by DBCLS, Bioicons (https://togotv.dbcls.jp/en/pics.html), CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)
 - "heart" by Servier, Bioicons (https://smart.servier.com/), CC-BY-3.0 (https://creativecommons.org/licenses/by/3.0/)
