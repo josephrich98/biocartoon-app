@@ -441,6 +441,12 @@ pub struct IconsState {
     pub mine_show_filters: bool,
     /// The filters are open under the search box.
     pub show_filters: bool,
+    /// The results' scroll offset when the open filters last held still (were opened, edited or
+    /// scrolled back above); scrolling on down from it closes them.
+    pub filters_scroll_from: Option<f32>,
+    /// The filters were just closed by scrolling: how tall they were, and the results' offset then,
+    /// so the next frame can scroll the results back by what the filters gave up and keep them still.
+    pub filters_closed: Option<(f32, f32)>,
     pub results: Vec<AssetRow>,
     /// How many colours the `results` that come in several have, by result id (the others are
     /// picked in Edit once one is placed).
@@ -481,6 +487,8 @@ impl Default for IconsState {
             mine_filter: SearchFilter::default(),
             mine_show_filters: false,
             show_filters: false,
+            filters_scroll_from: None,
+            filters_closed: None,
             results: Vec::new(),
             colors: HashMap::new(),
             results_req: 0,
@@ -1100,6 +1108,8 @@ pub struct BioCartoon {
     stars_migrated: bool,
     /// Web: the optional account that keeps projects and Your library online.
     pub account: crate::account::Account,
+    /// The open project's share link, and the Share windows (see [`crate::share`]).
+    pub share: crate::share::Sharer,
     /// Web: Your library's own icons, put back into each catalog loaded.
     pub library: crate::library::Library,
     pub images: ImageCache,
@@ -1168,7 +1178,7 @@ pub struct BioCartoon {
     pub text_edit_focus: bool,
     pub toasts: Vec<Toast>,
     pub screen: Screen,
-    ctx: egui::Context,
+    pub(crate) ctx: egui::Context,
     pub store: Store,
     /// The open project's id; `None` for a new document not saved yet.
     pub project: Option<String>,
@@ -1229,6 +1239,9 @@ pub struct BioCartoon {
     /// The Attributions window lists only credits the licenses require.
     pub attributions_required_only: bool,
     pub drag: Option<crate::canvas::Drag>,
+    /// Set once a finger has touched the screen: the canvas then draws bigger handles and gives
+    /// them a finger-sized hit area.
+    pub touch_input: bool,
     /// When and where (screen) the last click on the canvas landed, to spot a double click.
     pub last_canvas_click: Option<(f64, Pos2)>,
     /// The guide (index into `doc.guides`) picked on the canvas: Delete removes it.
@@ -1351,6 +1364,7 @@ impl BioCartoon {
             template_stars: HashMap::new(),
             stars_migrated: false,
             account: crate::account::Account::new(app_dir.join("account.json"), cc.egui_ctx.clone()),
+            share: crate::share::Sharer::new(cc.egui_ctx.clone()),
             library: crate::library::Library::open(app_dir.join("library.json")),
             catalog_sync: None,
             offline: Default::default(),
@@ -1430,6 +1444,7 @@ impl BioCartoon {
             credit_item: None,
             attributions_required_only: false,
             drag: None,
+            touch_input: false,
             last_canvas_click: None,
             selected_guide: None,
             app_dir,
@@ -1951,6 +1966,32 @@ impl BioCartoon {
             let ids: std::collections::HashSet<ItemId> = self.doc.slides.iter().flat_map(|s| s.items.iter().map(|i| i.id)).collect();
             self.pending_fit.retain(|(id, _)| ids.contains(id));
         }
+    }
+
+    /// Picked or dropped files ready to use as images: a PDF is converted to an SVG kept in the
+    /// app's uploads folder (so it stays vector), and the SVG is used in its place. A PDF that
+    /// can't be converted is left out, with a message.
+    fn vector_uploads(&mut self, files: Vec<PathBuf>) -> Vec<PathBuf> {
+        let stamp = crate::projects::now_ms();
+        let mut out = Vec::new();
+        for (i, f) in files.into_iter().enumerate() {
+            let is_pdf_name = f.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+            if !is_pdf_name {
+                out.push(f);
+                continue;
+            }
+            let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "PDF".into());
+            let converted = crate::storage::read(&f).map_err(|e| e.to_string()).and_then(|b| crate::assets::pdf_to_svg(&b)).and_then(|svg| {
+                let stem = f.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "pdf".into());
+                let path = self.app_dir.join("uploads").join(format!("{stamp}-{i}")).join(format!("{stem}.svg"));
+                crate::storage::write(&path, svg.as_bytes()).map(|()| path).map_err(|e| e.to_string())
+            });
+            match converted {
+                Ok(p) => out.push(p),
+                Err(e) => self.toast_err(format!("Couldn't add {name}: {e}")),
+            }
+        }
+        out
     }
 
     /// Remember a picked or dropped file in Uploads. It is read afresh, so a file uploaded again
@@ -3760,7 +3801,7 @@ impl BioCartoon {
     // ---------- file IO ----------
 
     /// Reset the editor to `doc` (no undo history, nothing selected).
-    fn load_into_editor(&mut self, doc: Document, project: Option<String>) {
+    pub(crate) fn load_into_editor(&mut self, doc: Document, project: Option<String>) {
         self.saved_doc = Some(doc.clone());
         self.doc = doc;
         self.project = project;
@@ -3788,7 +3829,7 @@ impl BioCartoon {
         self.show_storage_notice = cfg!(target_arch = "wasm32") && !self.account.signed_in() && !self.settings.hide_project_notice;
     }
 
-    fn open_project(&mut self, id: &str) {
+    pub(crate) fn open_project(&mut self, id: &str) {
         if self.project.as_deref() == Some(id) && self.screen == Screen::Editor {
             return;
         }
@@ -3802,10 +3843,11 @@ impl BioCartoon {
         }
     }
 
-    /// Ask for a `.biocartoon` file to import (see [`Self::open_file`]).
+    /// Ask for a `.biocartoon` file to import (see [`Self::open_file`]); the picker offers only
+    /// `.biocartoon` files.
     fn open(&mut self) {
         let tx = self.action_tx.clone();
-        crate::platform::pick_files("biocartoon", &["biocartoon", "json", "zip"], true, move |paths| open_paths(&tx, paths));
+        crate::platform::pick_files("biocartoon", &["biocartoon"], true, move |paths| open_paths(&tx, paths));
     }
 
     /// Open files given on the command line, as when a `.biocartoon` file is double-clicked
@@ -3969,7 +4011,7 @@ impl BioCartoon {
     }
 
     /// Save the open project (recording a version) before switching away from it.
-    fn close_project(&mut self) {
+    pub(crate) fn close_project(&mut self) {
         if self.screen == Screen::Editor {
             self.save_current(Snapshot::IfChanged, "Edited");
         }
@@ -5242,6 +5284,7 @@ impl BioCartoon {
                 });
             }
             Action::LibraryFilePicked(f) => {
+                let Some(f) = self.vector_uploads(vec![f]).pop() else { return };
                 self.add_upload(&f);
                 self.open_upload_dialog(UploadTarget::File(f), false);
             }
@@ -5300,11 +5343,14 @@ impl BioCartoon {
                 });
             }
             Action::AddUploads(files) => {
-                for f in files {
+                for f in self.vector_uploads(files) {
                     self.add_upload(&f);
                 }
             }
-            Action::DropImages(files, at) => self.drop_images(&files, at),
+            Action::DropImages(files, at) => {
+                let files = self.vector_uploads(files);
+                self.drop_images(&files, at);
+            }
             Action::OpenFile(p) => self.open_file(&p),
             Action::ImportFiles(paths) => self.import_files(&paths),
             Action::BackupAll => self.backup_all(),
@@ -5496,6 +5542,7 @@ impl BioCartoon {
         self.lookup_credits();
         self.poll_stars();
         self.poll_account();
+        self.poll_share();
         self.poll_catalog_sync(&ctx);
         self.handle_ai_results(&ctx);
         self.poll_export(&ctx);
@@ -5509,6 +5556,7 @@ impl BioCartoon {
                 self.export_window(&ctx);
             }
             self.settings_windows(&ctx);
+            self.open_link_window(&ctx);
             self.export_progress_ui(&ctx);
             self.toasts_ui(&ctx);
             self.run_actions(&ctx);
@@ -5551,14 +5599,14 @@ impl BioCartoon {
         if self.settings.show_icons {
             self.left_panel(ui);
         }
-        self.rail_ui(ui);
+        let rail = self.rail_ui(ui);
         if self.rail.is_some() {
             self.right_panel(ui);
         }
         if let Some(r) = self.rail.filter(|&r| r != RailTab::Text) {
             self.last_rail = Some(r);
         }
-        self.edge_swipes(ui);
+        self.edge_swipes(ui, rail);
         self.canvas_ui(ui);
         self.windows(&ctx);
         self.home_windows_in_editor(&ctx);
@@ -5597,12 +5645,20 @@ impl BioCartoon {
                 egui::Frame::new().fill(theme::panel()).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
                     ui.menu_button(egui::RichText::new(ph::LIST).size(18.0), |ui| {
                         if ui.button("All projects").clicked() { self.actions.push(Action::GoHome); ui.close(); }
-                        if ui.add_enabled(!self.settings.show_icons, egui::Button::new("Show artwork menu"))
+                        if ui.add_enabled(!self.settings.show_icons, egui::Button::new(format!("{}  Show artwork menu", ph::DNA)))
                             .on_hover_text("Open the Artwork panel on the left")
                             .on_disabled_hover_text("Artwork menu is already up")
                             .clicked()
                         {
                             self.settings.show_icons = true;
+                            ui.close();
+                        }
+                        if ui.add_enabled(self.rail.is_none(), egui::Button::new(format!("{}  Show options menu", ph::WRENCH)))
+                            .on_hover_text("Open the panel on the right, on the tab it showed last")
+                            .on_disabled_hover_text("Options menu is already up")
+                            .clicked()
+                        {
+                            self.actions.push(Action::SetRail(Some(self.last_rail.unwrap_or(RailTab::Edit))));
                             ui.close();
                         }
                         ui.separator();
@@ -5643,8 +5699,8 @@ impl BioCartoon {
                         self.actions.push(Action::GoHome);
                     }
                     ui.separator();
-                    // Narrower on a phone, leaving room for what follows it and the Export button.
-                    let title_w = (ui.ctx().content_rect().right() - ui.cursor().min.x - 160.0).clamp(40.0, 140.0);
+                    // Narrower on a phone, leaving room for what follows it and the Share and Export buttons.
+                    let title_w = (ui.ctx().content_rect().right() - ui.cursor().min.x - 210.0).clamp(40.0, 140.0);
                     let title = ui.add(egui::TextEdit::singleline(&mut self.doc.title).desired_width(title_w).frame(egui::Frame::NONE));
                     if title.changed() { self.dirty = true; }
                     let (icon, tip) = match (self.dirty, self.settings.autosave) {
@@ -5665,6 +5721,13 @@ impl BioCartoon {
                     if ui.add(egui::Button::new(egui::RichText::new("Export").color(Color32::WHITE)).fill(theme::accent())).clicked() {
                         self.actions.push(Action::OpenExport);
                     }
+                    // Left of Export (this layout runs right to left). Only the icon on a phone.
+                    let linked = self.share.remote.is_some();
+                    let label = if phone_width(ui.ctx()) { ph::SHARE_NETWORK.to_string() } else { format!("{}  Share", ph::SHARE_NETWORK) };
+                    let tip = if linked { "Shared: get its links, or stop sharing" } else { "Get a link to this project for a collaborator" };
+                    if ui.add(egui::Button::new(label).selected(self.share.show)).on_hover_text(tip).clicked() {
+                        self.share.show = !self.share.show;
+                    }
                 });
             });
         });
@@ -5676,12 +5739,19 @@ impl BioCartoon {
         egui::Panel::bottom("bottombar").exact_size(36.0).frame(frame).show_separator_line(false).show(ui, |ui| {
             let full = ui.max_rect();
             let row = |layout: egui::Layout, rect: Rect| egui::UiBuilder::new().max_rect(rect).layout(layout);
+            // On a phone the panel buttons go by short names and the page colour (also in the Page
+            // panel) is left out, so the zoom controls still fit between them.
+            let phone = phone_width(ui.ctx());
             let left = ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), full), |ui| {
-                if ui.add(egui::Button::new(format!("{}  Artwork", ph::DNA)).selected(self.settings.show_icons)).on_hover_text("Show or hide the Artwork panel").clicked() {
+                if ui.add(egui::Button::new(format!("{}  {}", ph::DNA, if phone { "Art" } else { "Artwork" })).selected(self.settings.show_icons)).on_hover_text("Show or hide the Artwork panel").clicked() {
                     self.settings.show_icons = !self.settings.show_icons;
                 }
             });
             let right = ui.scope_builder(row(egui::Layout::right_to_left(egui::Align::Center), full), |ui| {
+                let open = self.rail.is_some();
+                if ui.add(egui::Button::new(format!("{}  {}", ph::WRENCH, if phone { "Opt" } else { "Options" })).selected(open)).on_hover_text("Show or hide the Options panel on the right").clicked() {
+                    self.actions.push(Action::SetRail(if open { None } else { Some(self.last_rail.unwrap_or(RailTab::Edit)) }));
+                }
                 // The pager is only worth its space once there is more than one slide.
                 if n > 1 {
                     if ui.add(egui::Button::new(ph::CARET_RIGHT).frame(false)).clicked() && self.cur_slide + 1 < n { self.actions.push(Action::GoSlide(self.cur_slide + 1)); }
@@ -5704,15 +5774,17 @@ impl BioCartoon {
             let zoom = ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), Rect::from_center_size(Pos2::new(x, full.center().y), Vec2::new(w, full.height()))), |ui| {
                 // The current slide's page colour, edited like the one in the Page panel (one undo
                 // step per burst of edits).
-                let mut col = self.doc.background_of(self.slide());
-                if crate::color::edit_button(ui, &mut col).on_hover_text("Page color").changed() {
-                    let before = (self.doc.width, self.doc.height, self.doc.unit, self.slide().background);
-                    if self.page.last_edit != Some(before) { self.commit(); }
-                    self.slide_mut().background = Some(col);
-                    self.page.last_edit = Some((self.doc.width, self.doc.height, self.doc.unit, Some(col)));
-                    self.dirty = true;
+                if !phone {
+                    let mut col = self.doc.background_of(self.slide());
+                    if crate::color::edit_button(ui, &mut col).on_hover_text("Page color").changed() {
+                        let before = (self.doc.width, self.doc.height, self.doc.unit, self.slide().background);
+                        if self.page.last_edit != Some(before) { self.commit(); }
+                        self.slide_mut().background = Some(col);
+                        self.page.last_edit = Some((self.doc.width, self.doc.height, self.doc.unit, Some(col)));
+                        self.dirty = true;
+                    }
+                    ui.add_space(4.0);
                 }
-                ui.add_space(4.0);
                 if ui.add(egui::Button::new(ph::MINUS).frame(false)).on_hover_text("Zoom out (Cmd+-)").clicked() { self.actions.push(Action::ZoomTo(self.view.zoom / 1.2)); }
                 if slider {
                     ui.spacing_mut().slider_width = slider_w;
@@ -6039,6 +6111,9 @@ impl BioCartoon {
             self.save_picture_window(ctx);
         }
         self.settings_windows(ctx);
+        self.share_window(ctx);
+        self.share_banner(ctx);
+        self.open_link_window(ctx);
         // Edit with AI: the image, then a chat that offers the quick edits as clickable prompts.
         if self.ai_edit.is_some() {
             let mut open = true;
@@ -6985,6 +7060,14 @@ fn linked_line(ui: &mut egui::Ui, text: &str, link: &str, url: &str) {
 
 impl eframe::App for BioCartoon {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // On touch screens a text box gives up focus as soon as a finger lands elsewhere, not only
+        // on a tap. Otherwise scrolling the results leaves the search box focused, and eframe web
+        // refocuses its hidden input at the end of every touch, which brings the keyboard back up.
+        let touch = ui.input(|i| i.has_touch_screen());
+        let on = if touch { egui::SurrenderFocusOn::Presses } else { egui::SurrenderFocusOn::Clicks };
+        if ui.ctx().options(|o| o.input_options.surrender_focus_on != on) {
+            ui.ctx().options_mut(|o| o.input_options.surrender_focus_on = on);
+        }
         self.show(ui);
     }
 

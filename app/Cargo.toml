@@ -48,9 +48,14 @@ resvg = "0.45"
 # Which characters a font has, for the SVG export (the version resvg already uses).
 ttf-parser = "0.25"
 svg2pdf = "0.13"
+# Turns an uploaded PDF's first page into an SVG, so it stays vector (see assets::pdf_to_svg).
+hayro-svg = "0.9"
 pdf-writer = "0.12"
 tiff = "0.11"
 base64 = "0.22"
+# Share links are encrypted on this device before they are sent (see share.rs). No getrandom
+# feature: the key and nonces come from share::random, which works on the web too.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 spellbook = "0.4.2"
 
 # Embeds the .exe icon on Windows (see build.rs).
@@ -62,6 +67,8 @@ winresource = "0.1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 ureq = "3"
 rfd = "0.17"
+# The operating system's random numbers, for share links' keys (the web uses crypto.getRandomValues).
+getrandom = "0.3"
 env_logger = "0.11"
 
 # Tells the Dock a file landed in Downloads, so its stack bounces (see platform::write_output),

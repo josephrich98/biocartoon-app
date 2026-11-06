@@ -38,12 +38,15 @@ pub struct ProjectMeta {
     pub slides: usize,
     /// When the project was last downloaded as a `.biocartoon` file or in a backup (0: never).
     pub backed_up: i64,
+    /// The share link this project keeps in step with (see [`crate::share`]), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share: Option<crate::share::ShareLink>,
 }
 
 impl Default for ProjectMeta {
     fn default() -> Self {
         let t = now_ms();
-        Self { id: String::new(), name: "Untitled".into(), created: t, modified: t, opened: t, slides: 1, backed_up: 0 }
+        Self { id: String::new(), name: "Untitled".into(), created: t, modified: t, opened: t, slides: 1, backed_up: 0, share: None }
     }
 }
 
@@ -242,7 +245,7 @@ impl Store {
             Err(_) => {
                 let doc = self.load(id)?;
                 let t = storage::modified_ms(&self.doc_path(id)).unwrap_or_else(now_ms);
-                ProjectMeta { id: id.into(), name: doc.title.clone(), created: t, modified: t, opened: t, slides: doc.slides.len(), backed_up: 0 }
+                ProjectMeta { id: id.into(), name: doc.title.clone(), created: t, modified: t, opened: t, slides: doc.slides.len(), backed_up: 0, share: None }
             }
         };
         m.id = id.into();
@@ -349,12 +352,28 @@ impl Store {
             return Err(format!("bad project id {id:?}"));
         }
         if self.meta(id).is_err() {
-            self.write_meta(&ProjectMeta { id: id.into(), name: doc.title.clone(), created: modified, modified, opened: modified, slides: doc.slides.len(), backed_up: 0 })?;
+            self.write_meta(&ProjectMeta { id: id.into(), name: doc.title.clone(), created: modified, modified, opened: modified, slides: doc.slides.len(), backed_up: 0, share: None })?;
         }
         self.save(id, doc, Snapshot::IfChanged, "From your account")?;
         let mut m = self.meta(id)?;
         m.modified = modified;
         self.write_meta(&m)
+    }
+
+    /// Tie the project to a share link, or (`None`) untie it. Not an edit: "last modified" stays.
+    pub fn set_share(&self, id: &str, share: Option<crate::share::ShareLink>) -> Result<(), String> {
+        let mut m = self.meta(id)?;
+        m.share = share;
+        self.write_meta(&m)
+    }
+
+    /// Replace the project's document with `doc` from elsewhere (a share link), keeping what was
+    /// there in the version history first. Returns the new "last modified".
+    pub fn replace_with(&self, id: &str, doc: &Document, note: &str) -> Result<i64, String> {
+        let current = self.load(id)?;
+        self.save(id, &current, Snapshot::IfChanged, "Before loading shared changes")?;
+        self.save(id, doc, Snapshot::IfChanged, note)?;
+        Ok(self.meta(id)?.modified)
     }
 
     /// Record that the project's current content was just downloaded.

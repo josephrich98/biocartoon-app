@@ -29,8 +29,8 @@ const SLIDES_W: f32 = 186.0;
 const SLIDES_MIN_W: f32 = 150.0;
 
 impl BioCartoon {
-    /// The rail at the right edge: one button per [`RailTab`].
-    pub fn rail_ui(&mut self, ui: &mut egui::Ui) {
+    /// The rail at the right edge: one button per [`RailTab`]. Returns its rect.
+    pub fn rail_ui(&mut self, ui: &mut egui::Ui) -> Rect {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::symmetric(4, 8));
         egui::Panel::right("rail").exact_size(60.0 * theme::text_scale()).frame(frame).show_separator_line(false).show(ui, |ui| {
             // Scrolls when the window is too short for every button (a phone, or large text).
@@ -51,13 +51,14 @@ impl BioCartoon {
                     ui.add_space(4.0);
                 }
             }));
-        });
+        }).response.rect
     }
 
     /// With the Icons panel hidden, a drag in from the window's left edge shows it again; with the
-    /// right panel closed, a drag in from the right edge reopens the tab it showed last. Call after
-    /// the panels, before the canvas, so the canvas doesn't take the drag.
-    pub fn edge_swipes(&mut self, ui: &mut egui::Ui) {
+    /// right panel closed, a drag left from the rail's inner edge (`rail`, where the panel's edge
+    /// sits when open) reopens the tab it showed last. Call after the panels, before the canvas, so
+    /// the canvas doesn't take the drag.
+    pub fn edge_swipes(&mut self, ui: &mut egui::Ui, rail: Rect) {
         const STRIP: f32 = 6.0;
         const DISTANCE: f32 = 30.0;
         let ctx = ui.ctx().clone();
@@ -84,7 +85,7 @@ impl BioCartoon {
         if !self.settings.show_icons && strip("left", Rect::from_x_y_ranges(screen.left()..=screen.left() + STRIP, rows), 1.0) {
             self.settings.show_icons = true;
         }
-        if self.rail.is_none() && strip("right", Rect::from_x_y_ranges(screen.right() - STRIP..=screen.right(), rows), -1.0) {
+        if self.rail.is_none() && strip("right", Rect::from_x_y_ranges(rail.left() - STRIP..=rail.left() + STRIP / 2.0, rows), -1.0) {
             self.actions.push(Action::SetRail(Some(self.last_rail.unwrap_or(RailTab::Edit))));
         }
     }
@@ -135,24 +136,39 @@ impl BioCartoon {
                         });
                     });
                 }
-                // The search box stays put above the results, so a new search is always at hand.
-                if self.icons.mode == IconsMode::Search {
-                    self.search_box(ui);
-                    ui.add_space(4.0);
-                }
+                // The search box and its filters stay put above the results, so a new search is always at hand.
                 let mine = match self.icons.mode {
                     IconsMode::Favorites if !self.settings.favorites.is_empty() => Some("Search favorites"),
                     IconsMode::Library => Some("Search your library"),
                     _ => None,
                 };
-                if let Some(hint) = mine {
+                // Where the open filters are, if they are, so scrolling the results can close them.
+                let mut open_filters: Option<Rect> = None;
+                let top = ui.cursor().top();
+                if self.icons.mode == IconsMode::Search {
+                    self.search_box(ui);
+                    ui.add_space(4.0);
+                    let top = ui.cursor().top();
+                    let open = self.icons.show_filters;
+                    self.search_filters(ui);
+                    open_filters = open.then(|| Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top()));
+                } else if let Some(hint) = mine {
                     self.mine_search_box(ui, hint);
                     ui.add_space(4.0);
+                    let top = ui.cursor().top();
+                    let open = self.icons.mine_show_filters;
+                    self.mine_filters(ui);
+                    open_filters = open.then(|| Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top()));
                 }
+                let header_h = ui.cursor().top() - top;
                 let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(ui.available_width());
                 let to = self.icons.scroll_to.take();
+                let closed = self.icons.filters_closed.take();
                 if to == Some(egui::Align::Min) {
                     scroll = scroll.vertical_scroll_offset(0.0);
+                } else if let Some((h, offset)) = closed {
+                    // The results' view grew by what the filters gave up; scroll back by as much.
+                    scroll = scroll.vertical_scroll_offset((offset - (h - header_h)).max(0.0));
                 }
                 let out = scroll.show(ui, |ui| {
                     self.icons_panel(ui);
@@ -161,11 +177,40 @@ impl BioCartoon {
                     }
                 });
                 (scrolled, view_h) = (out.state.offset.y, out.inner_rect.height());
+                self.close_filters_on_scroll(ui.ctx(), open_filters, header_h, scrolled);
             })
             .response
             .rect
         });
         self.back_to_top(ui.ctx(), panel.inner, scrolled > view_h);
+    }
+
+    /// Scrolling the results on down past the open filters (`filters`, where they are) closes them
+    /// to their one-line summary, as they're done with; the results keep still as the filters
+    /// shrink (see `filters_closed`). Not while a filter is being edited (a dropdown open, or a field typed in), and
+    /// scrolling back up doesn't reopen them.
+    fn close_filters_on_scroll(&mut self, ctx: &egui::Context, filters: Option<Rect>, header_h: f32, offset: f32) {
+        const DISTANCE: f32 = 24.0;
+        let Some(filters) = filters else {
+            self.icons.filters_scroll_from = None;
+            return;
+        };
+        let editing = ctx.any_popup_open()
+            || ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id)).is_some_and(|r| filters.intersects(r.rect));
+        // The offset the filters last held still at: scrolling up (or back to it) moves it along.
+        let from = self.icons.filters_scroll_from.map_or(offset, |f| f.min(offset));
+        if editing || offset - from < DISTANCE {
+            self.icons.filters_scroll_from = Some(if editing { offset } else { from });
+            return;
+        }
+        if self.icons.mode == IconsMode::Search {
+            self.icons.show_filters = false;
+        } else {
+            self.icons.mine_show_filters = false;
+        }
+        self.icons.filters_scroll_from = None;
+        self.icons.filters_closed = Some((header_h, offset));
+        ctx.request_repaint();
     }
 
     /// A circled up arrow that appears once the Icons panel has scrolled down a screen, and goes
@@ -198,12 +243,13 @@ impl BioCartoon {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin { left: 0, right: 4, top: 36, bottom: 8 });
         // Resizable by dragging its left edge. The narrow Slides panel has its own id, so egui
         // remembers its width separately from the other tabs'.
+        let (id, min_w) = if tab == RailTab::Slides { ("rightpanel_slides", SLIDES_MIN_W) } else { ("rightpanel", PANEL_MIN_W) };
         let panel = if tab == RailTab::Slides {
-            egui::Panel::right("rightpanel_slides").resizable(true).default_size(SLIDES_W).size_range(SLIDES_MIN_W..=PANEL_MAX_W)
+            egui::Panel::right(id).resizable(true).default_size(SLIDES_W).size_range(SLIDES_MIN_W..=PANEL_MAX_W)
         } else {
-            egui::Panel::right("rightpanel").resizable(true).default_size(PANEL_W + 20.0).size_range(PANEL_MIN_W..=PANEL_MAX_W)
+            egui::Panel::right(id).resizable(true).default_size(PANEL_W + 20.0).size_range(PANEL_MIN_W..=PANEL_MAX_W)
         };
-        panel.frame(frame).show_separator_line(false).show(ui, |ui| {
+        let shown = panel.frame(frame).show_separator_line(false).show(ui, |ui| {
             let margin = if tab == RailTab::Slides { 10 } else { 12 };
             egui::Frame::new().fill(theme::panel()).corner_radius(10).inner_margin(egui::Margin::same(margin)).stroke(Stroke::new(1.0, theme::border())).show(ui, |ui| {
                 ui.set_min_height(ui.available_height());
@@ -246,6 +292,24 @@ impl BioCartoon {
                 });
             });
         });
+        self.collapse_by_drag(ui.ctx(), egui::Id::new(id), shown.response.rect, min_w);
+    }
+
+    /// Dragging the right panel's edge on past its narrowest, more than halfway to the rail,
+    /// closes it, and it reopens as wide as it was before the drag.
+    fn collapse_by_drag(&mut self, ctx: &egui::Context, id: egui::Id, rect: Rect, min_w: f32) {
+        let saved = id.with("width_before_drag");
+        if !ctx.is_being_dragged(id.with("__resize")) {
+            ctx.data_mut(|d| d.insert_temp(saved, rect.width()));
+            return;
+        }
+        let past = ctx.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.x > rect.left() + min_w / 2.0);
+        if past {
+            let w = ctx.data(|d| d.get_temp::<f32>(saved)).unwrap_or(rect.width());
+            let outer_rect = Rect::from_x_y_ranges(rect.right() - w..=rect.right(), rect.y_range());
+            ctx.data_mut(|d| d.insert_persisted(id, egui::containers::panel::PanelState { outer_rect }));
+            self.actions.push(Action::SetRail(None));
+        }
     }
 
     /// A database's display name: BioCartoon's own, or one from the catalog.
@@ -687,6 +751,19 @@ impl BioCartoon {
         }
     }
 
+    /// The search's filters when open, else what they keep, as a reminder; clicking opens them.
+    fn search_filters(&mut self, ui: &mut egui::Ui) {
+        if self.icons.show_filters {
+            self.filters_panel(ui, false);
+        } else if self.icons.filter.active() > 0 {
+            let summary = self.filter_summary(false);
+            let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
+            if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.icons.show_filters = true;
+            }
+        }
+    }
+
     /// Favorites' or Your library's filters when open, else what they keep, as the search's are.
     fn mine_filters(&mut self, ui: &mut egui::Ui) {
         if self.icons.mine_show_filters {
@@ -794,17 +871,7 @@ impl BioCartoon {
                 });
             }
             IconsMode::Search => {
-                // The search box is above the scroll area, in `left_panel`.
-                if self.icons.show_filters {
-                    self.filters_panel(ui, false);
-                } else if self.icons.filter.active() > 0 {
-                    // What the closed filters keep, as a reminder; clicking opens them.
-                    let summary = self.filter_summary(false);
-                    let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
-                    if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        self.icons.show_filters = true;
-                    }
-                }
+                // The search box and its filters are above the scroll area, in `left_panel`.
                 self.results_grid(ui);
             }
             IconsMode::Generate => self.generate_panel(ui),
@@ -815,12 +882,10 @@ impl BioCartoon {
                 if self.settings.favorites.is_empty() {
                     ui.label(egui::RichText::new("No favorites yet. Click the star on an icon or template, or right-click it and pick Favorite.").color(theme::text_dim()));
                 } else {
-                    self.mine_filters(ui);
                     self.results_grid(ui);
                 }
             }
             IconsMode::Library => {
-                self.mine_filters(ui);
                 if self.icons.results.is_empty() && !self.icons.loading && self.matching_templates().is_empty() {
                     ui.label(egui::RichText::new("Nothing here yet. Images you add to your library (generated with AI, or from Uploads) and slides you save as templates appear here.").color(theme::text_dim()));
                 }
@@ -927,7 +992,7 @@ impl BioCartoon {
         let sort = if self.icons.mode == IconsMode::Search { self.settings.search_sort } else { self.settings.icon_sort };
         let more = icons && self.icons.more;
         let total = shown_total.filter(|_| icons).map_or(rows.len(), |n| n.max(0) as usize);
-        let tiles = mix_templates(&rows, &templates, sort, more, total);
+        let tiles = mix_templates(&rows, &templates, &self.template_stars, sort, more, total);
         let mut picked: Option<AssetRow> = None;
         let (per_row, size) = self.icon_grid(ui);
         // Reveal thumbnails in order: hold back each one until the visible tiles before it are in.
@@ -2527,10 +2592,11 @@ enum Tile<'a> {
 }
 
 /// The loaded icons with the matching templates mixed in. A to Z and Z to A place each template
-/// by its title; the other orders have nothing to rank a template by, so they spread the
-/// templates through the icons, at most a few tiles apart. A template whose place is past the
-/// icons loaded so far waits for the page that reaches it.
-fn mix_templates<'a>(icons: &'a [AssetRow], templates: &'a [TemplateRow], sort: IconSort, more: bool, total: usize) -> Vec<Tile<'a>> {
+/// by its title, and Popular by its stars (`stars`), ahead of the icons with as many; Relevance
+/// has nothing to rank a template by, so it spreads the templates through the icons, at most a
+/// few tiles apart. A template whose place is past the icons loaded so far waits for the page
+/// that reaches it.
+fn mix_templates<'a>(icons: &'a [AssetRow], templates: &'a [TemplateRow], stars: &std::collections::HashMap<String, i64>, sort: IconSort, more: bool, total: usize) -> Vec<Tile<'a>> {
     let key = |t: &str| t.to_lowercase();
     let mut temps: Vec<&TemplateRow> = templates.iter().collect();
     let mut at: Vec<usize> = match sort {
@@ -2545,7 +2611,12 @@ fn mix_templates<'a>(icons: &'a [AssetRow], templates: &'a [TemplateRow], sort: 
                 icons.iter().position(|a| if rev { key(&a.title) < k } else { key(&a.title) > k }).unwrap_or(usize::MAX)
             }).collect()
         }
-        _ => {
+        IconSort::Popular => {
+            let n = |t: &TemplateRow| stars.get(&t.meta.id).copied().unwrap_or(0);
+            temps.sort_by_key(|t| std::cmp::Reverse(n(t)));
+            temps.iter().map(|t| icons.iter().position(|a| a.stars <= n(t)).unwrap_or(usize::MAX)).collect()
+        }
+        IconSort::Relevance => {
             let step = (total / (temps.len() + 1)).clamp(1, 6);
             (1..=temps.len()).map(|j| j * step).collect()
         }

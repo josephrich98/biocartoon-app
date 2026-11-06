@@ -135,6 +135,13 @@ fn handle_cursor(h: usize) -> egui::CursorIcon {
 }
 
 const HANDLE_R: f32 = 5.0;
+/// Handle half-size once the screen has been touched: big enough to see under a fingertip.
+const TOUCH_HANDLE_R: f32 = 7.0;
+/// How far (screen points) from a handle's center a mouse press still grabs it.
+const HANDLE_HIT: f32 = HANDLE_R + 3.0;
+/// The same for a finger, which covers far more than a mouse pointer (Apple and Google both
+/// ask for touch targets of about 44 to 48 points).
+const TOUCH_HANDLE_HIT: f32 = 22.0;
 /// A second click this soon (seconds) and this close (screen points) to the first is a double
 /// click. Egui's own test (0.3 s, 6 points) is made for a mouse: two finger taps are rarely that
 /// close or quick, and the browser build also sees every tap twice (as pointer and as touch
@@ -1357,14 +1364,15 @@ impl BioCartoon {
             return;
         }
         let items = self.selected_items();
+        let hr = self.handle_r();
         let hover_stroke = Stroke::new(1.5, theme::accent());
         for it in &items {
             if it.is_line() {
                 let pts: Vec<Pos2> = line_points(it).iter().map(|p| xf.to_screen(*p)).collect();
                 painter.add(Shape::line(pts, Stroke::new(1.0, theme::accent())));
                 for p in line_ends(it).map(|p| xf.to_screen(p)) {
-                    painter.circle_filled(p, HANDLE_R, Color32::WHITE);
-                    painter.add(Shape::circle_stroke(p, HANDLE_R, Stroke::new(1.5, theme::handle())));
+                    painter.circle_filled(p, hr, Color32::WHITE);
+                    painter.add(Shape::circle_stroke(p, hr, Stroke::new(1.5, theme::handle())));
                 }
                 continue;
             }
@@ -1384,20 +1392,23 @@ impl BioCartoon {
         for (i, p) in hp.iter().enumerate() {
             if i == 8 {
                 painter.line_segment([hp[1], *p], Stroke::new(1.0, theme::accent()));
-                painter.circle_filled(*p, HANDLE_R + 1.0, Color32::WHITE);
-                painter.add(Shape::circle_stroke(*p, HANDLE_R + 1.0, Stroke::new(1.5, theme::handle())));
-                painter.text(*p, egui::Align2::CENTER_CENTER, ph::ARROW_CLOCKWISE, FontId::proportional(9.0), theme::handle());
+                painter.circle_filled(*p, hr + 1.0, Color32::WHITE);
+                painter.add(Shape::circle_stroke(*p, hr + 1.0, Stroke::new(1.5, theme::handle())));
+                painter.text(*p, egui::Align2::CENTER_CENTER, ph::ARROW_CLOCKWISE, FontId::proportional(9.0 + 2.0 * (hr - HANDLE_R)), theme::handle());
             } else if locked {
                 painter.rect_filled(Rect::from_center_size(*p, Vec2::splat(7.0)), 1.0, Color32::from_gray(160));
             } else {
-                painter.rect_filled(Rect::from_center_size(*p, Vec2::splat(2.0 * HANDLE_R)), 1.0, Color32::WHITE);
-                painter.rect_stroke(Rect::from_center_size(*p, Vec2::splat(2.0 * HANDLE_R)), 1.0, Stroke::new(1.5, theme::handle()), StrokeKind::Inside);
+                painter.rect_filled(Rect::from_center_size(*p, Vec2::splat(2.0 * hr)), 1.0, Color32::WHITE);
+                painter.rect_stroke(Rect::from_center_size(*p, Vec2::splat(2.0 * hr)), 1.0, Stroke::new(1.5, theme::handle()), StrokeKind::Inside);
             }
         }
     }
 
     fn canvas_interaction(&mut self, ui: &mut egui::Ui, response: &egui::Response, rect: Rect, xf: &Xform) {
         let ptr = response.interact_pointer_pos().or_else(|| response.hover_pos());
+        if ui.input(|i| i.any_touches()) {
+            self.touch_input = true;
+        }
         let shift = ui.input(|i| i.modifiers.shift);
         let space = ui.input(|i| i.key_down(egui::Key::Space));
         let middle = ui.input(|i| i.pointer.middle_down());
@@ -1800,17 +1811,46 @@ impl BioCartoon {
         }
         if items.len() == 1 && items[0].is_line() {
             let [a, b] = line_ends(items[0]).map(|p| xf.to_screen(p));
-            if (p - a).length() <= HANDLE_R + 3.0 {
-                return Some(0);
-            }
-            if (p - b).length() <= HANDLE_R + 3.0 {
-                return Some(4);
-            }
-            return None;
+            // A short line's two hit areas overlap: the nearer end wins.
+            let reach = self.handle_hit().min(((b - a).length() / 2.0).max(HANDLE_HIT));
+            let (da, db) = ((p - a).length(), (p - b).length());
+            return if da <= reach && da <= db {
+                Some(0)
+            } else if db <= reach {
+                Some(4)
+            } else {
+                None
+            };
         }
         let single = if items.len() == 1 { Some(items[0]) } else { None };
-        let hp = handle_points(single, self.selection_rect()?, xf);
-        hp.iter().enumerate().find(|(_, h)| (p - **h).length() <= HANDLE_R + 3.0).map(|(i, _)| i)
+        let sel = self.selection_rect()?;
+        let hp = handle_points(single, sel, xf);
+        let hit = self.handle_hit();
+        // Inside a small box the finger-sized areas would cover it all and leave nothing to drag
+        // the item by, so there they reach in at most a quarter of the box's shorter side.
+        let (r, c, a) = match single {
+            Some(it) => (it.rect(), it.center(), it.rotation),
+            None => (sel, sel.center(), 0.0),
+        };
+        let local = rotate_about(xf.to_doc(p), c, -a);
+        let inside = r.contains(local);
+        let inner = (r.width().min(r.height()) * xf.zoom / 4.0).clamp(HANDLE_HIT, hit);
+        hp.iter()
+            .enumerate()
+            .map(|(i, h)| (i, (p - *h).length()))
+            .filter(|(i, d)| *d <= if inside && *i != 8 { inner } else { hit })
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .map(|(i, _)| i)
+    }
+
+    /// The drawn half-size of the resize handles.
+    fn handle_r(&self) -> f32 {
+        if self.touch_input { TOUCH_HANDLE_R } else { HANDLE_R }
+    }
+
+    /// How far from a handle a press still grabs it.
+    fn handle_hit(&self) -> f32 {
+        if self.touch_input { TOUCH_HANDLE_HIT } else { HANDLE_HIT }
     }
 
     /// The right-click menu for empty canvas, in the Page panel's order.
@@ -2008,7 +2048,7 @@ impl BioCartoon {
     /// on the whole image (to slide it under the frame).
     fn crop_handle_at(&self, p: Pos2, xf: &Xform) -> Option<(usize, CropGeom)> {
         let g = self.crop_geom()?;
-        if let Some(h) = rect_handles(g.frame).iter().position(|h| (g.screen(xf, *h) - p).length() <= 10.0) {
+        if let Some(h) = rect_handles(g.frame).iter().position(|h| (g.screen(xf, *h) - p).length() <= self.handle_hit().max(10.0)) {
             return Some((h, g));
         }
         g.full.contains(g.local(xf.to_doc(p))).then_some((8, g))

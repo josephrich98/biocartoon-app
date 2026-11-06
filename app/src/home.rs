@@ -310,17 +310,19 @@ impl BioCartoon {
         });
     }
 
-    /// Open, Settings and About.
+    /// Open, Open a share link, Settings and About.
     fn home_icon_buttons(&mut self, ui: &mut egui::Ui) {
-        for b in 0..3 {
+        for b in [0, 3, 1, 2] {
             let (icon, tip) = match b {
                 0 => (ph::FOLDER_OPEN, "Open .biocartoon files, or a backup .zip, as new projects"),
+                3 => (ph::LINK, "Open a share link someone sent you"),
                 1 => (ph::GEAR, "Settings"),
                 _ => (ph::INFO, "About BioCartoon"),
             };
             if ui.add(egui::Button::new(egui::RichText::new(icon).size(sz(18.0))).frame(false)).on_hover_text(tip).clicked() {
                 match b {
                     0 => self.actions.push(Action::Open),
+                    3 => self.share.show_open = true,
                     1 => self.open_settings(crate::app::SettingsTab::General),
                     _ => self.show_about = true,
                 }

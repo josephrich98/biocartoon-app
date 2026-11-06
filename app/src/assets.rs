@@ -32,8 +32,9 @@ const MAX_LOD_SIDE: u32 = 4096;
 /// GPU memory kept for those renderings before the least recently drawn are dropped.
 const LOD_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
-/// File types accepted as uploads (picked or dropped on the canvas).
-pub const IMAGE_EXTS: [&str; 7] = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"];
+/// File types accepted as uploads (picked or dropped on the canvas). PDFs are turned into SVGs
+/// when added (see [`pdf_to_svg`]), so everything downstream sees a vector image.
+pub const IMAGE_EXTS: [&str; 10] = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "svg", "pdf"];
 const MAX_TEXTURES: usize = 400;
 
 #[derive(Clone, Debug)]
@@ -244,6 +245,25 @@ pub fn is_svg(bytes: &[u8]) -> bool {
         let name: Vec<u8> = name.copied().collect();
         name.rsplit(|b| *b == b':').next() == Some(b"svg")
     })
+}
+
+/// Whether `bytes` are a PDF file.
+pub fn is_pdf(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(1024)].windows(5).any(|w| w == b"%PDF-")
+}
+
+/// The first page of a PDF as an SVG document, keeping its paths, text (as outlines) and
+/// embedded images, so an uploaded PDF figure stays vector on the canvas and in exports.
+pub fn pdf_to_svg(bytes: &[u8]) -> Result<String, String> {
+    use hayro_svg::hayro_interpret::InterpreterSettings;
+    use hayro_svg::hayro_syntax::Pdf;
+    let pdf = Pdf::new(bytes.to_vec()).map_err(|e| format!("not a readable PDF ({e:?})"))?;
+    let page = pdf.pages().first().ok_or("the PDF has no pages")?;
+    let svg = hayro_svg::convert(page, &hayro_svg::RenderCache::new(), &InterpreterSettings::default(), &hayro_svg::SvgRenderSettings::default());
+    if !is_svg(svg.as_bytes()) {
+        return Err("couldn't convert the PDF".into());
+    }
+    Ok(svg)
 }
 
 /// True for a file path on this computer rather than an R2 key: user uploads store those.
@@ -941,6 +961,34 @@ mod tests {
         let l = decode(prefixed).unwrap();
         assert_eq!((l.width, l.height), (MAX_SIDE, MAX_SIDE / 2));
         assert!(l.svg.is_some());
+    }
+
+    /// An uploaded PDF becomes an SVG of its first page that keeps its shapes as vectors, sized
+    /// and coloured like the original; TIFFs decode like any raster upload.
+    #[test]
+    fn pdf_and_tiff_uploads() {
+        let src = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="100" height="100" fill="#0000ff"/><rect x="150" width="50" height="100" fill="#ff0000"/></svg>"##;
+        let tree = resvg::usvg::Tree::from_str(src, &resvg::usvg::Options::default()).unwrap();
+        let pdf = svg2pdf::to_pdf(&tree, svg2pdf::ConversionOptions::default(), svg2pdf::PageOptions::default()).unwrap();
+        assert!(is_pdf(&pdf) && !is_svg(&pdf));
+        let svg = pdf_to_svg(&pdf).unwrap();
+        assert!(svg.contains("<path") || svg.contains("<rect"), "vector shapes kept:\n{svg}");
+        assert!(!svg.contains("data:image"), "no raster images:\n{svg}");
+        let (w, h) = image_size(svg.as_bytes()).unwrap();
+        assert!((w / h - 2.0).abs() < 0.01, "{w}x{h}");
+        let l = decode(svg.as_bytes()).unwrap();
+        assert!(l.svg.is_some());
+        let px = |x: u32, y: u32| &l.rgba[((y * l.width + x) * 4) as usize..][..4];
+        assert_eq!(px(l.width / 4, l.height / 2), [0, 0, 255, 255]);
+        assert_eq!(px(l.width * 5 / 8, l.height / 2)[3], 0, "the gap stays transparent");
+        assert_eq!(px(l.width * 7 / 8, l.height / 2), [255, 0, 0, 255]);
+        assert!(pdf_to_svg(b"not a pdf").is_err());
+
+        let mut tif = Vec::new();
+        RgbaImage::from_pixel(4, 2, image::Rgba([0, 255, 0, 255])).write_to(&mut std::io::Cursor::new(&mut tif), image::ImageFormat::Tiff).unwrap();
+        assert!(!is_svg(&tif));
+        let l = decode(&tif).unwrap();
+        assert_eq!((l.width, l.height, &l.rgba[..4]), (4, 2, &[0, 255, 0, 255][..]));
     }
 
     /// A catalog image whose SVG fetches but will not decode falls back to its PNG, so the

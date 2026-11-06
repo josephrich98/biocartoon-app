@@ -188,6 +188,11 @@ impl Account {
         self.saved.is_some()
     }
 
+    /// The session token, for a request that is better signed in (a share link gets higher limits).
+    pub fn bearer(&self) -> Option<String> {
+        self.saved.as_ref().map(|s| s.token.clone()).filter(|t| !t.is_empty())
+    }
+
     fn token(&self) -> String {
         self.saved.as_ref().map(|s| s.token.clone()).unwrap_or_default()
     }

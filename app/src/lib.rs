@@ -25,6 +25,7 @@ pub mod pptx;
 pub mod panels;
 pub mod platform;
 pub mod projects;
+pub mod share;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
 #[cfg(not(target_arch = "wasm32"))]
