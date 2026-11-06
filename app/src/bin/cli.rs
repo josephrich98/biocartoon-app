@@ -18,7 +18,7 @@ fn main() {
 mod cli {
     use biocartoon::query::{self, Catalog};
     use biocartoon::{control, mcp};
-    use biocartoon_catalog::cli::{command_help, print_json, run_command, version, Args, CATALOG_COMMANDS, CATALOG_OPTIONS};
+    use biocartoon_catalog::cli::{command_help, command_summary, print_json, run_command, version, Args, CATALOG_COMMANDS, CATALOG_OPTIONS};
     use serde_json::{json, Value};
 
     fn usage() -> String {
@@ -29,6 +29,7 @@ biocartoon — search the BioCartoon icon catalog and templates, and drive the e
 USAGE
   biocartoon <command> [arguments] [options]
 
+{summary}
 {CATALOG_COMMANDS}
 EDITOR (the desktop app must be running)
   app <cmd> [json]          send a command, e.g.
@@ -46,7 +47,8 @@ ASSISTANTS
   mcp                       serve the catalog and editor tools over MCP on stdin/stdout:
                               claude mcp add biocartoon -- biocartoon mcp
 
-{CATALOG_OPTIONS}"
+{CATALOG_OPTIONS}",
+            summary = command_summary(&["app", "mcp"])
         )
     }
 

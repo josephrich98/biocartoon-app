@@ -704,11 +704,45 @@ pub struct ContributeState {
     pub picked_templates: HashSet<usize>,
 }
 
-/// The first is the default. CC BY needs [`UploadDialog::no_ai`]: see [`CC_BY_NEEDS_NO_AI`].
+/// The first is the default. CC BY needs [`UploadDialog::ai`] to be [`AiUse::No`]: see [`CC_BY_NEEDS_NO_AI`].
 pub const UPLOAD_LICENSES: [(&str, &str); 2] = [("CC0-1.0", "CC0 (no credit needed)"), ("CC-BY-4.0", "CC BY 4.0 (users must credit you)")];
-/// Why CC BY is greyed out while "No generative AI" is unchecked: AI output may not be
-/// copyrightable, so there may be no copyright to license on condition of credit.
-pub const CC_BY_NEEDS_NO_AI: &str = "This license is not compatible with generative AI content. Check \"No generative AI was used\" above (if correct) to select this license.";
+/// Why CC BY is greyed out unless AI use is "No": AI output may not be copyrightable, so there
+/// may be no copyright to license on condition of credit.
+pub const CC_BY_NEEDS_NO_AI: &str = "This license is not compatible with generative AI content. Answer \"No\" under AI use above (if correct) to select this license.";
+
+/// The answer to "Was generative AI used to make this artwork?" in the library dialog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AiUse {
+    #[default]
+    NotSpecified,
+    Yes,
+    No,
+}
+
+impl AiUse {
+    /// From a stored `generative_ai_used` (`None`: not specified).
+    pub fn from_flag(used: Option<bool>) -> Self {
+        match used {
+            None => Self::NotSpecified,
+            Some(true) => Self::Yes,
+            Some(false) => Self::No,
+        }
+    }
+
+    /// As stored and submitted: `generative_ai_used`.
+    pub fn flag(self) -> Option<bool> {
+        match self {
+            Self::NotSpecified => None,
+            Self::Yes => Some(true),
+            Self::No => Some(false),
+        }
+    }
+}
+
+/// A drawing BioCartoon's AI drawing made (its credit says so), whose AI use is fixed at "Yes".
+fn ai_drawing(row: &AssetRow) -> bool {
+    row.generative_ai_used == Some(true) && row.credit.contains("\" generated with BioCartoon. Prompt: ")
+}
 
 pub struct UploadDialog {
     pub target: UploadTarget,
@@ -723,10 +757,12 @@ pub struct UploadDialog {
     /// The layers as the dialog opened, for Reset all.
     pub layers_start: Vec<(String, Vec<[u8; 3]>)>,
     pub license: &'static str,
-    /// The contributor checked "No generative AI was used to create this asset" (unchecked by
-    /// default; kept through a batch, like the license).
-    pub no_ai: bool,
-    /// BioCartoon's AI drawing made it, so `no_ai` can't be checked.
+    /// The answer to "Was generative AI used to make this artwork?" (not specified by default;
+    /// kept through a batch, like the license, unless an item already has an answer).
+    pub ai: AiUse,
+    /// How generative AI was used (optional; asked only when `ai` is Yes).
+    pub ai_details: String,
+    /// BioCartoon's AI drawing made it, so `ai` stays Yes.
     pub ai_made: bool,
     /// Submit it to the BioCartoon library (reviewed before it is published), not only keep it
     /// in Your library. Fixed when the dialog opens.
@@ -856,6 +892,9 @@ pub enum Action {
     DownloadAsset(Box<AssetRow>),
     /// Desktop: download a template, and the icons it uses, into the offline folder.
     DownloadTemplate(Box<TemplateRow>),
+    /// Desktop: delete an icon's files (or a template's JSON and thumbnail) from the offline folder.
+    DeleteDownload(Box<AssetRow>),
+    DeleteTemplateDownload(Box<TemplateRow>),
     /// An icon or template is now in the offline folder.
     Downloaded { title: String },
     /// Web: an asset's file arrived; save it.
@@ -2866,7 +2905,9 @@ impl BioCartoon {
             taxa: Vec::new(),
             layers: Vec::new(),
             generative_ai_used: Some(true),
+            generative_ai_details: format!("Generated with BioCartoon's AI drawing. Prompt: {prompt}").chars().take(500).collect(),
             file_bytes: 0,
+            thumb_key: None,
         };
         if let Err(e) = self.save_user_png(img, svg_file(Path::new(path)).as_deref(), &mut row) {
             self.toast_err(e);
@@ -2927,12 +2968,12 @@ impl BioCartoon {
     }
 
     pub fn open_upload_dialog(&mut self, target: UploadTarget, share: bool) {
-        self.open_upload_queue(vec![target], UPLOAD_LICENSES[0].0, false, 1, share);
+        self.open_upload_queue(vec![target], UPLOAD_LICENSES[0].0, AiUse::NotSpecified, String::new(), 1, share);
     }
 
     /// Open the library dialog for the first of `targets`, item `step` of the batch; the rest
     /// follow as each is submitted.
-    fn open_upload_queue(&mut self, mut targets: Vec<UploadTarget>, license: &'static str, no_ai: bool, step: usize, share: bool) {
+    fn open_upload_queue(&mut self, mut targets: Vec<UploadTarget>, license: &'static str, ai: AiUse, ai_details: String, step: usize, share: bool) {
         if targets.is_empty() {
             return;
         }
@@ -2951,13 +2992,18 @@ impl BioCartoon {
                 None => (t.slide.name.clone(), String::new(), String::new(), String::new()),
             },
         };
-        let ai_made = match &target {
-            UploadTarget::Library(row) => row.generative_ai_used == Some(true),
-            UploadTarget::Template(t) => t.saved.as_ref().is_some_and(|m| m.generative_ai_used == Some(true)),
-            UploadTarget::File(_) => false,
+        let ai_made = matches!(&target, UploadTarget::Library(row) if ai_drawing(row));
+        // An item that already has an answer (saved to Your library before) keeps it.
+        let (ai, ai_details) = match &target {
+            UploadTarget::Library(row) if row.generative_ai_used.is_some() => (AiUse::from_flag(row.generative_ai_used), row.generative_ai_details.clone()),
+            UploadTarget::Template(t) => match &t.saved {
+                Some(m) if m.generative_ai_used.is_some() => (AiUse::from_flag(m.generative_ai_used), m.generative_ai_details.clone()),
+                _ => (ai, ai_details),
+            },
+            _ => (ai, ai_details),
         };
-        let no_ai = no_ai && !ai_made;
-        let license = if license == "CC-BY-4.0" && !no_ai { UPLOAD_LICENSES[0].0 } else { license };
+        let ai = if ai_made { AiUse::Yes } else { ai };
+        let license = if license == "CC-BY-4.0" && ai != AiUse::No { UPLOAD_LICENSES[0].0 } else { license };
         let svg_text = match &target {
             UploadTarget::File(p) => svg_file(p),
             UploadTarget::Library(row) => library_svg(row),
@@ -3004,7 +3050,8 @@ impl BioCartoon {
             layers,
             layers_start,
             license,
-            no_ai,
+            ai,
+            ai_details,
             ai_made,
             share,
             svg,
@@ -3048,7 +3095,7 @@ impl BioCartoon {
         if targets.is_empty() {
             return self.toast("Pick icons or templates to add first");
         }
-        self.open_upload_queue(targets, UPLOAD_LICENSES[0].0, false, 1, self.contribute.share);
+        self.open_upload_queue(targets, UPLOAD_LICENSES[0].0, AiUse::NotSpecified, String::new(), 1, self.contribute.share);
     }
 
     /// Offer the slides of .biocartoon files under Contribute artwork > Templates.
@@ -3143,7 +3190,8 @@ impl BioCartoon {
                 }
             })
             .collect();
-        let ai_used = if d.ai_made { Some(true) } else { d.no_ai.then_some(false) };
+        let ai_used = if d.ai_made { Some(true) } else { d.ai.flag() };
+        let ai_details: String = if ai_used == Some(true) { d.ai_details.trim().chars().take(500).collect() } else { String::new() };
         if !d.svg && !d.png_ok && !matches!(d.target, UploadTarget::Template(_)) {
             self.toast_err("Confirm adding it as a PNG first");
             self.upload_dialog = Some(d);
@@ -3168,7 +3216,7 @@ impl BioCartoon {
             };
             if again {
                 self.toast_err(format!("\"{}\" was submitted to the BioCartoon library already", d.name.trim()));
-                return self.open_upload_queue(d.queue, d.license, d.no_ai, d.step.0 + 1, d.share);
+                return self.open_upload_queue(d.queue, d.license, d.ai, d.ai_details, d.step.0 + 1, d.share);
             }
         }
         if let Some(Ok((_, _, bytes))) = &d.out {
@@ -3187,7 +3235,7 @@ impl BioCartoon {
             }
             None => None,
             Some(url) => {
-                if d.license == "CC-BY-4.0" && !d.no_ai {
+                if d.license == "CC-BY-4.0" && ai_used != Some(false) {
                     self.toast_err(CC_BY_NEEDS_NO_AI);
                     self.upload_dialog = Some(d);
                     return;
@@ -3222,6 +3270,7 @@ impl BioCartoon {
                     author: if credit.is_empty() { "anonymous".into() } else { credit.clone() },
                     license: d.license.into(),
                     generative_ai_used: ai_used,
+                    generative_ai_details: ai_details.clone(),
                     email,
                     official: d.official,
                 };
@@ -3234,7 +3283,7 @@ impl BioCartoon {
             None => credit,
         };
         match &d.target {
-            UploadTarget::Template(t) => self.save_template((**t).clone(), name, category, description, tags, d.license, ai_used, author, share),
+            UploadTarget::Template(t) => self.save_template((**t).clone(), name, category, description, tags, d.license, ai_used, ai_details, author, share),
             target => {
                 let img = match (&d.image, target) {
                     // Read when the dialog opened, at the size shown there.
@@ -3283,7 +3332,9 @@ impl BioCartoon {
                     taxa: Vec::new(),
                     layers,
                     generative_ai_used: ai_used,
+                    generative_ai_details: ai_details,
                     file_bytes: 0,
+                    thumb_key: None,
                 };
                 match img {
                     Ok(img) => self.upload_asset(img, svg, row, share, replaces, fingerprint),
@@ -3292,7 +3343,7 @@ impl BioCartoon {
             }
         }
         // Next in the batch, keeping the license just chosen.
-        self.open_upload_queue(d.queue, d.license, d.no_ai, d.step.0 + 1, d.share);
+        self.open_upload_queue(d.queue, d.license, d.ai, d.ai_details, d.step.0 + 1, d.share);
     }
 
     /// Send the Submit an idea form to the submissions Worker.
@@ -3506,6 +3557,7 @@ impl BioCartoon {
         tags: Vec<String>,
         license: &str,
         generative_ai_used: Option<bool>,
+        generative_ai_details: String,
         author: String,
         submit: Option<(String, SubmitMeta)>,
     ) {
@@ -3521,6 +3573,7 @@ impl BioCartoon {
             created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             thumb_key: format!("templates/{slug}/thumb.png"),
             generative_ai_used,
+            generative_ai_details,
             // Only a reviewer makes one official (it is listed as the published copy says).
             official: false,
             credit: String::new(),
@@ -4166,7 +4219,7 @@ impl BioCartoon {
             return self.toast_err(format!("email: {e}"));
         }
         let png = dir.join(format!("{slug}.png"));
-        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: false, pdf_raster: false, jpg_quality: 90 };
+        let opts = ExportOptions { format: ExportFormat::Png, dpi: 150, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: false, pdf_raster: false, jpg_quality: 90, pptx_text_images: false };
         self.pending_email = Some((doc.title.clone(), vec![png.clone(), file]));
         let job = self.export_job_for(&doc, &[0], png, opts);
         self.launch_export(ctx, job);
@@ -4422,7 +4475,11 @@ impl BioCartoon {
         let multi = n_slides > 1;
         let all = self.settings.export.all_slides && multi;
         let n_images = if all { all_images } else { slide_images };
+        let count_text = |s: &Slide| s.items.iter().filter(|it| matches!(it.kind, ItemKind::Text { .. })).count();
+        let n_text = if all { doc.slides.iter().map(count_text).sum() } else { count_text(&doc.slides[slide]) };
         let project_file = self.settings.export.format == ExportFormat::Biocartoon;
+        // A deck always holds whole slides, every item on its own.
+        let deck = self.settings.export.format == ExportFormat::Pptx;
         let heading = match (&self.export_doc, all) {
             (Some(_), _) => format!("Export \"{}\"", doc.title),
             (None, _) if project_file => "Export project".into(),
@@ -4506,7 +4563,7 @@ impl BioCartoon {
                     }
 
                     ui.label("Resolution (dpi)");
-                    ui.add_enabled_ui(opts.format.is_raster() || (opts.format == ExportFormat::Pdf && opts.pdf_raster), |ui| {
+                    ui.add_enabled_ui(opts.format.is_raster() || deck || (opts.format == ExportFormat::Pdf && opts.pdf_raster), |ui| {
                         ui.horizontal(|ui| dpi_picker(ui, &mut opts.dpi, egui::Id::new("export_custom_dpi")));
                     });
                     ui.end_row();
@@ -4518,12 +4575,12 @@ impl BioCartoon {
                                 ui.selectable_value(&mut dims_unit, u, u.label());
                             }
                         });
-                        let dims = if opts.individual {
+                        let dims = if opts.individual && !deck {
                             "a size per image".to_string()
-                        } else if all && opts.crop {
+                        } else if all && opts.crop && !deck {
                             "a size per slide".to_string()
                         } else {
-                            let region = if opts.crop { image_bounds.unwrap_or(page) } else { page };
+                            let region = if opts.crop && !deck { image_bounds.unwrap_or(page) } else { page };
                             let each = if all { " each" } else { "" };
                             match dims_unit {
                                 // Vector files have no pixels of their own: their size at the slide's 96 px per inch.
@@ -4539,7 +4596,7 @@ impl BioCartoon {
                     });
                     ui.end_row();
 
-                    if !opts.format.is_raster() {
+                    if !opts.format.is_raster() && !deck {
                         let note = if opts.format == ExportFormat::Pdf && opts.pdf_raster { "Vector text and shapes; images at the resolution above." } else { "Vector output: scales to any size." };
                         ui.label("");
                         ui.label(egui::RichText::new(note).color(theme::text_dim()));
@@ -4567,7 +4624,13 @@ impl BioCartoon {
                     ui.checkbox(&mut opts.pdf_raster, "Rasterize images (reduce file size)")
                         .on_hover_text("Draw each image at the resolution above instead of embedding it as it is. Detailed vector drawings and large photos make big PDFs; text and shapes stay vector.");
                 }
-                if !project_file {
+                if deck {
+                    ui.add_enabled_ui(n_images > 0, |ui| {
+                        ui.checkbox(&mut opts.pdf_raster, "Rasterize images (reduce file size)")
+                            .on_hover_text("Put each image in as a picture at the resolution above instead of as it is. Detailed vector drawings and large photos make big decks; text and shapes stay as they are.");
+                    });
+                }
+                if !project_file && !deck {
                     ui.add_enabled_ui(n_images > 0 && !opts.individual, |ui| {
                         ui.checkbox(&mut opts.crop, "Crop to images")
                             .on_hover_text("Crop the sheet to the area covered by the images, instead of exporting the whole slide.");
@@ -4581,6 +4644,19 @@ impl BioCartoon {
                         ui.checkbox(&mut opts.all_slides, format!("Export all slides ({n_slides})"))
                             .on_hover_text("Save every slide, one file each, named <name>-slide1, <name>-slide2, ... (a PDF can instead hold them all)");
                     });
+                }
+                if deck {
+                    ui.add_enabled_ui(n_text > 0, |ui| {
+                        ui.checkbox(&mut opts.pptx_text_images, "Save text boxes as images").on_hover_text(
+                            "Pictures of the text, exactly as it looks here, instead of PowerPoint text boxes you can edit. Text boxes use each font where this computer has it installed, and a similar standard font (e.g. Arial, Times New Roman) where it doesn't, so lines may break a little differently.",
+                        );
+                    });
+                    ui.add_enabled_ui(multi, |ui| {
+                        ui.checkbox(&mut opts.all_slides, format!("Export all slides ({n_slides})"))
+                            .on_hover_text("Put every slide in the deck, instead of just this one.");
+                    });
+                }
+                if !project_file && !deck {
                     if all && opts.format == ExportFormat::Pdf && !opts.individual {
                         ui.indent("pdf_pages", |ui| {
                             ui.checkbox(&mut opts.pdf_pages, "One PDF, a page per slide")
@@ -4590,7 +4666,7 @@ impl BioCartoon {
                 }
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let can = project_file || !((opts.individual || opts.crop) && n_images == 0);
+                    let can = project_file || deck || !((opts.individual || opts.crop) && n_images == 0);
                     if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(Color32::WHITE)).fill(theme::accent())).clicked() { go = true; }
                     if ui.button("Cancel").clicked() { cancel = true; }
                 });
@@ -4806,6 +4882,8 @@ impl BioCartoon {
                 self.toast(format!("Downloaded {title} for offline use"));
             }
             Action::SaveAsset { title, bytes } => self.save_asset(&title, bytes),
+            Action::DeleteDownload(row) => self.delete_asset_download(&row),
+            Action::DeleteTemplateDownload(row) => self.delete_template_download(&row),
             Action::InsertFile(p) => {
                 self.insert_file(&p);
                 self.hide_icons_on_phones(ctx);
@@ -6067,7 +6145,7 @@ impl BioCartoon {
         let size = Vec2::new((screen.width() * 0.92).min(1600.0), (screen.height() * 0.88).min(1100.0));
         // Side by side when there is room, otherwise the details go under the preview.
         let wide = size.x >= 760.0;
-        const FORM_W: f32 = 320.0;
+        const FORM_W: f32 = 400.0;
         egui::Window::new(title).id(egui::Id::new("upload_dialog")).open(&mut open).order(egui::Order::Foreground).collapsible(false).resizable(false).fixed_size(size).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
             let saved_where = self.library_where();
             let form = |ui: &mut egui::Ui, d: &mut UploadDialog, submit: &mut bool, cancel: &mut bool| {
@@ -6114,18 +6192,38 @@ impl BioCartoon {
                     crate::panels::layer_grid(ui, "upload_layers", &mut d.layers, Some(&d.layers_start));
                     ui.label(dim("Name the parts of the drawing so they are easy to find when restyling it, and merge colors that belong to one part. Color and opacity here only preview each layer; they aren't saved."));
                 }
+                ui.add_space(6.0);
+                field(ui, "AI use");
+                ui.label("Was generative AI used to make this artwork?");
+                ui.add_enabled_ui(!d.ai_made, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        // Spaced apart, so each button reads with its own label.
+                        ui.spacing_mut().item_spacing.x = 18.0;
+                        ui.radio_value(&mut d.ai, AiUse::NotSpecified, "Not specified");
+                        ui.radio_value(&mut d.ai, AiUse::Yes, "Yes");
+                        ui.radio_value(&mut d.ai, AiUse::No, "No");
+                    });
+                })
+                .response
+                .on_disabled_hover_text("It was made with BioCartoon's AI drawing.");
+                if d.ai == AiUse::Yes {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut d.ai_details)
+                            .char_limit(500)
+                            .desired_rows(2)
+                            .hint_text("Details (optional): e.g. which model, and what you drew or edited by hand")
+                            .desired_width(w),
+                    );
+                }
                 // Your library keeps it on this computer: license, credit and contact are for submissions.
                 if d.share {
-                    ui.add_space(6.0);
-                    let no_ai = ui.add_enabled(!d.ai_made, egui::Checkbox::new(&mut d.no_ai, "No generative AI was used to create this asset."));
-                    no_ai.on_disabled_hover_text("It was made with BioCartoon's AI drawing.");
-                    if !d.no_ai && d.license == "CC-BY-4.0" {
+                    if d.ai != AiUse::No && d.license == "CC-BY-4.0" {
                         d.license = UPLOAD_LICENSES[0].0;
                     }
                     field(ui, "License");
                     egui::ComboBox::from_id_salt("upload_license").width(w).selected_text(UPLOAD_LICENSES.iter().find(|l| l.0 == d.license).map(|l| l.1).unwrap_or(d.license)).show_ui(ui, |ui| {
                         for (id, label) in UPLOAD_LICENSES {
-                            let ok = id != "CC-BY-4.0" || d.no_ai;
+                            let ok = id != "CC-BY-4.0" || d.ai == AiUse::No;
                             if ui.add_enabled(ok, egui::Button::selectable(d.license == id, label)).on_disabled_hover_text(CC_BY_NEEDS_NO_AI).clicked() {
                                 d.license = id;
                             }
@@ -6356,7 +6454,7 @@ impl BioCartoon {
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, gridsteps, spell, viewspell, dictionary, textedit, equation, tableedit, placetext,
-    /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>).
+    /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>, aiyes).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -6655,6 +6753,13 @@ impl BioCartoon {
                         let path = self.app_dir.join("generated").join(name);
                         if crate::storage::write(&path, bytes).is_ok() {
                             self.open_upload_dialog(UploadTarget::File(path), step.starts_with("share"));
+                        }
+                    }
+                    // The library dialog's AI use answered Yes, with details.
+                    "aiyes" => {
+                        if let Some(d) = &mut self.upload_dialog {
+                            d.ai = AiUse::Yes;
+                            d.ai_details = "Claude wrote the SVG code; I adjusted the colours and layer names by hand.".into();
                         }
                     }
                     // A PNG over the upload limit, so the dialog makes it smaller.
@@ -7088,7 +7193,9 @@ mod tests {
             taxa: Vec::new(),
             layers: Vec::new(),
             generative_ai_used: None,
+            generative_ai_details: String::new(),
             file_bytes: 0,
+            thumb_key: None,
         };
         assert!(row_submitted(&mut memo, &[fp], &row));
         assert!(row_submitted(&mut memo, &["id:user/x".into()], &row));

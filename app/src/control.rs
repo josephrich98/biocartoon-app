@@ -602,7 +602,9 @@ impl BioCartoon {
                     taxa: Vec::new(),
                     layers: Vec::new(),
                     generative_ai_used: a.get("generative_ai_used").and_then(Value::as_bool),
+                    generative_ai_details: g("generative_ai_details"),
                     file_bytes: 0,
+                    thumb_key: None,
                 };
                 if row.id.is_empty() || row.png_key.is_empty() {
                     return Err("asset needs at least id and png_key".into());

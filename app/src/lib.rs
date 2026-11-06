@@ -21,6 +21,7 @@ pub mod home;
 pub mod latex;
 pub mod library;
 pub mod offline;
+pub mod pptx;
 pub mod panels;
 pub mod platform;
 pub mod projects;

@@ -38,6 +38,9 @@ pub struct Asset {
     pub svg_key: Option<String>,
     pub layers: Vec<AssetLayer>,
     pub generative_ai_used: Option<bool>,
+    /// See [`AssetRow::generative_ai_details`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub generative_ai_details: String,
     /// When it was added here (or the copy online was), Unix milliseconds.
     pub modified: i64,
 }
@@ -60,6 +63,7 @@ impl Asset {
             svg_key: r.svg_key.clone(),
             layers: r.layers.clone(),
             generative_ai_used: r.generative_ai_used,
+            generative_ai_details: r.generative_ai_details.clone(),
             modified,
         }
     }
@@ -87,7 +91,9 @@ impl Asset {
             taxa: Vec::new(),
             layers: self.layers.clone(),
             generative_ai_used: self.generative_ai_used,
+            generative_ai_details: self.generative_ai_details.clone(),
             file_bytes: 0,
+            thumb_key: None,
         }
     }
 }

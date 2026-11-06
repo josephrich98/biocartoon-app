@@ -34,10 +34,12 @@ pub struct SubmitMeta {
     pub layers: Vec<crate::catalog::AssetLayer>,
     pub author: String,
     pub license: String,
-    /// `Some(false)` when the contributor checked "No generative AI was used to create this
-    /// asset", `Some(true)` when the app knows AI made it, `None` (undisclosed) otherwise. The
-    /// Worker only takes CC BY 4.0 with `Some(false)`.
+    /// The contributor's answer to "Was generative AI used to make this artwork?" (`None`: not
+    /// specified). The Worker only takes CC BY 4.0 with `Some(false)`.
     pub generative_ai_used: Option<bool>,
+    /// How generative AI was used, in the contributor's words (only with `Some(true)`; optional).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub generative_ai_details: String,
     /// Optional contact address for the reviewers; the Worker stores it privately and never publishes it.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub email: String,

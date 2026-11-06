@@ -497,6 +497,44 @@ impl ImageCache {
         self.asset_image(key, None, local_rel)
     }
 
+    /// The cache key [`Self::tile`] keeps `row`'s tile image under.
+    pub fn tile_key(row: &crate::catalog::AssetRow) -> String {
+        match row.thumb_key.as_deref().filter(|_| row.png_local.is_none()) {
+            Some(thumb) => format!("asset:{thumb}"),
+            None => format!("asset:{}", row.png_key),
+        }
+    }
+
+    /// Ask for a result tile's image: the catalog's small thumbnail when it has one, so a search
+    /// doesn't fetch (and keep in the offline folder) every full PNG it shows. A PNG already in
+    /// the offline folder is read instead of fetching the thumbnail, and the PNG is fetched when
+    /// the thumbnail fails. The user's own uploads have none: their PNG is on this computer.
+    pub fn tile(&mut self, row: &crate::catalog::AssetRow) -> &ImgState {
+        let Some(thumb) = row.thumb_key.as_deref().filter(|_| row.png_local.is_none()) else {
+            return self.asset(&row.png_key, row.png_local.as_deref());
+        };
+        let ck = format!("asset:{thumb}");
+        if !self.map.contains_key(&ck) {
+            let req = match (self.request_for_asset(thumb, None), self.request_for_asset(&row.png_key, None)) {
+                (Ok(t @ Request::Path(_)), _) => Ok(t),
+                (_, Ok(p @ Request::Path(_))) => Ok(p),
+                (Ok(t), Ok(p)) => Ok(Request::Either(Box::new(t), Box::new(p))),
+                (Ok(r), Err(_)) | (Err(_), Ok(r)) => Ok(r),
+                (Err(e), Err(_)) => Err(e),
+            };
+            match req {
+                Ok(req) => self.queue(ck.clone(), Work::Fetch(req)),
+                Err(e) => {
+                    self.map.insert(ck.clone(), ImgState::Failed(e));
+                }
+            }
+        } else {
+            self.want(&ck);
+        }
+        self.touch(&ck);
+        self.map.get(&ck).unwrap()
+    }
+
     /// Ask for a catalog image placed on the canvas: its SVG (`svg`, an R2 key) when it has one,
     /// with the PNG (`key`) as the fallback. Cached under the key of the one it prefers, as
     /// [`crate::doc::ImageSource::cache_key`] names it.

@@ -373,8 +373,12 @@ impl BioCartoon {
         let templates = if mine { Vec::new() } else { self.templates_matching(true) };
         // Your library last: its icons and templates are also in the database they are listed under.
         let library = (LIBRARY_SOURCE.to_string(), "", "Your library".to_string());
-        let dbs: Vec<(String, String)> = self
-            .databases()
+        let mut all_dbs = self.databases();
+        // (User-generated sorts last; the catalog may not list it until someone uploads.)
+        if !all_dbs.iter().any(|(s, ..)| s == "user") {
+            all_dbs.push(("user".into(), "UG", self.source_name("user")));
+        }
+        let dbs: Vec<(String, String)> = all_dbs
             .into_iter()
             .chain(std::iter::once(library))
             .filter_map(|(s, _, name)| {
@@ -382,8 +386,9 @@ impl BioCartoon {
                 let n = in_facet(facets.as_ref().map_or(&[][..], |fc| &fc.sources), &s);
                 let in_db = |r: &TemplateRow| if s == LIBRARY_SOURCE { r.json_local.is_some() } else { r.source() == s };
                 let t = templates.iter().filter(|r| in_db(r)).count() as i64;
-                // A database's templates are in it even when none of its icons are.
-                let keep = n != Some(0) || f.sources.contains(&s) || (!mine && self.template_rows.iter().any(in_db));
+                // A database's templates are in it even when none of its icons are. Favorites always
+                // lists User-generated and Your library (the last two), where the user's own are.
+                let keep = n != Some(0) || f.sources.contains(&s) || (!mine && self.template_rows.iter().any(in_db)) || (mine && (s == "user" || s == LIBRARY_SOURCE));
                 // "BioCartoon (1 icon, 6 templates)": templates only when there are some.
                 let parts: Vec<String> =
                     n.map(|n| counted(n, "icon")).into_iter().chain((t > 0).then(|| counted(t, "template"))).collect();
@@ -945,20 +950,22 @@ impl BioCartoon {
                     colors: if self.settings.tile_colors { colors } else { 1 },
                     stars: self.settings.tile_stars,
                     fav: self.settings.favorites.contains(&row.id),
+                    downloaded: self.offline.asset_keys.contains(&row.png_key),
                 };
                 let (fingerprints, submitted) = (&mut self.fingerprints, &self.settings.submitted);
                 let mut unsent = || !crate::app::row_submitted(fingerprints, submitted, row);
-                let (r, act) = asset_tile(ui, size, row, row.png_local.as_deref(), &mut self.images, hold, colors, marks, &mut unsent);
+                let (r, act) = asset_tile(ui, size, row, &mut self.images, hold, colors, marks, &mut unsent);
                 match act {
                     Some(TileAct::Remove) => self.actions.push(Action::RemoveUserAsset(row.clone())),
                     Some(TileAct::RequestRemoval) => self.actions.push(Action::OpenRemovalRequest(row.clone())),
                     Some(TileAct::Share) => self.actions.push(Action::OpenUploadDialog(UploadTarget::Library(Box::new(row.clone())), true)),
                     Some(TileAct::Favorite) => self.actions.push(Action::ToggleFavorite(row.id.clone())),
                     Some(TileAct::Download) => self.actions.push(Action::DownloadAsset(Box::new(row.clone()))),
+                    Some(TileAct::DeleteDownload) => self.actions.push(Action::DeleteDownload(Box::new(row.clone()))),
                     None if r.clicked() => picked = Some(row.clone()),
                     None => {}
                 }
-                if ui.is_rect_visible(r.rect) && matches!(self.images.get(&format!("asset:{}", row.png_key)), Some(ImgState::Loading)) {
+                if ui.is_rect_visible(r.rect) && matches!(self.images.get(&crate::assets::ImageCache::tile_key(row)), Some(ImgState::Loading)) {
                     hold = true;
                 }
                 if (i + 1) % per_row == 0 {
@@ -1151,7 +1158,7 @@ impl BioCartoon {
         let star_rect = star_corner(ui, r.rect, stars, fav, self.settings.tile_stars, r.hover_pos());
         let on_star = (self.settings.tile_stars || fav) && r.interact_pointer_pos().is_some_and(|q| star_rect.contains(q));
         // Laid out like an icon's: "Eukaryotic cell  ·  Template", the description and category,
-        // "BioCartoon  ·  CC0-1.0  ·  AI unknown", the ID, and the credit line in grey.
+        // "BioCartoon  ·  CC0-1.0  ·  AI not specified", the ID, and the credit line in grey.
         let info = |ui: &mut egui::Ui| {
             ui.label(egui::RichText::new(format!("{}  ·  Template", row.meta.title)).strong());
             if !row.meta.description.is_empty() {
@@ -1162,6 +1169,9 @@ impl BioCartoon {
             }
             let line = [row.meta.author.as_str(), row.meta.license.as_str(), ai_label(row.meta.generative_ai_used)];
             ui.label(line.iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  "));
+            if row.meta.generative_ai_used == Some(true) && !row.meta.generative_ai_details.is_empty() {
+                ui.label(format!("AI use: {}", row.meta.generative_ai_details));
+            }
             ui.label(format!("Template ID: {}", row.meta.id));
             ui.label(egui::RichText::new(crate::credits::template_row_credit(&row.meta)).small().color(theme::text_dim()));
         };
@@ -1177,7 +1187,15 @@ impl BioCartoon {
                 self.actions.push(Action::ToggleFavorite(row.meta.id.clone()));
                 ui.close();
             }
-            if !cfg!(target_arch = "wasm32") && ui.button(format!("{}  Download", ph::DOWNLOAD_SIMPLE)).on_hover_text("Keep it, and the icons it uses, for offline use").clicked() {
+            // Downloaded already: take it out of the offline folder instead (a template of the
+            // user's own is removed below).
+            let downloaded = row.json_local.is_none() && self.offline.template_ids.contains(&row.meta.id);
+            if downloaded {
+                if ui.button(format!("{}  Delete download", ph::TRASH)).on_hover_text("Delete it from the offline folder (the icons it uses stay)").clicked() {
+                    self.actions.push(Action::DeleteTemplateDownload(Box::new(row.clone())));
+                    ui.close();
+                }
+            } else if !cfg!(target_arch = "wasm32") && ui.button(format!("{}  Download", ph::DOWNLOAD_SIMPLE)).on_hover_text("Keep it, and the icons it uses, for offline use").clicked() {
                 self.actions.push(Action::DownloadTemplate(Box::new(row.clone())));
                 ui.close();
             }
@@ -1803,7 +1821,7 @@ impl BioCartoon {
                         let mut pick: Option<AssetRow> = None;
                         ui.horizontal_wrapped(|ui| {
                             for v in &variants {
-                                let state = self.images.asset(&v.png_key, v.png_local.as_deref());
+                                let state = self.images.tile(v);
                                 let (rect, r) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
                                 let on = &v.id == aid;
                                 ui.painter().rect(rect, 6.0, Color32::WHITE, Stroke::new(if on { 2.0 } else { 1.0 }, if on { theme::accent() } else { theme::border() }), StrokeKind::Inside);
@@ -2559,6 +2577,8 @@ enum TileAct {
     Favorite,
     /// Save its original file (SVG, else PNG).
     Download,
+    /// Desktop: delete its files from the offline folder.
+    DeleteDownload,
     /// Remove from your library, on one of the user's own uploads.
     Remove,
     /// Request removal from BioCartoon library, on a published (or submitted) community icon.
@@ -2578,6 +2598,8 @@ struct TileMarks {
     stars: bool,
     /// The user starred it (one of their favorites): the star is filled gold.
     fav: bool,
+    /// Its files are in the offline folder (desktop): the menu offers to delete them.
+    downloaded: bool,
 }
 
 /// A catalog asset's tile. `hold` draws it as still loading even if its image is ready. `colors`
@@ -2592,13 +2614,13 @@ fn ai_label(used: Option<bool>) -> &'static str {
     match used {
         Some(true) => "AI",
         Some(false) => "No AI",
-        None => "AI unknown",
+        None => "AI not specified",
     }
 }
 
-fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>, images: &mut crate::assets::ImageCache, hold: bool, colors: usize, marks: TileMarks, unsent: &mut dyn FnMut() -> bool) -> (egui::Response, Option<TileAct>) {
+fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, images: &mut crate::assets::ImageCache, hold: bool, colors: usize, marks: TileMarks, unsent: &mut dyn FnMut() -> bool) -> (egui::Response, Option<TileAct>) {
     let fav = marks.fav;
-    let state = images.asset(&row.png_key, local);
+    let state = images.tile(row);
     let loading = ImgState::Loading;
     let state = if hold { &loading } else { state };
     let (abbr, col, name) = theme::source_badge(theme::asset_source(row));
@@ -2625,6 +2647,9 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
             ui.label(format!("Database category: {}", row.category));
         }
         ui.label([name, row.license.as_str(), ai_label(row.generative_ai_used)].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  "));
+        if row.generative_ai_used == Some(true) && !row.generative_ai_details.is_empty() {
+            ui.label(format!("AI use: {}", row.generative_ai_details));
+        }
         let mut file = (if row.svg_key.is_some() { crate::catalog::FORMAT_SVG } else { crate::catalog::FORMAT_PNG }).to_string();
         if row.png_width > 0 && row.png_height > 0 {
             file += &format!("  ·  {} × {} px", row.png_width, row.png_height);
@@ -2645,7 +2670,13 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
             act = Some(TileAct::Favorite);
             ui.close();
         }
-        if ui.button(format!("{}  Download", ph::DOWNLOAD_SIMPLE)).clicked() {
+        // Downloaded already (desktop): take it out of the offline folder instead.
+        if marks.downloaded {
+            if ui.button(format!("{}  Delete download", ph::TRASH)).on_hover_text("Delete it from the offline folder").clicked() {
+                act = Some(TileAct::DeleteDownload);
+                ui.close();
+            }
+        } else if ui.button(format!("{}  Download", ph::DOWNLOAD_SIMPLE)).clicked() {
             act = Some(TileAct::Download);
             ui.close();
         }
@@ -2683,7 +2714,7 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, local: Option<&str>,
             }
         }
     });
-    if let ImgState::Failed(e) = images.get(&format!("asset:{}", row.png_key)).unwrap_or(&ImgState::Loading) {
+    if let ImgState::Failed(e) = images.get(&crate::assets::ImageCache::tile_key(row)).unwrap_or(&ImgState::Loading) {
         let e = e.clone();
         return (r.on_hover_text(e), act);
     }
@@ -3558,7 +3589,13 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
     }
     // What a row's last button asks for: split it, or cross it out (true) or bring it back.
     let (mut split, mut remove) = (None, None);
-    egui::Grid::new(id_salt).num_columns(if edit { 7 } else { 5 }).spacing([6.0, 4.0]).show(ui, |ui| {
+    // The name boxes take up what the other columns leave, so the last column ends at the
+    // right edge, as the fields above do: last frame's width says how far off it was.
+    let name_key = ui.id().with((id_salt, "name_w"));
+    // (this frame's width, last frame's): the grid places its columns by last frame's widths.
+    let (name_w, laid_w): (f32, f32) = ui.data(|d| d.get_temp(name_key)).unwrap_or((110.0, 110.0));
+    let avail = ui.available_width();
+    let grid = egui::Grid::new(id_salt).num_columns(if edit { 7 } else { 5 }).spacing([6.0, 4.0]).show(ui, |ui| {
         for (i, row) in rows.iter_mut().enumerate() {
             let style = &mut row.style;
             let before = style.clone();
@@ -3570,9 +3607,9 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     if live {
-                        ui.add(egui::TextEdit::singleline(&mut row.name).char_limit(40).desired_width(110.0));
+                        ui.add(egui::TextEdit::singleline(&mut row.name).char_limit(40).desired_width(name_w));
                     } else {
-                        let size = egui::vec2(110.0, ui.spacing().interact_size.y);
+                        let size = egui::vec2(name_w, ui.spacing().interact_size.y);
                         ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.set_min_size(size);
                             ui.add_space(4.0);
@@ -3644,6 +3681,13 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
             changed |= *style != before;
         }
     });
+    if edit {
+        let fit = (laid_w + avail - grid.response.rect.width()).clamp(60.0, 400.0);
+        if (fit - name_w).abs() > 0.5 || (laid_w - name_w).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(name_key, (fit, name_w)));
+            ui.ctx().request_repaint();
+        }
+    }
     if let Some(i) = split {
         split_layer(rows, i);
         changed = true;
@@ -3682,7 +3726,9 @@ mod tests {
             taxa,
             layers: Vec::new(),
             generative_ai_used: None,
+            generative_ai_details: String::new(),
             file_bytes: 0,
+            thumb_key: None,
         }
     }
 

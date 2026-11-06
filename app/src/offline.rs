@@ -614,7 +614,7 @@ pub fn remove(db: &Path, base_url: &str, offline_dir: &Path, sources: &[String],
 
 /// A zip archive written front to back: each entry's header is returned for the caller to emit
 /// before the entry's bytes, and `finish` returns the central directory. Entries are stored
-/// uncompressed (PNGs are compressed already). No ZIP64: packs stay under 4 GB and 65,535 files.
+/// uncompressed (PNGs are compressed already), or with `deflated`, compressed. No ZIP64: packs stay under 4 GB and 65,535 files.
 #[derive(Default)]
 pub struct ZipWriter {
     offset: u64,
@@ -635,19 +635,37 @@ impl ZipWriter {
     pub fn entry(&mut self, name: &str, data: &[u8]) -> Result<Vec<u8>, String> {
         let mut crc = flate2::Crc::new();
         crc.update(data);
-        let (crc, len) = (crc.sum(), data.len() as u64);
-        if self.offset + len + 30 + name.len() as u64 > u32::MAX as u64 || self.count >= 65_000 {
+        self.header(name, crc.sum(), data.len() as u64, data.len() as u64, 0)
+    }
+
+    /// `name` holding `data`, compressed: the local header followed by the deflated bytes.
+    pub fn deflated(&mut self, name: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+        use std::io::Write as _;
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).map_err(|e| e.to_string())?;
+        let packed = enc.finish().map_err(|e| e.to_string())?;
+        let mut out = self.header(name, crc.sum(), data.len() as u64, packed.len() as u64, 8)?;
+        out.extend_from_slice(&packed);
+        Ok(out)
+    }
+
+    /// The local header of an entry `len` bytes long (`packed` once compressed with `method`:
+    /// 0 stored, 8 deflate), recorded for the central directory.
+    fn header(&mut self, name: &str, crc: u32, len: u64, packed: u64, method: u16) -> Result<Vec<u8>, String> {
+        if self.offset + packed + 30 + name.len() as u64 > u32::MAX as u64 || len > u32::MAX as u64 || self.count >= 65_000 {
             return Err("this download is too big for one zip; download the collections one at a time".into());
         }
         let (time, date) = Self::dos_time();
         let mut fixed = Vec::with_capacity(26);
         fixed.extend_from_slice(&20u16.to_le_bytes()); // version needed
         fixed.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 names
-        fixed.extend_from_slice(&0u16.to_le_bytes()); // stored
+        fixed.extend_from_slice(&method.to_le_bytes());
         fixed.extend_from_slice(&time.to_le_bytes());
         fixed.extend_from_slice(&date.to_le_bytes());
         fixed.extend_from_slice(&crc.to_le_bytes());
-        fixed.extend_from_slice(&(len as u32).to_le_bytes());
+        fixed.extend_from_slice(&(packed as u32).to_le_bytes());
         fixed.extend_from_slice(&(len as u32).to_le_bytes());
         fixed.extend_from_slice(&(name.len() as u16).to_le_bytes());
         fixed.extend_from_slice(&0u16.to_le_bytes()); // extra length
@@ -666,7 +684,7 @@ impl ZipWriter {
         self.central.extend_from_slice(&(self.offset as u32).to_le_bytes());
         self.central.extend_from_slice(name.as_bytes());
 
-        self.offset += local.len() as u64 + len;
+        self.offset += local.len() as u64 + packed;
         self.count += 1;
         Ok(local)
     }
@@ -969,6 +987,8 @@ pub struct OfflineState {
     templates: Collection,
     /// The templates downloaded (the Downloads filter).
     pub(crate) template_ids: std::collections::HashSet<String>,
+    /// The PNG keys of the icons downloaded (the right-click menu's Delete download).
+    pub(crate) asset_keys: std::collections::HashSet<String>,
     error: Option<String>,
     scan: Option<Receiver<Result<Scanned, String>>>,
     /// The image loader kept new files in the folder since the last scan, and when that was
@@ -1013,6 +1033,38 @@ impl crate::app::BioCartoon {
         self.offline.scan = Some(scan(db, self.images.cache_dir(), self.template_rows.clone()));
     }
 
+    /// Delete `row`'s PNG and SVG from the offline folder (the right-click menu's Delete download).
+    pub(crate) fn delete_asset_download(&mut self, row: &crate::catalog::AssetRow) {
+        let keys: Vec<&str> = std::iter::once(row.png_key.as_str()).chain(row.svg_key.as_deref()).collect();
+        self.delete_downloaded(&row.title, &keys);
+        self.offline.asset_keys.remove(&row.png_key);
+    }
+
+    /// Delete `row`'s JSON and thumbnail from the offline folder; the icons it uses stay, as other
+    /// templates or downloads may use them too.
+    pub(crate) fn delete_template_download(&mut self, row: &TemplateRow) {
+        let keys: Vec<&str> = [(row.json_local.is_none(), row.json_key.as_str()), (row.thumb_local.is_none(), row.meta.thumb_key.as_str())]
+            .into_iter()
+            .filter_map(|(cached, k)| cached.then_some(k))
+            .collect();
+        self.delete_downloaded(&row.meta.title, &keys);
+        self.offline.template_ids.remove(&row.meta.id);
+    }
+
+    fn delete_downloaded(&mut self, title: &str, keys: &[&str]) {
+        let Some(dir) = self.images.cache_dir() else { return };
+        for p in keys.iter().filter_map(|k| cache_path(&dir, k)) {
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return self.toast_err(format!("Couldn't delete {}: {e}", p.display())),
+            }
+        }
+        // Recount Settings > Offline and the Downloads filter.
+        self.offline_rescan();
+        self.toast(format!("Deleted the download of {title}"));
+    }
+
     /// Fetch the catalog's current version from the asset URL (installing it if it is newer) and
     /// recount what is downloaded.
     fn offline_sync(&mut self) {
@@ -1028,7 +1080,8 @@ impl crate::app::BioCartoon {
     pub(crate) fn poll_offline(&mut self, ctx: &egui::Context) {
         // Files the image loader keeps in the folder may complete an icon or template: count again,
         // at most every few seconds.
-        if !self.images.take_stored().is_empty() {
+        // (Not a search's thumbnails: no icon or template is made of them.)
+        if self.images.take_stored().iter().any(|k| !k.starts_with("thumbs/")) {
             self.offline.stale = true;
         }
         let now = ctx.input(|i| i.time);
@@ -1045,6 +1098,7 @@ impl crate::app::BioCartoon {
                             self.offline.templates = found.templates;
                             self.offline.template_ids = found.template_ids.into_iter().collect();
                             self.offline.error = None;
+                            self.offline.asset_keys = found.keys.iter().cloned().collect();
                             if self.images.cache_dir().is_some() {
                                 self.catalog.send(crate::catalog::Req::SetDownloads { keys: found.keys });
                                 // The Downloads filter's results follow.

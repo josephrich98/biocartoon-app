@@ -27,13 +27,15 @@ pub enum ExportFormat {
     Tif,
     Pdf,
     Svg,
+    /// A PowerPoint deck, every item a picture of its own (see [`crate::pptx`]).
+    Pptx,
     /// The editable project file (see [`crate::projects::to_file`]), written by the app rather than
     /// rendered here.
     Biocartoon,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 6] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Biocartoon];
+    pub const ALL: [ExportFormat; 7] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Pptx, ExportFormat::Biocartoon];
     pub fn label(self) -> &'static str {
         match self {
             ExportFormat::Png => "PNG",
@@ -41,6 +43,7 @@ impl ExportFormat {
             ExportFormat::Tif => "TIFF",
             ExportFormat::Pdf => "PDF",
             ExportFormat::Svg => "SVG",
+            ExportFormat::Pptx => "PPTX",
             ExportFormat::Biocartoon => "BioCartoon",
         }
     }
@@ -51,6 +54,7 @@ impl ExportFormat {
             ExportFormat::Tif => "tif",
             ExportFormat::Pdf => "pdf",
             ExportFormat::Svg => "svg",
+            ExportFormat::Pptx => "pptx",
             ExportFormat::Biocartoon => "biocartoon",
         }
     }
@@ -64,6 +68,7 @@ impl ExportFormat {
             "tif" | "tiff" => Some(ExportFormat::Tif),
             "pdf" => Some(ExportFormat::Pdf),
             "svg" => Some(ExportFormat::Svg),
+            "pptx" => Some(ExportFormat::Pptx),
             "biocartoon" => Some(ExportFormat::Biocartoon),
             _ => None,
         }
@@ -88,17 +93,20 @@ pub struct ExportOptions {
     pub all_slides: bool,
     /// PDF of several slides: one file with a page per slide, instead of a file per slide.
     pub pdf_pages: bool,
-    /// PDF only: draw image items as pictures at `dpi` instead of as they are. Detailed SVG
-    /// drawings become many thousands of PDF objects, and photos keep their full resolution;
-    /// this makes much smaller files. Text and shapes stay vector.
+    /// PDF and PPTX: draw image items as pictures at `dpi` instead of as they are. Detailed SVG
+    /// drawings become many thousands of PDF objects (or large SVGs in a deck), and photos keep
+    /// their full resolution; this makes much smaller files. Text and shapes stay vector.
     pub pdf_raster: bool,
     /// JPG only: 1 (smallest file) to 100 (best quality).
     pub jpg_quality: u8,
+    /// PPTX only: text boxes as pictures, which look exactly as here, instead of PowerPoint text
+    /// boxes, which can be edited.
+    pub pptx_text_images: bool,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: true, pdf_raster: false, jpg_quality: 90 }
+        Self { format: ExportFormat::Png, dpi: 300, transparent: false, individual: false, crop: false, all_slides: false, pdf_pages: true, pdf_raster: false, jpg_quality: 90, pptx_text_images: false }
     }
 }
 
@@ -255,6 +263,10 @@ pub fn run(ctx: &egui::Context, job: ExportJob) -> Result<String, String> {
     if out.missing > 0 {
         let _ = write!(msg, " ({} image(s) could not be loaded and were left out)", out.missing);
     }
+    if !out.replaced.is_empty() {
+        let list: Vec<String> = out.replaced.iter().map(|(a, b)| format!("{a} with {b}")).collect();
+        let _ = write!(msg, ". Fonts this computer doesn't have were replaced: {}", list.join(", "));
+    }
     Ok(msg)
 }
 
@@ -290,6 +302,8 @@ struct Rendered {
     pages: usize,
     /// Images that could not be loaded.
     missing: usize,
+    /// Fonts a deck names in place of ones this computer lacks: (font, replacement).
+    replaced: Vec<(String, String)>,
 }
 
 /// Encode every file `job` exports and hand each to `out`, with its path and how much bigger the
@@ -325,6 +339,9 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
         }
     }
 
+    if opts.format == ExportFormat::Pptx {
+        return render_pptx(ctx, job, &images, missing, out);
+    }
     let transparent = opts.format == ExportFormat::Png && opts.transparent;
     let raster = (opts.format == ExportFormat::Pdf && opts.pdf_raster).then(|| opts.dpi.clamp(MIN_DPI, MAX_DPI));
     let mut written = Vec::new();
@@ -393,7 +410,214 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
     if written.is_empty() && pages.is_empty() {
         return Err(if multi { "There are no images on these slides" } else { "There are no images on this slide" }.into());
     }
-    Ok(Rendered { files: written, pages: pages.len(), missing })
+    Ok(Rendered { files: written, pages: pages.len(), missing, replaced: Vec::new() })
+}
+
+/// One PowerPoint deck, a slide per slide, with every item on it a picture of its own.
+fn render_pptx(ctx: &egui::Context, job: &ExportJob, images: &HashMap<String, Picture>, missing: usize, out: &mut dyn FnMut(&Path, &[u8], f64) -> Result<(), String>) -> Result<Rendered, String> {
+    let dpi = job.opts.dpi.clamp(MIN_DPI, MAX_DPI);
+    let total: usize = job.slides.iter().map(|(_, s)| s.items.len()).sum();
+    job.progress.total.store(total.max(1), Ordering::Relaxed);
+    let title = job.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut deck = crate::pptx::Deck { title, size: [job.page.width(), job.page.height()], slides: Vec::new() };
+    let mut replaced: Vec<(String, String)> = Vec::new();
+    let offset = |pos: [f32; 2]| [pos[0] - job.page.min.x, pos[1] - job.page.min.y];
+    for (n, slide) in &job.slides {
+        let mut shapes = Vec::new();
+        for it in &slide.items {
+            if job.progress.cancelled() {
+                return Err(CANCELLED.into());
+            }
+            if matches!(it.kind, ItemKind::Text { .. }) && !job.opts.pptx_text_images {
+                let mut t = pptx_text(it, &mut replaced);
+                t.pos = offset(t.pos);
+                shapes.push(crate::pptx::Shape::Text(t));
+            } else {
+                match pptx_picture(ctx, it, images, dpi, job.opts.pdf_raster) {
+                    Ok(Some(mut p)) => {
+                        p.pos = offset(p.pos);
+                        shapes.push(crate::pptx::Shape::Picture(p));
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::warn!("export: slide {n}, {}: {e}", it.name),
+                }
+            }
+            job.progress.done.fetch_add(1, Ordering::Relaxed);
+            ctx.request_repaint();
+        }
+        deck.slides.push(crate::pptx::SlideOut { background: slide.background.unwrap_or(job.background), shapes });
+    }
+    let bytes = crate::pptx::write(&deck).map_err(|e| format!("{}: {e}", job.path.display()))?;
+    out(&job.path, &bytes, 1.0)?;
+    Ok(Rendered { files: vec![job.path.clone()], pages: 0, missing, replaced })
+}
+
+/// The typeface a deck names for `font`: its own when this computer has it installed, otherwise
+/// a standard one most computers have, of the same kind (metrically the same where there is
+/// one, so lines break in the same places). A replacement is noted in `replaced`, once.
+fn deck_typeface(font: TextFont, replaced: &mut Vec<(String, String)>) -> String {
+    static INSTALLED: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    let installed = INSTALLED.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        db.faces().flat_map(|f| f.families.iter().map(|(n, _)| n.to_lowercase())).collect()
+    });
+    let own = match font {
+        TextFont::Sans => "Ubuntu",
+        TextFont::Mono => "Hack",
+        f => f.embedded_name().unwrap_or("Arial"),
+    };
+    if installed.contains(&own.to_lowercase()) {
+        return own.into();
+    }
+    let standard = match font {
+        TextFont::Arimo => "Arial",
+        TextFont::Tinos => "Times New Roman",
+        TextFont::Cousine => "Courier New",
+        TextFont::Carlito => "Calibri",
+        TextFont::Caladea => "Cambria",
+        TextFont::Gelasio => "Georgia",
+        f => match f.kind() {
+            FontKind::Sans => "Arial",
+            FontKind::Serif => "Times New Roman",
+            FontKind::Mono => "Courier New",
+            FontKind::Handwriting => "Comic Sans MS",
+        },
+    };
+    if !replaced.iter().any(|(a, _)| a == own) {
+        replaced.push((own.into(), standard.into()));
+    }
+    standard.into()
+}
+
+/// Text item `it` as a PowerPoint text box, its styled characters as runs. Item opacity goes
+/// into the colours.
+fn pptx_text(it: &Item, replaced: &mut Vec<(String, String)>) -> crate::pptx::TextBox {
+    let ItemKind::Text { text, size, align, font, line_spacing, valign, fill, .. } = &it.kind else { unreachable!("pptx_text takes text items") };
+    let op = it.opacity.clamp(0.0, 1.0);
+    let fade = |c: [u8; 4]| [c[0], c[1], c[2], (c[3] as f32 * op).round() as u8];
+    let typeface = deck_typeface(*font, replaced);
+    let mut paragraphs: Vec<Vec<crate::pptx::Run>> = vec![Vec::new()];
+    for (c, look) in text.chars().zip(crate::doc::char_looks(&it.kind, text)) {
+        if c == '\n' {
+            paragraphs.push(Vec::new());
+            continue;
+        }
+        let run = crate::pptx::Run {
+            text: String::new(),
+            size_px: *size,
+            typeface: typeface.clone(),
+            bold: look.bold,
+            italic: look.italic,
+            underline: look.underline,
+            strike: look.strike,
+            color: fade(look.color),
+            baseline: match look.script {
+                None => 0,
+                Some(crate::doc::Script::Super) => 30_000,
+                Some(crate::doc::Script::Sub) => -25_000,
+            },
+            highlight: look.highlight,
+        };
+        let para = paragraphs.last_mut().expect("never empty");
+        match para.last_mut() {
+            Some(r) if (r.bold, r.italic, r.underline, r.strike, r.color, r.baseline, r.highlight) == (run.bold, run.italic, run.underline, run.strike, run.color, run.baseline, run.highlight) => r.text.push(c),
+            _ => para.push(crate::pptx::Run { text: c.to_string(), ..run }),
+        }
+    }
+    let r = it.rect();
+    crate::pptx::TextBox {
+        name: it.name.clone(),
+        pos: [r.min.x, r.min.y],
+        size: [r.width(), r.height()],
+        rotation: it.rotation,
+        group: it.group,
+        fill: fade(*fill),
+        align: match align {
+            TextAlign::Left => "l",
+            TextAlign::Center => "ctr",
+            TextAlign::Right => "r",
+            TextAlign::Justify => "just",
+        },
+        anchor: match valign {
+            crate::doc::TextVAlign::Top => "t",
+            crate::doc::TextVAlign::Middle => "ctr",
+            crate::doc::TextVAlign::Bottom => "b",
+        },
+        line_spacing: *line_spacing,
+        paragraphs,
+        size_px: *size,
+        typeface,
+    }
+}
+
+/// Fallback PNGs in a deck are kept below this many pixels each.
+const PPTX_MAX_PIXELS: u64 = 16_000_000;
+
+/// Item `it` as a PowerPoint picture: an SVG of it (text turned into outlines, so it looks the
+/// same without our fonts) cropped to what it draws, with a PNG at `dpi` for apps that can't
+/// show SVG. Rotation is left to PowerPoint, so the picture still turns about the item's centre;
+/// photos go in as their own pixels. With `raster`, an image item is a PNG at `dpi` alone (a
+/// photo only when it has more pixels than that needs). `None` when it draws nothing (or its
+/// image is missing).
+fn pptx_picture(ctx: &egui::Context, it: &Item, images: &HashMap<String, Picture>, dpi: u32, raster: bool) -> Result<Option<crate::pptx::Picture>, String> {
+    // The canvas doesn't turn these.
+    let rotates = !matches!(it.kind, ItemKind::Line { .. } | ItemKind::Table { .. } | ItemKind::Code { .. });
+    let mut flat = it.clone();
+    let rotation = if rotates { std::mem::take(&mut flat.rotation) } else { 0.0 };
+    let picture = |rect: Rect, alpha: f32, png: Vec<u8>, svg: Option<Vec<u8>>| crate::pptx::Picture {
+        name: it.name.clone(),
+        descr: crate::credits::for_items(&[it], false),
+        pos: [rect.min.x, rect.min.y],
+        size: [rect.width(), rect.height()],
+        rotation,
+        alpha,
+        png,
+        svg,
+        group: it.group,
+    };
+    if let ItemKind::Image { source, crop, overlay, .. } = &it.kind {
+        let alpha = it.opacity.clamp(0.0, 1.0);
+        match images.get(&source.cache_key()) {
+            None => return Ok(None),
+            Some(p) if raster && should_rasterise(p, it, *crop, dpi) => return Ok(rasterised_png(ctx, it, images, dpi).map(|png| picture(it.rect(), alpha, png_with_dpi(png, dpi), None))),
+            Some(Picture::Pixels(img)) => {
+                return Ok(prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v).map(|png| picture(it.rect(), alpha, png, None)));
+            }
+            Some(Picture::Vector(_)) => {}
+        }
+    }
+    // Draw it with room around it, measure what it covers (strokes, arrowheads, text past its
+    // box), then draw it again cropped to that: centred on the item when PowerPoint rotates it.
+    let r = flat.rect();
+    let probe = r.expand(r.width().max(r.height()) * 0.5 + 64.0);
+    let tree = parse(&svg_document(ctx, &[&flat], probe, None, images, None))?;
+    if !tree.root().has_children() {
+        return Ok(None);
+    }
+    let bb = tree.root().abs_layer_bounding_box();
+    let k = probe.width() / tree.size().width();
+    let drawn = Rect::from_min_max(Pos2::new(probe.min.x + bb.left() * k, probe.min.y + bb.top() * k), Pos2::new(probe.min.x + bb.right() * k, probe.min.y + bb.bottom() * k))
+        .expand(1.0)
+        .intersect(probe);
+    if !(drawn.width() > 0.0 && drawn.height() > 0.0) {
+        return Ok(None);
+    }
+    let region = if rotates {
+        let c = r.center();
+        let half = Vec2::new((c.x - drawn.min.x).max(drawn.max.x - c.x), (c.y - drawn.min.y).max(drawn.max.y - c.y));
+        Rect::from_center_size(c, half * 2.0)
+    } else {
+        drawn
+    };
+    let tree = parse(&svg_document(ctx, &[&flat], region, None, images, None))?;
+    let svg = tree.to_string(&usvg::WriteOptions::default());
+    let [w, h] = pixel_size(region, dpi);
+    let full = w as u64 * h as u64;
+    let dpi = if full > PPTX_MAX_PIXELS { ((dpi as f64 * (PPTX_MAX_PIXELS as f64 / full as f64).sqrt()) as u32).max(1) } else { dpi };
+    let mut png = Vec::new();
+    rasterise(&tree, region, dpi)?.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    Ok(Some(picture(region, 1.0, png_with_dpi(png, dpi), Some(svg.into_bytes()))))
 }
 
 /// Encode one file and hand it to `out`, at a lower resolution if it has more than `max_pixels`.
@@ -1479,6 +1703,7 @@ fn encode(svg: &str, region: Rect, opts: &ExportOptions, dpi: u32, credits: &str
         ExportFormat::Svg if !credits.is_empty() => svg_with_credits(svg, credits).into_bytes(),
         ExportFormat::Svg => svg.as_bytes().to_vec(),
         ExportFormat::Biocartoon => return Err("A .biocartoon file is a project, not a rendered slide".into()),
+        ExportFormat::Pptx => return Err("A deck is written by render_pptx".into()),
         ExportFormat::Pdf => {
             let tree = parse(svg)?;
             svg2pdf::to_pdf(&tree, svg2pdf::ConversionOptions::default(), svg2pdf::PageOptions { dpi: DPI }).map_err(|e| err(&e))?
@@ -1725,7 +1950,7 @@ mod tests {
         requests.insert(src.cache_key(), Request::Path(icon.clone()));
         let job = |format, dpi, transparent, individual, name: &str| ExportJob {
             path: dir.join(name),
-            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false, pdf_pages: true, pdf_raster: false, jpg_quality: 90 },
+            opts: ExportOptions { format, dpi, transparent, individual, crop: false, all_slides: false, pdf_pages: true, pdf_raster: false, jpg_quality: 90, pptx_text_images: false },
             slides: vec![(1, slide.clone())],
             page,
             background: [250, 245, 235, 255],
@@ -1807,5 +2032,51 @@ mod tests {
         each.opts.pdf_pages = false;
         run(&ctx, each).unwrap();
         assert!(dir.join("split-slide1.pdf").exists() && dir.join("split-slide2.pdf").exists() && !dir.join("split.pdf").exists());
+
+        // PowerPoint: one deck, a picture per item; the title and star grouped, a vector drawing kept as SVG.
+        std::fs::write(dir.join("shape.svg"), r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect x="10" y="10" width="80" height="30" fill="#2f80ed"/></svg>"##).unwrap();
+        let svg_src = ImageSource::file(dir.join("shape.svg").display().to_string());
+        let mut grouped = slide.clone();
+        grouped.items[2].group = Some(9);
+        grouped.items[3].group = Some(9);
+        grouped.items[3].rotation = 0.5;
+        grouped.items.push(Item::new(10, "Drawing", ItemKind::Image { source: svg_src.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() }, Pos2::new(100.0, 250.0), Vec2::new(160.0, 80.0)));
+        let mut deck = job(ExportFormat::Pptx, 150, false, true, "deck.pptx");
+        deck.requests.insert(svg_src.cache_key(), Request::Path(dir.join("shape.svg")));
+        deck.slides = vec![(1, grouped), (2, text_only_slide(&slide))];
+        let msg = run(&ctx, deck).unwrap();
+        assert!(msg.contains("deck.pptx"), "{msg}");
+        let bytes = std::fs::read(dir.join("deck.pptx")).unwrap();
+        assert!(bytes.starts_with(b"PK\x03\x04"));
+        let names = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
+        // Local header and central directory each name every part once.
+        assert_eq!(names(b"ppt/slides/slide2.xml"), 2);
+        assert_eq!(names(b"ppt/slides/slide3.xml"), 0);
+        // Nine pictures on slide 1 bar the title, now a text box; the two photos without an SVG.
+        assert_eq!(names(b"ppt/media/image8.png"), 2);
+        assert_eq!(names(b"ppt/media/image9.png"), 0, "slide 2 is text alone");
+        assert_eq!(names(b"ppt/media/image8.svg"), 2);
+        assert_eq!(names(b"svgBlip"), 0, "slide XML is compressed");
+        // Text boxes as pictures, if asked.
+        let mut pics = job(ExportFormat::Pptx, 150, false, false, "deck-text-pictures.pptx");
+        pics.opts.pptx_text_images = true;
+        pics.slides = vec![(1, text_only_slide(&slide))];
+        run(&ctx, pics).unwrap();
+        let bytes = std::fs::read(dir.join("deck-text-pictures.pptx")).unwrap();
+        assert_eq!(bytes.windows(20).filter(|w| *w == b"ppt/media/image1.svg").count(), 2);
+        // Rasterized images: the vector drawing as a PNG alone.
+        let mut raster = job(ExportFormat::Pptx, 150, false, false, "deck-raster.pptx");
+        raster.opts.pdf_raster = true;
+        raster.requests.insert(svg_src.cache_key(), Request::Path(dir.join("shape.svg")));
+        let drawing = Item::new(10, "Drawing", ItemKind::Image { source: svg_src, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() }, Pos2::new(100.0, 250.0), Vec2::new(160.0, 80.0));
+        raster.slides = vec![(1, Slide { items: vec![drawing], ..Slide::default() })];
+        run(&ctx, raster).unwrap();
+        let bytes = std::fs::read(dir.join("deck-raster.pptx")).unwrap();
+        assert_eq!(bytes.windows(20).filter(|w| *w == b"ppt/media/image1.png").count(), 2);
+        assert_eq!(bytes.windows(4).filter(|w| *w == b".svg").count(), 0);
+    }
+
+    fn text_only_slide(slide: &Slide) -> Slide {
+        Slide { name: "Text".into(), items: vec![slide.items[2].clone()], comments: Vec::new(), background: None }
     }
 }

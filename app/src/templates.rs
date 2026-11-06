@@ -36,6 +36,9 @@ pub struct TemplateMeta {
     pub thumb_key: String,
     /// See [`crate::catalog::AssetRow::generative_ai_used`]: `None` when it isn't known.
     pub generative_ai_used: Option<bool>,
+    /// How generative AI was used, as the uploader said; empty when they didn't.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub generative_ai_details: String,
     /// A reviewer accepted it to the official BioCartoon library (its author unchanged); see
     /// [`TemplateRow::source`].
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -78,11 +81,12 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, category TEXT, author TEXT,
     license TEXT, created_at TEXT, json_key TEXT NOT NULL, thumb_key TEXT,
     json_local TEXT, thumb_local TEXT,
-    tags TEXT NOT NULL DEFAULT '[]', generative_ai_used INTEGER, official INTEGER NOT NULL DEFAULT 0, credit TEXT);
+    tags TEXT NOT NULL DEFAULT '[]', generative_ai_used INTEGER, official INTEGER NOT NULL DEFAULT 0, credit TEXT,
+    generative_ai_details TEXT);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);";
 
 /// Whether `table` (e.g. `pub.templates`) has `column`: lists made before templates had tags
-/// (or `generative_ai_used`, `official` or `credit`) don't.
+/// (or `generative_ai_used`, `official`, `credit` or `generative_ai_details`) don't.
 fn has_col(c: &Connection, table: &str, column: &str) -> bool {
     c.prepare(&format!("SELECT {column} FROM {table} LIMIT 0")).is_ok()
 }
@@ -116,6 +120,9 @@ impl TemplateStore {
             }
             if !has_col(&c, "templates", "credit") {
                 c.execute_batch("ALTER TABLE templates ADD COLUMN credit TEXT;")?;
+            }
+            if !has_col(&c, "templates", "generative_ai_details") {
+                c.execute_batch("ALTER TABLE templates ADD COLUMN generative_ai_details TEXT;")?;
             }
             Ok(c)
         });
@@ -176,7 +183,7 @@ impl TemplateStore {
             let mut st = c.prepare(
                 "SELECT id, title, coalesce(description,''), coalesce(category,''), coalesce(author,''), \
                  coalesce(license,''), coalesce(created_at,''), coalesce(thumb_key,''), json_key, json_local, thumb_local, \
-                 coalesce(tags,'[]'), generative_ai_used, official, coalesce(credit,'') FROM templates ORDER BY json_local IS NULL, lower(title), id",
+                 coalesce(tags,'[]'), generative_ai_used, official, coalesce(credit,''), coalesce(generative_ai_details,'') FROM templates ORDER BY json_local IS NULL, lower(title), id",
             )?;
             let rows = st
                 .query_map([], |r| {
@@ -194,6 +201,7 @@ impl TemplateStore {
                             generative_ai_used: r.get::<_, Option<i64>>(12)?.map(|v| v != 0),
                             official: r.get::<_, i64>(13)? != 0,
                             credit: r.get(14)?,
+                            generative_ai_details: r.get(15)?,
                         },
                         json_key: r.get(8)?,
                         json_local: r.get(9)?,
@@ -216,8 +224,8 @@ impl TemplateStore {
         let m = &row.meta;
         c.execute(
             "INSERT OR REPLACE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, \
-             json_local, thumb_local, tags, generative_ai_used, official, credit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-             ?14 OR coalesce((SELECT official FROM templates WHERE id = ?1), 0), ?15)",
+             json_local, thumb_local, tags, generative_ai_used, official, credit, generative_ai_details) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+             ?14 OR coalesce((SELECT official FROM templates WHERE id = ?1), 0), ?15, ?16)",
             params![
                 m.id,
                 m.title,
@@ -233,7 +241,8 @@ impl TemplateStore {
                 serde_json::to_string(&m.tags).map_err(|e| e.to_string())?,
                 m.generative_ai_used,
                 m.official,
-                m.credit
+                m.credit,
+                (m.generative_ai_used == Some(true) && !m.generative_ai_details.is_empty()).then_some(&m.generative_ai_details)
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -262,10 +271,11 @@ impl TemplateStore {
         let ai = if has_col(c, "pub.templates", "generative_ai_used") { "generative_ai_used" } else { "NULL" };
         let official = if has_col(c, "pub.templates", "official") { "coalesce(official,0)" } else { "0" };
         let credit = if has_col(c, "pub.templates", "credit") { "credit" } else { "NULL" };
+        let ai_details = if has_col(c, "pub.templates", "generative_ai_details") { "generative_ai_details" } else { "NULL" };
         let r = c.execute_batch(&format!(
             "BEGIN; DELETE FROM templates WHERE json_local IS NULL; \
-             INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, tags, generative_ai_used, official, credit) \
-             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags}, {ai}, {official}, {credit} FROM pub.templates; \
+             INSERT OR IGNORE INTO templates (id, title, description, category, author, license, created_at, json_key, thumb_key, tags, generative_ai_used, official, credit, generative_ai_details) \
+             SELECT id, title, description, category, author, license, created_at, json_key, thumb_key, {tags}, {ai}, {official}, {credit}, {ai_details} FROM pub.templates; \
              UPDATE templates SET official = (SELECT {official} FROM pub.templates p WHERE p.id = templates.id) \
              WHERE json_local IS NOT NULL AND id IN (SELECT id FROM pub.templates); COMMIT;"
         ));
@@ -560,7 +570,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pic = dir.join("pic.png");
         image::RgbaImage::from_pixel(40, 30, image::Rgba([200, 60, 60, 255])).save(&pic).unwrap();
-        let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), tags: vec!["test".into()], layers: Vec::new(), author: "tester".into(), license: "CC0-1.0".into(), generative_ai_used: Some(false), email: String::new(), official: false };
+        let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), tags: vec!["test".into()], layers: Vec::new(), author: "tester".into(), license: "CC0-1.0".into(), generative_ai_used: Some(false), generative_ai_details: String::new(), email: String::new(), official: false };
         let image = ItemKind::Image { source: ImageSource::file(pic.display().to_string()), crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0], layers: Vec::new() };
         let text = ItemKind::text("Step 1", 20.0, [0, 0, 0, 255], crate::doc::TextAlign::Left, true);
         let slide = Slide { name: "x".into(), items: vec![Item::new(1, "pic", image, egui::Pos2::ZERO, egui::Vec2::splat(50.0)), Item::new(2, "t", text, egui::Pos2::ZERO, egui::Vec2::splat(50.0))], comments: Vec::new(), background: None };

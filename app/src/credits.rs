@@ -421,7 +421,9 @@ mod tests {
             taxa: Vec::new(),
             layers: Vec::new(),
             generative_ai_used: None,
+            generative_ai_details: String::new(),
             file_bytes: 0,
+            thumb_key: None,
         };
         fill(doc.slides.iter_mut(), &[row]);
         assert!(missing(&doc).is_empty());
