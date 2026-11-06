@@ -54,11 +54,12 @@ impl BioCartoon {
         }).response.rect
     }
 
-    /// With the Icons panel hidden, a drag in from the window's left edge shows it again; with the
-    /// right panel closed, a drag left from the rail's inner edge (`rail`, where the panel's edge
-    /// sits when open) reopens the tab it showed last. Call after the panels, before the canvas, so
-    /// the canvas doesn't take the drag.
-    pub fn edge_swipes(&mut self, ui: &mut egui::Ui, rail: Rect) {
+    /// With the Icons panel hidden, a drag in from the window's left edge shows it again. With the
+    /// rail hidden (`rail` is `None`), a drag in from the right edge shows it, with the panel it had
+    /// open; with the rail shown but its panel closed, a drag left from the rail's inner edge (where
+    /// the panel's edge sits when open) reopens the tab it showed last. Call after the panels,
+    /// before the canvas, so the canvas doesn't take the drag.
+    pub fn edge_swipes(&mut self, ui: &mut egui::Ui, rail: Option<Rect>) {
         const STRIP: f32 = 6.0;
         const DISTANCE: f32 = 30.0;
         let ctx = ui.ctx().clone();
@@ -85,8 +86,17 @@ impl BioCartoon {
         if !self.settings.show_icons && strip("left", Rect::from_x_y_ranges(screen.left()..=screen.left() + STRIP, rows), 1.0) {
             self.settings.show_icons = true;
         }
-        if self.rail.is_none() && strip("right", Rect::from_x_y_ranges(rail.left() - STRIP..=rail.left() + STRIP / 2.0, rows), -1.0) {
-            self.actions.push(Action::SetRail(Some(self.last_rail.unwrap_or(RailTab::Edit))));
+        match rail {
+            None => {
+                if strip("right", Rect::from_x_y_ranges(screen.right() - STRIP..=screen.right(), rows), -1.0) {
+                    self.settings.show_rail = true;
+                }
+            }
+            Some(rail) => {
+                if self.rail.is_none() && strip("right", Rect::from_x_y_ranges(rail.left() - STRIP..=rail.left() + STRIP / 2.0, rows), -1.0) {
+                    self.actions.push(Action::SetRail(Some(self.last_rail.unwrap_or(RailTab::Edit))));
+                }
+            }
         }
     }
 

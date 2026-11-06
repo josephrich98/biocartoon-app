@@ -632,95 +632,119 @@ impl BioCartoon {
         let mut restore: Option<i64> = None;
         let page = link_page();
         let link = self.share.link.clone();
-        egui::Window::new(format!("{}  Share", ph::SHARE_NETWORK)).open(&mut open).collapsible(false).resizable(false).default_width(420.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.set_max_width(420.0);
-            let dim = |t: &str| egui::RichText::new(t).color(theme::text_dim());
-            let Some(link) = &link else {
-                ui.label("Get a link to this project to send to a collaborator. Whoever opens it gets the project in their own BioCartoon, and their edits come back here.");
-                ui.add_space(4.0);
-                ui.label(dim(&format!(
-                    "The project is encrypted on this device before it is uploaded, and the key is only in the link, so BioCartoon's server can't see it. Anyone with the link can open it. Links last until nobody has used them for {SHARE_IDLE_DAYS} days."
-                )));
-                ui.add_space(8.0);
-                let busy = self.share.busy;
-                if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(format!("{}  Create share link", ph::LINK)).color(Color32::WHITE)).fill(theme::accent())).clicked() {
-                    act = Some("create");
-                }
-                if busy {
-                    ui.label(dim("Uploading..."));
-                }
-                return;
-            };
-            let mut copy_row = |ui: &mut egui::Ui, title: &str, about: &str, url: String| {
-                ui.label(egui::RichText::new(title).strong());
-                ui.label(dim(about));
+        // A modal, like Export: a click outside closes it. It fits the screen's width, scrolls if
+        // it is too tall, and pinches to zoom (the whole app, until it closes).
+        let zoom_id = egui::Id::new("share_base_zoom");
+        crate::app::dialog_zoom(ctx, zoom_id);
+        let width = crate::app::dialog_width(ctx, 420.0);
+        let modal = egui::Modal::new(egui::Id::new("share_modal")).show(ctx, |ui| {
+            crate::app::dialog_body(ui, egui::Id::new("share_body"), |ui| {
+                ui.set_min_width(width);
+                ui.set_max_width(width);
                 ui.horizontal(|ui| {
-                    let mut shown = url.clone();
-                    ui.add(egui::TextEdit::singleline(&mut shown).desired_width(300.0).font(egui::TextStyle::Monospace));
-                    if ui.button(format!("{}  Copy", ph::COPY)).clicked() {
-                        ui.ctx().copy_text(url);
-                        act = Some("copied");
-                    }
+                    ui.heading(format!("{}  Share", ph::SHARE_NETWORK));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).on_hover_text("Close").clicked() {
+                            open = false;
+                        }
+                    });
                 });
-                ui.add_space(6.0);
-            };
-            let gone = self.share.gone;
-            if let Some(url) = link.edit_url(&page).filter(|_| !gone) {
-                copy_row(ui, "Edit link", "Opens this project for editing. Their saves come back here, and yours go to them.", url);
-            }
-            if !gone {
-                copy_row(ui, "View link", "Opens a copy that follows your changes. Changes made with it stay with whoever made them.", link.view_url(&page));
-            }
-            if !link.can_edit() && !gone {
-                ui.label(egui::RichText::new(format!("{}  You opened a view link: your changes stay on this device.", ph::EYE)).color(theme::text_dim()));
-            }
-            ui.separator();
-            if let Some(e) = &self.share.error {
-                ui.label(egui::RichText::new(e).color(theme::danger()));
-            }
-            match &self.share.remote {
-                Some(r) => {
-                    let pending = self.share.modified > link.synced && link.can_edit();
-                    let state = if r.version > link.version {
-                        "Someone else's newer version hasn't been loaded here."
-                    } else if pending {
-                        "Changes here are waiting to go up."
-                    } else {
-                        "Up to date."
-                    };
-                    ui.label(dim(&format!("Shared version {}, saved {}. {state}", r.version, crate::projects::format_time(iso_ms(&r.updated)))));
-                    ui.label(dim(&format!("Expires {} unless someone uses it before then.", crate::projects::format_date(iso_ms(&r.expires)))));
-                    let earlier: Vec<&RemoteVersion> = r.versions.iter().filter(|v| v.version != r.version).collect();
-                    if !earlier.is_empty() {
-                        egui::CollapsingHeader::new(format!("Earlier versions online ({})", earlier.len())).show(ui, |ui| {
-                            ui.label(dim(&format!("The last {SHARE_VERSIONS} versions are kept, so an overwrite can be undone.")));
-                            for v in earlier {
-                                ui.horizontal(|ui| {
-                                    ui.label(format!("Version {} · {}", v.version, crate::projects::format_time(iso_ms(&v.updated))));
-                                    if ui.add_enabled(!self.share.busy, egui::Button::new("Restore")).on_hover_text("Bring this version back. What is here now is kept in Version history.").clicked() {
-                                        restore = Some(v.version);
-                                    }
-                                });
-                            }
-                        });
+                ui.add_space(4.0);
+                let dim = |t: &str| egui::RichText::new(t).color(theme::text_dim());
+                let Some(link) = &link else {
+                    ui.label("Get a link to this project to send to a collaborator. Whoever opens it gets the project in their own BioCartoon, and their edits come back here.");
+                    ui.add_space(4.0);
+                    ui.label(dim(&format!(
+                        "The project is encrypted on this device before it is uploaded, and the key is only in the link, so BioCartoon's server can't see it. Anyone with the link can open it. Links last until nobody has used them for {SHARE_IDLE_DAYS} days."
+                    )));
+                    ui.add_space(8.0);
+                    let busy = self.share.busy;
+                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(format!("{}  Create share link", ph::LINK)).color(Color32::WHITE)).fill(theme::accent())).clicked() {
+                        act = Some("create");
                     }
+                    if busy {
+                        ui.label(dim("Uploading..."));
+                    }
+                    return;
+                };
+                let mut copy_row = |ui: &mut egui::Ui, title: &str, about: &str, url: String| {
+                    ui.label(egui::RichText::new(title).strong());
+                    ui.label(dim(about));
+                    ui.horizontal(|ui| {
+                        let mut shown = url.clone();
+                        // The link takes what the Copy button leaves.
+                        let copy = format!("{}  Copy", ph::COPY);
+                        let button = ui.fonts_mut(|f| f.layout_no_wrap(copy.clone(), egui::TextStyle::Button.resolve(ui.style()), Color32::WHITE)).size().x + 2.0 * ui.spacing().button_padding.x;
+                        let field = (ui.available_width() - button - ui.spacing().item_spacing.x - 8.0).max(80.0);
+                        ui.add(egui::TextEdit::singleline(&mut shown).desired_width(field).font(egui::TextStyle::Monospace));
+                        if ui.button(copy).clicked() {
+                            ui.ctx().copy_text(url);
+                            act = Some("copied");
+                        }
+                    });
+                    ui.add_space(6.0);
+                };
+                let gone = self.share.gone;
+                if let Some(url) = link.edit_url(&page).filter(|_| !gone) {
+                    copy_row(ui, "Edit link", "Opens this project for editing. Their saves come back here, and yours go to them.", url);
                 }
-                None if !self.share.gone => {
-                    ui.label(dim("Checking the shared copy..."));
+                if !gone {
+                    copy_row(ui, "View link", "Opens a copy that follows your changes. Changes made with it stay with whoever made them.", link.view_url(&page));
                 }
-                None => {}
-            }
-            ui.add_space(6.0);
-            let (label, tip) = if link.is_owner() && !self.share.gone {
-                ("Stop sharing", "Delete the shared copy online: the links stop working. The project stays here.")
-            } else {
-                ("Unlink this project", "Stop following the share link. The project stays here as it is.")
-            };
-            let label = if self.share.confirm_stop { format!("{}  Click again to confirm", ph::WARNING) } else { format!("{}  {label}", ph::LINK_BREAK) };
-            if ui.add_enabled(!self.share.busy, egui::Button::new(label)).on_hover_text(tip).clicked() {
-                act = Some(if self.share.confirm_stop { "stop" } else { "confirm" });
-            }
+                if !link.can_edit() && !gone {
+                    ui.label(egui::RichText::new(format!("{}  You opened a view link: your changes stay on this device.", ph::EYE)).color(theme::text_dim()));
+                }
+                ui.separator();
+                if let Some(e) = &self.share.error {
+                    ui.label(egui::RichText::new(e).color(theme::danger()));
+                }
+                match &self.share.remote {
+                    Some(r) => {
+                        let pending = self.share.modified > link.synced && link.can_edit();
+                        let state = if r.version > link.version {
+                            "Someone else's newer version hasn't been loaded here."
+                        } else if pending {
+                            "Changes here are waiting to go up."
+                        } else {
+                            "Up to date."
+                        };
+                        ui.label(dim(&format!("Shared version {}, saved {}. {state}", r.version, crate::projects::format_time(iso_ms(&r.updated)))));
+                        ui.label(dim(&format!("Expires {} unless someone uses it before then.", crate::projects::format_date(iso_ms(&r.expires)))));
+                        let earlier: Vec<&RemoteVersion> = r.versions.iter().filter(|v| v.version != r.version).collect();
+                        if !earlier.is_empty() {
+                            egui::CollapsingHeader::new(format!("Earlier versions online ({})", earlier.len())).show(ui, |ui| {
+                                ui.label(dim(&format!("The last {SHARE_VERSIONS} versions are kept, so an overwrite can be undone.")));
+                                for v in earlier {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("Version {} · {}", v.version, crate::projects::format_time(iso_ms(&v.updated))));
+                                        if ui.add_enabled(!self.share.busy, egui::Button::new("Restore")).on_hover_text("Bring this version back. What is here now is kept in Version history.").clicked() {
+                                            restore = Some(v.version);
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    None if !self.share.gone => {
+                        ui.label(dim("Checking the shared copy..."));
+                    }
+                    None => {}
+                }
+                ui.add_space(6.0);
+                let (label, tip) = if link.is_owner() && !self.share.gone {
+                    ("Stop sharing", "Delete the shared copy online: the links stop working. The project stays here.")
+                } else {
+                    ("Unlink this project", "Stop following the share link. The project stays here as it is.")
+                };
+                let label = if self.share.confirm_stop { format!("{}  Click again to confirm", ph::WARNING) } else { format!("{}  {label}", ph::LINK_BREAK) };
+                if ui.add_enabled(!self.share.busy, egui::Button::new(label)).on_hover_text(tip).clicked() {
+                    act = Some(if self.share.confirm_stop { "stop" } else { "confirm" });
+                }
+            });
         });
+        if modal.should_close() {
+            open = false;
+        }
         match act {
             Some("create") => self.create_share(),
             Some("copied") => self.toast("Link copied"),
@@ -737,6 +761,7 @@ impl BioCartoon {
         self.share.show &= open;
         if !self.share.show {
             self.share.confirm_stop = false;
+            crate::app::end_dialog_zoom(ctx, zoom_id);
         }
     }
 

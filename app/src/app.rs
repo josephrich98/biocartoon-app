@@ -77,6 +77,9 @@ pub struct Settings {
     pub text_size: theme::TextSize,
     /// The Icons panel on the left is open.
     pub show_icons: bool,
+    /// The rail on the right is shown, with the panel of its open tab (if any). Hiding it leaves
+    /// that tab open, so it comes back along with the rail.
+    pub show_rail: bool,
     /// Number of tile columns in the Icons panel (1 to 5).
     pub icon_columns: usize,
     /// Icon tiles show their database's badge (lower left).
@@ -152,6 +155,7 @@ impl Default for Settings {
             theme: theme::ThemeMode::System,
             text_size: theme::TextSize::Medium,
             show_icons: true,
+            show_rail: true,
             icon_columns: 3,
             tile_database: true,
             tile_colors: true,
@@ -557,8 +561,53 @@ impl UploadTarget {
 /// Screens narrower than this (in points) get the phone layout: one side panel at a time.
 const PHONE_WIDTH: f32 = 700.0;
 
-fn phone_width(ctx: &egui::Context) -> bool {
+pub(crate) fn phone_width(ctx: &egui::Context) -> bool {
     ctx.content_rect().width() < PHONE_WIDTH
+}
+
+/// Phones: a pinch while a dialog is up zooms the whole app (text and all), from the zoom it had
+/// when the dialog opened; [`end_dialog_zoom`] puts that back when it closes.
+pub(crate) fn dialog_zoom(ctx: &egui::Context, id: egui::Id) {
+    if !phone_width(ctx) {
+        return;
+    }
+    let pinch = ctx.input(|i| i.zoom_delta());
+    if pinch != 1.0 {
+        let zoom = ctx.zoom_factor();
+        let base = ctx.data_mut(|d| *d.get_temp_mut_or(id, zoom));
+        // Never zoomed out so far that the screen gets the desktop layout.
+        let min = zoom * ctx.content_rect().width() / (PHONE_WIDTH - 10.0);
+        ctx.set_zoom_factor((zoom * pinch).clamp(min.min(base), base * 2.0));
+    }
+}
+
+/// Undo [`dialog_zoom`] once its dialog has closed.
+pub(crate) fn end_dialog_zoom(ctx: &egui::Context, id: egui::Id) {
+    if let Some(base) = ctx.data_mut(|d| d.remove_temp::<f32>(id)) {
+        ctx.set_zoom_factor(base);
+    }
+}
+
+/// A dialog's content, which scrolls once it is taller or wider than the screen (going by its size
+/// the frame before), as when zoomed in on a phone. Only then: a scroll area around content that
+/// fits cuts a little off its bottom.
+pub(crate) fn dialog_body<R>(ui: &mut egui::Ui, id: egui::Id, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let max = ui.ctx().content_rect().size() - Vec2::new(32.0, 48.0);
+    let last = ui.data(|d| d.get_temp::<Vec2>(id)).unwrap_or(Vec2::ZERO);
+    let (r, size) = if last.x > max.x || last.y > max.y {
+        let out = egui::ScrollArea::both().id_salt(id).max_width(max.x).max_height(max.y).show(ui, body);
+        (out.inner, out.content_size)
+    } else {
+        let out = ui.scope(body);
+        (out.inner, out.response.rect.size())
+    };
+    ui.data_mut(|d| d.insert_temp(id, size));
+    r
+}
+
+/// The widest a dialog's content can be and still fit the screen with a margin, up to `want`.
+pub(crate) fn dialog_width(ctx: &egui::Context, want: f32) -> f32 {
+    want.min(ctx.content_rect().width() - 48.0).max(120.0)
 }
 
 /// The SVG an image holds (one an AI model drew, or an upload), sent along with AI edits so
@@ -4398,7 +4447,7 @@ impl BioCartoon {
             ui.add_enabled_ui(format.is_raster(), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Resolution (dpi)");
-                    dpi_picker(ui, dpi, egui::Id::new("picture_custom_dpi"));
+                    dpi_picker(ui, dpi, egui::Id::new("picture_custom_dpi"), false);
                 });
                 if let Some(r) = region {
                     let [w, h] = crate::export::pixel_size(r, *dpi);
@@ -4549,26 +4598,18 @@ impl BioCartoon {
         };
         let opts = &mut self.settings.export;
         let phone = phone_width(ctx);
-        // Phones: the dialog is wider than the screen, so it scrolls both ways (drag to move) and
-        // pinches to zoom, which zooms the whole app until the dialog closes.
+        // Phones: the dialog fits the screen's width and scrolls if it is too tall, and pinches to
+        // zoom, which zooms the whole app until the dialog closes.
         let zoom_id = egui::Id::new("export_base_zoom");
-        if phone {
-            let pinch = ctx.input(|i| i.zoom_delta());
-            if pinch != 1.0 {
-                let zoom = ctx.zoom_factor();
-                let base = ctx.data_mut(|d| *d.get_temp_mut_or(zoom_id, zoom));
-                // Never zoomed out so far that the screen gets the desktop layout.
-                let min = zoom * ctx.content_rect().width() / (PHONE_WIDTH - 10.0);
-                ctx.set_zoom_factor((zoom * pinch).clamp(min.min(base), base * 2.0));
-            }
-        }
+        dialog_zoom(ctx, zoom_id);
+        let width = dialog_width(ctx, 440.0);
         let units_id = egui::Id::new("export_dims_unit");
         let mut dims_unit: Unit = ctx.data(|d| d.get_temp(units_id)).unwrap_or(Unit::Px);
-        let screen = ctx.content_rect().size();
         let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
             let body = |ui: &mut egui::Ui| {
                 // Reuse the measured content width so the header and body share the same bounds.
-                ui.set_min_width(440.0);
+                ui.set_min_width(width);
+                ui.set_max_width(width);
                 ui.horizontal(|ui| {
                     ui.heading(heading);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4583,9 +4624,15 @@ impl BioCartoon {
                 ui.add_space(8.0);
                 egui::Grid::new("export_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                     ui.label("Format");
-                    ui.horizontal(|ui| {
-                        for f in ExportFormat::ALL {
-                            ui.selectable_value(&mut opts.format, f, f.label());
+                    // Phones: two rows, to fit the screen. (Rows of their own, as a grid cell
+                    // can't measure a wrapped layout.)
+                    ui.vertical(|ui| {
+                        for row in ExportFormat::ALL.chunks(if phone { 4 } else { ExportFormat::ALL.len() }) {
+                            ui.horizontal(|ui| {
+                                for &f in row {
+                                    ui.selectable_value(&mut opts.format, f, f.label());
+                                }
+                            });
                         }
                     });
                     ui.end_row();
@@ -4597,7 +4644,7 @@ impl BioCartoon {
                         let note = format!(".biocartoon format allows for sharing editable slides: {slides} and their images in one file, which anyone can open with Open file.");
                         ui.label("");
                         // Wrap within the dialog's width instead of stretching it.
-                        ui.allocate_ui(egui::vec2(360.0, 0.0), |ui| {
+                        ui.allocate_ui(egui::vec2((width - 110.0).min(360.0), 0.0), |ui| {
                             ui.add(egui::Label::new(egui::RichText::new(note).color(theme::text_dim())).wrap());
                         });
                         ui.end_row();
@@ -4606,7 +4653,12 @@ impl BioCartoon {
 
                     ui.label("Resolution (dpi)");
                     ui.add_enabled_ui(opts.format.is_raster() || deck || (opts.format == ExportFormat::Pdf && opts.pdf_raster), |ui| {
-                        ui.horizontal(|ui| dpi_picker(ui, &mut opts.dpi, egui::Id::new("export_custom_dpi")));
+                        let id = egui::Id::new("export_custom_dpi");
+                        if phone {
+                            ui.vertical(|ui| dpi_picker(ui, &mut opts.dpi, id, true));
+                        } else {
+                            ui.horizontal(|ui| dpi_picker(ui, &mut opts.dpi, id, false));
+                        }
                     });
                     ui.end_row();
 
@@ -4648,6 +4700,9 @@ impl BioCartoon {
                     if opts.format == ExportFormat::Jpg {
                         ui.label("Quality");
                         ui.horizontal(|ui| {
+                            if phone {
+                                ui.spacing_mut().slider_width = 60.0;
+                            }
                             ui.label(egui::RichText::new("Smaller").color(theme::text_dim()));
                             ui.add(egui::Slider::new(&mut opts.jpg_quality, 10..=100).suffix("%").trailing_fill(true))
                                 .on_hover_text("JPEG compression: lower quality makes a smaller file, with more visible artifacts.");
@@ -4707,17 +4762,15 @@ impl BioCartoon {
                     }
                 }
                 ui.add_space(10.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Top-aligned: in the phone's scroll area, a centred row centres itself in what is
+                // left of the scroll area, which cuts it off.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     let can = project_file || deck || !((opts.individual || opts.crop) && n_images == 0);
                     if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(Color32::WHITE)).fill(theme::accent())).clicked() { go = true; }
                     if ui.button("Cancel").clicked() { cancel = true; }
                 });
             };
-            if phone {
-                egui::ScrollArea::both().max_width(screen.x - 32.0).max_height(screen.y - 48.0).show(ui, body);
-            } else {
-                body(ui);
-            }
+            dialog_body(ui, egui::Id::new("export_body"), body);
         });
         ctx.data_mut(|d| d.insert_temp(units_id, dims_unit));
         if modal.should_close() {
@@ -4738,9 +4791,7 @@ impl BioCartoon {
             self.export_doc = None;
         }
         if !self.show_export {
-            if let Some(base) = ctx.data_mut(|d| d.remove_temp::<f32>(zoom_id)) {
-                ctx.set_zoom_factor(base);
-            }
+            end_dialog_zoom(ctx, zoom_id);
         }
         if go {
             self.pick_export_path();
@@ -5365,6 +5416,9 @@ impl BioCartoon {
             Action::SyncCatalog => self.open_catalog(),
             Action::SetRail(Some(RailTab::Text)) => self.apply(Action::ArmText(!self.placing_text), ctx),
             Action::SetRail(r) => {
+                if r.is_some() {
+                    self.settings.show_rail = true;
+                }
                 if r != Some(RailTab::Lines) {
                     self.drawing = false;
                     self.stroke.clear();
@@ -5507,7 +5561,8 @@ impl BioCartoon {
             self.phone_panels = None;
             return;
         }
-        if self.settings.show_icons && self.rail.is_some() {
+        let shown = |s: &Self| s.rail.filter(|_| s.settings.show_rail);
+        if self.settings.show_icons && shown(self).is_some() {
             // The right panel just opened beside the Icons panel: it wins.
             if self.phone_panels.is_some_and(|(icons, rail)| icons && rail.is_none()) {
                 self.settings.show_icons = false;
@@ -5515,7 +5570,7 @@ impl BioCartoon {
                 self.rail = None;
             }
         }
-        let now = (self.settings.show_icons, self.rail);
+        let now = (self.settings.show_icons, shown(self));
         if self.phone_panels.is_some_and(|(icons, rail)| (icons && !now.0) || (rail.is_some() && now.1.is_none())) {
             self.view.fit_requested = true;
         }
@@ -5599,8 +5654,8 @@ impl BioCartoon {
         if self.settings.show_icons {
             self.left_panel(ui);
         }
-        let rail = self.rail_ui(ui);
-        if self.rail.is_some() {
+        let rail = self.settings.show_rail.then(|| self.rail_ui(ui));
+        if rail.is_some() && self.rail.is_some() {
             self.right_panel(ui);
         }
         if let Some(r) = self.rail.filter(|&r| r != RailTab::Text) {
@@ -5653,12 +5708,12 @@ impl BioCartoon {
                             self.settings.show_icons = true;
                             ui.close();
                         }
-                        if ui.add_enabled(self.rail.is_none(), egui::Button::new(format!("{}  Show options menu", ph::WRENCH)))
-                            .on_hover_text("Open the panel on the right, on the tab it showed last")
+                        if ui.add_enabled(!self.settings.show_rail, egui::Button::new(format!("{}  Show options menu", ph::WRENCH)))
+                            .on_hover_text("Show the tools on the right (Edit, Text, Lines...)")
                             .on_disabled_hover_text("Options menu is already up")
                             .clicked()
                         {
-                            self.actions.push(Action::SetRail(Some(self.last_rail.unwrap_or(RailTab::Edit))));
+                            self.settings.show_rail = true;
                             ui.close();
                         }
                         ui.separator();
@@ -5739,8 +5794,9 @@ impl BioCartoon {
         egui::Panel::bottom("bottombar").exact_size(36.0).frame(frame).show_separator_line(false).show(ui, |ui| {
             let full = ui.max_rect();
             let row = |layout: egui::Layout, rect: Rect| egui::UiBuilder::new().max_rect(rect).layout(layout);
-            // On a phone the panel buttons go by short names and the page colour (also in the Page
-            // panel) is left out, so the zoom controls still fit between them.
+            // On a phone the panel buttons go by short names, and the page colour (also in the Page
+            // panel) is shown only when there is one slide: the slide pager and zoom controls are
+            // used far more, and there is no room for all three between the buttons.
             let phone = phone_width(ui.ctx());
             let left = ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), full), |ui| {
                 if ui.add(egui::Button::new(format!("{}  {}", ph::DNA, if phone { "Art" } else { "Artwork" })).selected(self.settings.show_icons)).on_hover_text("Show or hide the Artwork panel").clicked() {
@@ -5748,9 +5804,8 @@ impl BioCartoon {
                 }
             });
             let right = ui.scope_builder(row(egui::Layout::right_to_left(egui::Align::Center), full), |ui| {
-                let open = self.rail.is_some();
-                if ui.add(egui::Button::new(format!("{}  {}", ph::WRENCH, if phone { "Opt" } else { "Options" })).selected(open)).on_hover_text("Show or hide the Options panel on the right").clicked() {
-                    self.actions.push(Action::SetRail(if open { None } else { Some(self.last_rail.unwrap_or(RailTab::Edit)) }));
+                if ui.add(egui::Button::new(format!("{}  {}", ph::WRENCH, if phone { "Opt" } else { "Options" })).selected(self.settings.show_rail)).on_hover_text("Show or hide the tools on the right, for more room for the canvas").clicked() {
+                    self.settings.show_rail = !self.settings.show_rail;
                 }
                 // The pager is only worth its space once there is more than one slide.
                 if n > 1 {
@@ -5774,7 +5829,7 @@ impl BioCartoon {
             let zoom = ui.scope_builder(row(egui::Layout::left_to_right(egui::Align::Center), Rect::from_center_size(Pos2::new(x, full.center().y), Vec2::new(w, full.height()))), |ui| {
                 // The current slide's page colour, edited like the one in the Page panel (one undo
                 // step per burst of edits).
-                if !phone {
+                if !phone || n <= 1 {
                     let mut col = self.doc.background_of(self.slide());
                     if crate::color::edit_button(ui, &mut col).on_hover_text("Page color").changed() {
                         let before = (self.doc.width, self.doc.height, self.doc.unit, self.slide().background);
@@ -6048,6 +6103,8 @@ impl BioCartoon {
                     linked_line(ui, "Free and open source under the ", "GNU AGPL v3.0", "https://www.gnu.org/licenses/agpl-3.0.html");
                     linked_line(ui, "Database and CLI source code: ", "github.com/josephrich98/biocartoon", "https://github.com/josephrich98/biocartoon");
                     linked_line(ui, "App source code: ", "github.com/josephrich98/biocartoon-app", crate::GITHUB_URL);
+                    ui.add_space(10.0);
+                    linked_line_with_suffix(ui, "If BioCartoon is useful to you, you can ", "buy me a coffee", "https://buymeacoffee.com/josephrich", " ☕");
                 });
             });
             if !open { self.show_about = false; }
@@ -6529,7 +6586,7 @@ impl BioCartoon {
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, gridsteps, spell, viewspell, dictionary, textedit, equation, tableedit, placetext,
-    /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|uploads|favorites|library|contribute|addlibrary>, aiyes).
+    /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|norail|uploads|favorites|library|contribute|addlibrary>, aiyes).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -6868,6 +6925,7 @@ impl BioCartoon {
                         match &s["rail=".len()..] {
                             "icons" => self.settings.show_icons = true,
                             "noicons" => self.settings.show_icons = false,
+                            "norail" => self.settings.show_rail = false,
                             "uploads" => { self.settings.show_icons = true; self.icons.mode = IconsMode::Uploads; }
                             "contribute" => { self.settings.show_icons = true; self.open_contribute(true); }
                             "addlibrary" => { self.settings.show_icons = true; self.open_contribute(false); }
@@ -7048,13 +7106,21 @@ fn ai_fields(ui: &mut egui::Ui, provider: &mut BackendKind, model: &mut String, 
 
 /// One centered line of plain text followed by a link.
 fn linked_line(ui: &mut egui::Ui, text: &str, link: &str, url: &str) {
+    linked_line_with_suffix(ui, text, link, url, "");
+}
+
+/// [`linked_line`] with `suffix` after the link.
+fn linked_line_with_suffix(ui: &mut egui::Ui, text: &str, link: &str, url: &str, suffix: &str) {
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let w = ui.fonts_mut(|f| f.layout_no_wrap(format!("{text}{link}"), font, Color32::WHITE).size().x);
+    let w = ui.fonts_mut(|f| f.layout_no_wrap(format!("{text}{link}{suffix}"), font, Color32::WHITE).size().x);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
         ui.label(text);
         ui.hyperlink_to(link, url);
+        if !suffix.is_empty() {
+            ui.label(suffix);
+        }
     });
 }
 
@@ -7118,14 +7184,22 @@ impl eframe::App for BioCartoon {
 /// typed number ("1" on the way to "1200") only takes effect once it is in range. Leaving the
 /// box with a number below the minimum (or nothing) empties it, and the resolution goes back to
 /// the default unless a preset is chosen; one above the maximum becomes the maximum.
-fn dpi_picker(ui: &mut egui::Ui, dpi: &mut u32, id: egui::Id) {
+fn dpi_picker(ui: &mut egui::Ui, dpi: &mut u32, id: egui::Id, presets_row: bool) {
     const PRESETS: [u32; 4] = [72, 150, 300, 600];
     let range = crate::export::MIN_DPI..=crate::export::MAX_DPI;
     let mut custom: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| if PRESETS.contains(dpi) { String::new() } else { dpi.to_string() });
-    for d in PRESETS {
-        if ui.selectable_value(dpi, d, d.to_string()).clicked() {
-            custom.clear();
+    let mut presets = |ui: &mut egui::Ui| {
+        for d in PRESETS {
+            if ui.selectable_value(dpi, d, d.to_string()).clicked() {
+                custom.clear();
+            }
         }
+    };
+    // In a row of their own (in a vertical `ui`, with the custom field under them), or in `ui`'s.
+    if presets_row {
+        ui.horizontal(presets);
+    } else {
+        presets(ui);
     }
     let active = custom.parse::<u32>().ok() == Some(*dpi);
     let mut edit = egui::TextEdit::singleline(&mut custom).desired_width(64.0).hint_text("other");
