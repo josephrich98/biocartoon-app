@@ -128,6 +128,8 @@ pub struct ImageCache {
     /// Bytes of GPU memory held by the `lod:` renderings in `map`.
     lod_bytes: usize,
     lru: VecDeque<String>,
+    /// The frame each key in `lru` was last asked for in.
+    drawn: HashMap<String, u64>,
     queue: Arc<Queue>,
     /// Keys still loading that the UI asked for this frame, in request order.
     wanted: Vec<String>,
@@ -427,6 +429,7 @@ impl ImageCache {
             last_restyled: HashMap::new(),
             lod_bytes: 0,
             lru: VecDeque::new(),
+            drawn: HashMap::new(),
             queue,
             wanted: Vec::new(),
             frame: 0,
@@ -654,6 +657,7 @@ impl ImageCache {
         self.drop_lod(lod);
         if let Some(i) = self.lru.iter().position(|k| k == lod) {
             self.lru.remove(i);
+            self.drawn.remove(lod);
         }
     }
 
@@ -801,6 +805,7 @@ impl ImageCache {
             self.lru.remove(i);
         }
         self.lru.push_back(key.to_string());
+        self.drawn.insert(key.to_string(), self.frame);
     }
 
     /// Poll decoded images and create textures. Call once per frame.
@@ -847,8 +852,14 @@ impl ImageCache {
             }
         }
         // Evict the least recently used textures (keep CPU copies only for live ones).
+        // Never one drawn in the frame just finished (`reprioritize` has moved `frame` past it):
+        // it would be asked for again at once, and reloading it would hold up the rest.
         while self.lru.len() > MAX_TEXTURES {
+            if self.lru.front().and_then(|k| self.drawn.get(k)).is_some_and(|f| f + 1 >= self.frame) {
+                break;
+            }
             if let Some(old) = self.lru.pop_front() {
+                self.drawn.remove(&old);
                 if matches!(self.map.get(&old), Some(ImgState::Ready { .. })) {
                     if is_lod_key(&old) {
                         self.drop_lod(&old);

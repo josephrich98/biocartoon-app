@@ -100,13 +100,31 @@ fn has_col(conn: &Connection, col: &str) -> bool {
     conn.query_row("SELECT count(*) FROM pragma_table_info('assets') WHERE name = ?1", [col], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false)
 }
 
-/// The SQL for a row's SVG key (NULL when it has none) and for the bytes of all its files.
+/// The SQL for a row's SVG key (NULL when it has none, or when the catalog lists it as empty:
+/// a few SVGs in the bucket are 0 bytes) and for the bytes of all its files.
 fn file_cols(conn: &Connection) -> (&'static str, &'static str) {
     match (has_col(conn, "svg_key"), has_col(conn, "svg_bytes")) {
-        (true, true) => ("nullif(svg_key, '')", "coalesce(png_bytes, 0) + coalesce(svg_bytes, 0)"),
+        (true, true) => ("CASE WHEN svg_bytes = 0 THEN NULL ELSE nullif(svg_key, '') END", "coalesce(png_bytes, 0) + coalesce(svg_bytes, 0)"),
         (true, false) => ("nullif(svg_key, '')", "coalesce(png_bytes, 0)"),
         _ => ("NULL", "coalesce(png_bytes, 0)"),
     }
+}
+
+/// The rows a pack downloads: those with an image in the bucket. The user's own uploads
+/// (`png_local`) are only on this computer, which is where they are kept already.
+fn pack_rows(conn: &Connection) -> &'static str {
+    if has_col(conn, "png_local") {
+        "png_key IS NOT NULL AND png_key != '' AND png_local IS NULL"
+    } else {
+        "png_key IS NOT NULL AND png_key != ''"
+    }
+}
+
+/// Whether fetched bytes are an image (an error page served with a 200 is not). Some "PNGs" in
+/// the bucket are JPEGs, which the app draws all the same.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_image(b: &[u8]) -> bool {
+    image::guess_format(b).is_ok() || crate::assets::is_svg(b)
 }
 
 /// The collection a row belongs to: uploads accepted to BioCartoon count as BioCartoon (see
@@ -123,8 +141,9 @@ fn collections(conn: &Connection) -> Result<Vec<Collection>, String> {
     let mut st = conn
         .prepare(&format!(
             "SELECT {} AS src, max(source_name), count(*), coalesce(sum({bytes}), 0), group_concat(DISTINCT license) \
-             FROM assets WHERE png_key IS NOT NULL AND png_key != '' GROUP BY src",
-            source_sql()
+             FROM assets WHERE {} GROUP BY src",
+            source_sql(),
+            pack_rows(conn)
         ))
         .map_err(|e| e.to_string())?;
     let rows = st
@@ -180,7 +199,7 @@ fn have_file(dir: &Path, key: &str) -> bool {
 fn items(conn: &Connection, sources: &[String]) -> Result<Vec<Item>, String> {
     let (svg, bytes) = file_cols(conn);
     let mut st = conn
-        .prepare(&format!("SELECT {} AS src, png_key, {svg}, {bytes} FROM assets WHERE png_key IS NOT NULL AND png_key != '' ORDER BY src, png_key", source_sql()))
+        .prepare(&format!("SELECT {} AS src, png_key, {svg}, {bytes} FROM assets WHERE {} ORDER BY src, png_key", source_sql(), pack_rows(conn)))
         .map_err(|e| e.to_string())?;
     let rows = st
         .query_map([], |r| Ok(Item { source: r.get(0)?, key: r.get(1)?, svg: r.get(2)?, bytes: r.get::<_, i64>(3)? as u64 }))
@@ -273,8 +292,7 @@ pub(crate) fn ensure(base: &str, dir: &Path, key: &str, cancel: &AtomicBool) -> 
         res = crate::assets::fetch(&req);
     }
     let b = res?;
-    // An error page served with a 200 is not the file.
-    let ok = if key.ends_with(".json") { std::str::from_utf8(&b).is_ok() } else { b.starts_with(b"\x89PNG") || crate::assets::is_svg(&b) };
+    let ok = if key.ends_with(".json") { std::str::from_utf8(&b).is_ok() } else { is_image(&b) };
     if !ok {
         return Err(format!("{key}: unexpected response"));
     }
@@ -857,7 +875,7 @@ mod web {
             let (url, png) = (format!("{}/{}", s.base, s.items[i].key), s.items[i].png);
             let st = state.clone();
             ehttp::fetch(ehttp::Request::get(&url), move |res| {
-                let bytes = res.ok().filter(|r| r.ok).map(|r| r.bytes).filter(|b| if png { b.starts_with(b"\x89PNG") } else { crate::assets::is_svg(b) });
+                let bytes = res.ok().filter(|r| r.ok).map(|r| r.bytes).filter(|b| if png { image::guess_format(b).is_ok() } else { crate::assets::is_svg(b) });
                 {
                     let mut s = st.lock().unwrap();
                     s.in_flight -= 1;
@@ -1359,6 +1377,25 @@ mod tests {
         assert!(have_file(&assets, "bioart/cell.png") && have_file(&assets, "bioart/cell.svg"));
         assert!(!have_file(&assets, "templates/t/img-0.png") && !have_file(&assets, &row.json_key));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pack leaves out what the bucket can't give it: SVGs the catalog lists as empty, and the
+    /// user's own uploads (only on this computer). JPEGs stored under a `.png` key are images.
+    #[test]
+    fn pack_skips_empty_svgs_and_local_uploads() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE assets (id TEXT, source TEXT, source_name TEXT, author TEXT, license TEXT, png_key TEXT, png_local TEXT, png_bytes INTEGER, svg_key TEXT, svg_bytes INTEGER);
+             INSERT INTO assets VALUES ('a', 'bioart', '', '', '', 'bioart/a.png', NULL, 10, 'bioart/a.svg', 5);
+             INSERT INTO assets VALUES ('b', 'bioart', '', '', '', 'bioart/b.png', NULL, 10, 'bioart/b.svg', 0);
+             INSERT INTO assets VALUES ('u', 'user', '', '', '', 'user/u.png', '/x/user_generated/u.png', NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let got: Vec<(String, Option<String>)> = items(&conn, &[]).unwrap().into_iter().map(|it| (it.key, it.svg)).collect();
+        assert_eq!(got, vec![("bioart/a.png".into(), Some("bioart/a.svg".into())), ("bioart/b.png".into(), None)]);
+        let user = collections(&conn).unwrap().into_iter().find(|c| c.source == "user").unwrap();
+        assert_eq!(user.count, 0);
+        assert!(is_image(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00") && is_image(b"\x89PNG\r\n\x1a\n") && !is_image(b"<!doctype html><html>"));
     }
 
     /// Export (`request_for`) and the canvas read the offline copy instead of the network.

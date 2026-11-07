@@ -1007,11 +1007,16 @@ impl BioCartoon {
         let (per_row, size) = self.icon_grid(ui);
         // Reveal thumbnails in order: hold back each one until the visible tiles before it are in.
         let mut hold = false;
+        // Only tiles on screen, or within a couple of rows of it, ask for their images: asking for
+        // every loaded result each frame overflows the texture cache once a few pages are loaded,
+        // and the evicted tiles at the top then jump the queue ahead of the visible ones.
+        let near_rect = ui.clip_rect().expand2(Vec2::new(0.0, 2.0 * (size + 6.0)));
         egui::Grid::new("results").spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, tile) in tiles.into_iter().enumerate() {
+                let near = near_rect.intersects(Rect::from_min_size(ui.cursor().min, Vec2::splat(size)));
                 let row = match tile {
                     Tile::Template(t) => {
-                        self.template_tile(ui, size, t);
+                        self.template_tile(ui, size, t, near);
                         if (i + 1) % per_row == 0 {
                             ui.end_row();
                         }
@@ -1029,7 +1034,7 @@ impl BioCartoon {
                 };
                 let (fingerprints, submitted) = (&mut self.fingerprints, &self.settings.submitted);
                 let mut unsent = || !crate::app::row_submitted(fingerprints, submitted, row);
-                let (r, act) = asset_tile(ui, size, row, &mut self.images, hold, colors, marks, &mut unsent);
+                let (r, act) = asset_tile(ui, size, row, &mut self.images, hold, near, colors, marks, &mut unsent);
                 match act {
                     Some(TileAct::Remove) => self.actions.push(Action::RemoveUserAsset(row.clone())),
                     Some(TileAct::RequestRemoval) => self.actions.push(Action::OpenRemovalRequest(row.clone())),
@@ -1224,8 +1229,10 @@ impl BioCartoon {
 
     /// One template's thumbnail in the results grid; clicking it adds its slide, and clicking its
     /// star stars it (makes it a favorite), as on an icon.
-    fn template_tile(&mut self, ui: &mut egui::Ui, size: f32, row: &TemplateRow) {
-        let state = self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref());
+    /// `near` false (well off screen) draws it as loading without asking for its image.
+    fn template_tile(&mut self, ui: &mut egui::Ui, size: f32, row: &TemplateRow, near: bool) {
+        let loading = ImgState::Loading;
+        let state = if near { self.images.asset(&row.meta.thumb_key, row.thumb_local.as_deref()) } else { &loading };
         let (abbr, col, _) = theme::source_badge(row.source());
         let r = tile(ui, size, &row.meta.title, state, self.settings.tile_database.then_some((abbr, col, "Template")));
         let fav = self.settings.favorites.contains(&row.meta.id);
@@ -2683,7 +2690,8 @@ struct TileMarks {
     downloaded: bool,
 }
 
-/// A catalog asset's tile. `hold` draws it as still loading even if its image is ready. `colors`
+/// A catalog asset's tile. `hold` draws it as still loading even if its image is ready, and `near`
+/// false (well off screen) draws it so without asking for its image at all. `colors`
 /// is how many colours it comes in (the colours are picked in Edit once it is placed); `marks`
 /// what to show on it. Clicking the star stars it, which makes it a favorite. Right-click
 /// (or a long press) opens its info with Favorite, Download, Copy name and Copy credit.
@@ -2699,10 +2707,10 @@ fn ai_label(used: Option<bool>) -> &'static str {
     }
 }
 
-fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, images: &mut crate::assets::ImageCache, hold: bool, colors: usize, marks: TileMarks, unsent: &mut dyn FnMut() -> bool) -> (egui::Response, Option<TileAct>) {
+fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, images: &mut crate::assets::ImageCache, hold: bool, near: bool, colors: usize, marks: TileMarks, unsent: &mut dyn FnMut() -> bool) -> (egui::Response, Option<TileAct>) {
     let fav = marks.fav;
-    let state = images.tile(row);
     let loading = ImgState::Loading;
+    let state = if near { images.tile(row) } else { &loading };
     let state = if hold { &loading } else { state };
     let (abbr, col, name) = theme::source_badge(theme::asset_source(row));
     let r = tile(ui, size, &row.title, state, marks.database.then_some((abbr, col, name)));
