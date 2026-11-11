@@ -180,6 +180,8 @@ impl BioCartoon {
                     // The results' view grew by what the filters gave up; scroll back by as much.
                     scroll = scroll.vertical_scroll_offset((offset - (h - header_h)).max(0.0));
                 }
+                // Read first: the scroll area uses up whatever wheel input it acts on.
+                let wheel = ui.input(|i| i.smooth_scroll_delta.y);
                 let out = scroll.show(ui, |ui| {
                     self.icons_panel(ui);
                     if to == Some(egui::Align::Max) {
@@ -187,7 +189,10 @@ impl BioCartoon {
                     }
                 });
                 (scrolled, view_h) = (out.state.offset.y, out.inner_rect.height());
-                self.close_filters_on_scroll(ui.ctx(), open_filters, header_h, scrolled);
+                let over_results = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| out.inner_rect.contains(p));
+                let wheel = if over_results { wheel } else { 0.0 };
+                let dragging = ui.ctx().dragged_id().is_some() || out.state.velocity().y != 0.0;
+                self.close_filters_on_scroll(ui.ctx(), open_filters, header_h, scrolled, wheel, dragging);
             })
             .response
             .rect
@@ -195,22 +200,25 @@ impl BioCartoon {
         self.back_to_top(ui.ctx(), panel.inner, scrolled > view_h);
     }
 
-    /// Scrolling the results on down past the open filters (`filters`, where they are) closes them
-    /// to their one-line summary, as they're done with; the results keep still as the filters
-    /// shrink (see `filters_closed`). Not while a filter is being edited (a dropdown open, or a field typed in), and
-    /// scrolling back up doesn't reopen them.
-    fn close_filters_on_scroll(&mut self, ctx: &egui::Context, filters: Option<Rect>, header_h: f32, offset: f32) {
+    /// Scrolling the results up or down past the open filters (`filters`, where they are) closes
+    /// them to their one-line summary, as they're done with; the results keep still as the filters
+    /// shrink (see `filters_closed`). Not while a filter is being edited (a dropdown open, or a
+    /// field typed in). Only the user's scrolling counts (`wheel`, the wheel input over the results,
+    /// or `dragging` them or their scrollbar): the offset also jumps when new results are shorter.
+    fn close_filters_on_scroll(&mut self, ctx: &egui::Context, filters: Option<Rect>, header_h: f32, offset: f32, wheel: f32, dragging: bool) {
         const DISTANCE: f32 = 24.0;
         let Some(filters) = filters else {
-            self.icons.filters_scroll_from = None;
+            self.icons.filters_scroll = None;
             return;
         };
         let editing = ctx.any_popup_open()
             || ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id)).is_some_and(|r| filters.intersects(r.rect));
-        // The offset the filters last held still at: scrolling up (or back to it) moves it along.
-        let from = self.icons.filters_scroll_from.map_or(offset, |f| f.min(offset));
-        if editing || offset - from < DISTANCE {
-            self.icons.filters_scroll_from = Some(if editing { offset } else { from });
+        let (last, travel) = self.icons.filters_scroll.unwrap_or((offset, 0.0));
+        // The wheel counts even at the end of the list, where the offset can't move.
+        let step = if wheel != 0.0 { -wheel } else if dragging { offset - last } else { 0.0 };
+        let travel = if editing { 0.0 } else { scroll_travel(travel, step) };
+        if travel.abs() < DISTANCE {
+            self.icons.filters_scroll = Some((offset, travel));
             return;
         }
         if self.icons.mode == IconsMode::Search {
@@ -218,7 +226,7 @@ impl BioCartoon {
         } else {
             self.icons.mine_show_filters = false;
         }
-        self.icons.filters_scroll_from = None;
+        self.icons.filters_scroll = None;
         self.icons.filters_closed = Some((header_h, offset));
         ctx.request_repaint();
     }
@@ -347,6 +355,14 @@ impl BioCartoon {
         dbs
     }
 
+    /// Whether the current menu shows icons, templates or both (its filter's Artwork type).
+    fn include(&self) -> Include {
+        match self.icons.mode {
+            IconsMode::Favorites | IconsMode::Library => self.icons.mine_filter.artwork,
+            _ => self.icons.filter.artwork,
+        }
+    }
+
     /// The saved templates a browse or search shows next to the icons, for the current menu.
     fn matching_templates(&self) -> Vec<TemplateRow> {
         self.templates_matching(false)
@@ -355,7 +371,7 @@ impl BioCartoon {
     /// `matching_templates`, but with `any_source` whichever databases are picked (for the
     /// database filter's count, which like the icons' counts leaves its own pick out).
     fn templates_matching(&self, any_source: bool) -> Vec<TemplateRow> {
-        if !self.icons.include.templates() {
+        if !self.include().templates() {
             return Vec::new();
         }
         let rows = self.template_rows.iter();
@@ -534,9 +550,17 @@ impl BioCartoon {
             // The second column takes what the labels leave; any wider and the grid would push the
             // panel out (it grows to fit), a little more each frame.
             let font = egui::TextStyle::Body.resolve(ui.style());
-            let labels: &[&str] = if all { &["Database", "Author", "Category", "Subcategory", "Database category", "License", "File type", "Tags"] } else { &["Category", "Subcategory", "File type"] };
+            let labels: &[&str] = if all { &["Database", "Author", "Category", "Subcategory", "Database category", "License", "File type", "Tags", "Artwork type"] } else { &["Category", "Subcategory", "File type", "Artwork type"] };
             let label_w = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), Color32::WHITE).size().x).fold(0.0, f32::max);
             let w = (ui.available_width() - label_w - 8.0).max(60.0);
+            // Rows are as tall as a dropdown (measured last frame), so each label is level with its
+            // control: the grid centers a cell on its row's height as it began, the interact height.
+            let row_id = egui::Id::new("filters_row_height");
+            let known: Option<f32> = ui.data(|d| d.get_temp(row_id));
+            let guess = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body) + 2.0 * ui.spacing().button_padding.y);
+            let mut measured = known.unwrap_or(guess);
+            ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = measured;
             egui::Grid::new("search_filters").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 if all {
                     ui.label("Database");
@@ -577,6 +601,14 @@ impl BioCartoon {
                     ui.add(egui::TextEdit::singleline(&mut f.tags).hint_text("Any (commas for several)").desired_width(w));
                     ui.end_row();
                 }
+                ui.label("Artwork type").on_hover_text("Icons, templates, or both (artwork_type:icons or artwork_type:templates in the search box)");
+                let combo = egui::ComboBox::from_id_salt("filter_artwork").width(w).selected_text(f.artwork.label()).show_ui(ui, |ui| {
+                    for inc in Include::ALL {
+                        ui.selectable_value(&mut f.artwork, inc, inc.label());
+                    }
+                });
+                measured = combo.response.rect.height();
+                ui.end_row();
                 // Favorites' own filters are all favorites already.
                 if !mine {
                     // Outlined even when off so they read as buttons; a narrow panel wraps the second.
@@ -625,6 +657,11 @@ impl BioCartoon {
                     ui.end_row();
                 }
             });
+            });
+            if (measured - known.unwrap_or(guess)).abs() > 0.5 {
+                ui.data_mut(|d| d.insert_temp(row_id, measured));
+                ui.ctx().request_repaint();
+            }
             if f.active() > 0 {
                 ui.add_space(2.0);
                 if ui.small_button(format!("{}  Clear filters", ph::FUNNEL_X)).clicked() {
@@ -664,6 +701,9 @@ impl BioCartoon {
         if !tags.is_empty() {
             parts.push(format!("tagged {}", tags.join(", ")));
         }
+        if f.artwork != Include::Both {
+            parts.push(f.artwork.label().into());
+        }
         if f.favorites {
             parts.push("Favorites".into());
         }
@@ -677,6 +717,116 @@ impl BioCartoon {
     fn icon_grid(&self, ui: &egui::Ui) -> (usize, f32) {
         let cols = self.settings.icon_columns.clamp(1, 5);
         (cols, ((ui.available_width() - 6.0 * (cols - 1) as f32) / cols as f32).floor().max(32.0))
+    }
+
+    /// "Sort [Popular]", for the row under the search box and for Favorites' and Your library's.
+    /// Returns the dropdown's height, for [`control_row`].
+    fn sort_combo(&mut self, ui: &mut egui::Ui) -> f32 {
+        ui.label(egui::RichText::new("Sort").small().color(theme::text_dim()));
+        let (sort, options): (&mut IconSort, &[IconSort]) = if self.icons.mode == IconsMode::Search {
+            // Relevance only means something once a query is typed.
+            let options: &[IconSort] = if self.icons.query.trim().is_empty() { &IconSort::SEARCH[1..] } else { &IconSort::SEARCH };
+            (&mut self.settings.search_sort, options)
+        } else {
+            (&mut self.settings.icon_sort, &IconSort::ALL)
+        };
+        let before = *sort;
+        let height = egui::ComboBox::from_id_salt("icon_sort")
+            .selected_text(before.label())
+            .show_ui(ui, |ui| {
+                for &s in options {
+                    ui.selectable_value(sort, s, s.label());
+                }
+            })
+            .response
+            .rect
+            .height();
+        if *sort != before {
+            self.icons.sort_picked = self.icons.mode == IconsMode::Search;
+            self.reload_results();
+        }
+        height
+    }
+
+    /// Above the results: Sort, and a labeled Filters button (the funnel in the search box opens the
+    /// same filters, and stays in view while the results scroll).
+    fn search_controls(&mut self, ui: &mut egui::Ui) {
+        control_row(ui, "search_controls", |ui| {
+            let height = self.sort_combo(ui);
+            ui.add_space(6.0);
+            let n = self.icons.filter.active();
+            let open = self.icons.show_filters;
+            let text = if n > 0 { format!("{}  Filters  {n}", ph::FUNNEL) } else { format!("{}  Filters", ph::FUNNEL) };
+            let color = if n > 0 { theme::accent() } else { theme::text() };
+            let b = egui::Button::new(egui::RichText::new(text).color(color)).selected(open).stroke(Stroke::new(1.0, theme::border())).corner_radius(6);
+            let tip = if open { "Hide the filters" } else { "Filter by database, author, category, license, tags or artwork type" };
+            if ui.add(b).on_hover_text(tip).clicked() {
+                self.icons.show_filters = !open;
+            }
+            height
+        });
+    }
+
+    /// Above the results, when the typed words are (part of) the name of an author, database,
+    /// category or subcategory: a button that searches that field for it (`author:"Jane Doe"`),
+    /// since plain words don't look in those.
+    fn search_suggestions(&mut self, ui: &mut egui::Ui) {
+        let q = self.icons.query.trim().to_string();
+        // Not on the first couple of letters: only once a whole word is typed (a space after
+        // it) or the word reaches 5 letters.
+        let word_done = self.icons.query.trim_start().contains(char::is_whitespace);
+        if self.icons.mode != IconsMode::Search || q.is_empty() || (!word_done && q.chars().count() < 5) || q.contains(':') || syntax::parse(&q).is_some() {
+            return;
+        }
+        let ql = q.to_lowercase();
+        // A word of the name starts with what was typed ("cell" finds "Cell types" and "Cells").
+        let word_prefix = |name: &str| name.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|w| !w.is_empty() && w.starts_with(&ql));
+        let mut chips: Vec<(&str, String)> = Vec::new();
+        let add = |field: &'static str, name: &str, chips: &mut Vec<(&'static str, String)>| {
+            let name = name.replace('"', "");
+            if !name.trim().is_empty() && !chips.iter().any(|(f, n)| *f == field && n.eq_ignore_ascii_case(&name)) {
+                chips.push((field, name));
+            }
+        };
+        // Authors: the catalog's, that still hold the typed words, then the templates'.
+        for (a, _) in self.icons.authors.iter().filter(|(a, _)| a.to_lowercase().contains(&ql)) {
+            add("author", a, &mut chips);
+        }
+        let mut template_authors: Vec<&str> = self.template_rows.iter().map(|r| r.meta.author.as_str()).filter(|a| a.to_lowercase().contains(&ql)).collect();
+        template_authors.sort_unstable();
+        template_authors.dedup();
+        for a in template_authors.into_iter().take(3) {
+            add("author", a, &mut chips);
+        }
+        for (_, _, name) in self.databases().iter().filter(|(_, _, n)| word_prefix(n)).take(2) {
+            add("database", name, &mut chips);
+        }
+        for (cat, subs) in crate::taxonomy::TAXONOMY {
+            if word_prefix(cat) {
+                add("category", cat, &mut chips);
+            }
+            for sub in subs.iter().filter(|s| word_prefix(s)).take(2) {
+                add("subcategory", sub, &mut chips);
+            }
+        }
+        chips.truncate(6);
+        if chips.is_empty() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Search by").small().color(theme::text_dim()));
+            for (field, name) in chips {
+                let term = format!("{field}:\"{name}\"");
+                let cap = field[..1].to_uppercase() + &field[1..];
+                let b = egui::Button::new(egui::RichText::new(format!("{cap}: {name}")).size(11.0)).stroke(Stroke::new(1.0, theme::border())).corner_radius(10);
+                if ui.add(b).on_hover_text(format!("Search {term}")).clicked() {
+                    self.icons.query = term;
+                    // Search now, not after the pause.
+                    self.icons.typed_at = f64::NEG_INFINITY;
+                }
+            }
+        });
+        ui.add_space(2.0);
     }
 
     fn search_box(&mut self, ui: &mut egui::Ui) {
@@ -693,7 +843,7 @@ impl BioCartoon {
                         0 => (ph::FUNNEL.to_string(), if self.icons.show_filters { theme::text() } else { theme::text_dim() }),
                         n => (format!("{} {n}", ph::FUNNEL), theme::accent()),
                     };
-                    let tip = if self.icons.show_filters { "Hide the filters" } else { "Filter by database, author, category, license or tags" };
+                    let tip = if self.icons.show_filters { "Hide the filters" } else { "Filter by database, author, category, license, tags or artwork type" };
                     if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
                         self.icons.show_filters = !self.icons.show_filters;
                     }
@@ -736,7 +886,7 @@ impl BioCartoon {
                     let tip = match (self.icons.mine_show_filters, &self.icons.mode) {
                         (true, _) => "Hide the filters",
                         (false, IconsMode::Library) => "Filter by category or file type",
-                        (false, _) => "Filter by database, author, category, license or tags",
+                        (false, _) => "Filter by database, author, category, license, tags or artwork type",
                     };
                     if ui.add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false)).on_hover_text(tip).clicked() {
                         self.icons.mine_show_filters = !self.icons.mine_show_filters;
@@ -767,10 +917,16 @@ impl BioCartoon {
             self.filters_panel(ui, false);
         } else if self.icons.filter.active() > 0 {
             let summary = self.filter_summary(false);
-            let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
-            if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                self.icons.show_filters = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
+                if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.icons.show_filters = true;
+                }
+                let clear = egui::Label::new(egui::RichText::new("Clear filters").small().underline().color(theme::text_dim())).sense(Sense::click());
+                if ui.add(clear).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.icons.filter = Default::default();
+                }
+            });
         }
     }
 
@@ -780,10 +936,16 @@ impl BioCartoon {
             self.filters_panel(ui, true);
         } else if self.icons.mine_filter.active() > 0 {
             let summary = self.filter_summary(true);
-            let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
-            if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                self.icons.mine_show_filters = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
+                if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.icons.mine_show_filters = true;
+                }
+                let clear = egui::Label::new(egui::RichText::new("Clear filters").small().underline().color(theme::text_dim())).sense(Sense::click());
+                if ui.add(clear).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.icons.mine_filter = Default::default();
+                }
+            });
         }
     }
 
@@ -952,34 +1114,16 @@ impl BioCartoon {
         if self.icons.loading && self.icons.results.is_empty() {
             ui.label(egui::RichText::new("Searching...").color(theme::text_dim()));
         }
+        // The suggestions, Sort and the Filters button scroll away with the results; the one-line
+        // summary of the set filters above them stays.
+        if self.icons.mode == IconsMode::Search {
+            self.search_suggestions(ui);
+            self.search_controls(ui);
+        } else {
+            control_row(ui, "sort_controls", |ui| self.sort_combo(ui));
+        }
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Sort").small().color(theme::text_dim()));
-            let (sort, options): (&mut IconSort, &[IconSort]) = if self.icons.mode == IconsMode::Search {
-                // Relevance only means something once a query is typed.
-                let options: &[IconSort] = if self.icons.query.trim().is_empty() { &IconSort::SEARCH[1..] } else { &IconSort::SEARCH };
-                (&mut self.settings.search_sort, options)
-            } else {
-                (&mut self.settings.icon_sort, &IconSort::ALL)
-            };
-            let before = *sort;
-            egui::ComboBox::from_id_salt("icon_sort").selected_text(before.label()).show_ui(ui, |ui| {
-                for &s in options {
-                    ui.selectable_value(sort, s, s.label());
-                }
-            });
-            if *sort != before {
-                self.icons.sort_picked = self.icons.mode == IconsMode::Search;
-                self.reload_results();
-            }
-            ui.label(egui::RichText::new("Include").small().color(theme::text_dim()));
-            egui::ComboBox::from_id_salt("icon_include").selected_text(self.icons.include.label()).show_ui(ui, |ui| {
-                for inc in Include::ALL {
-                    ui.selectable_value(&mut self.icons.include, inc, inc.label());
-                }
-            });
-        });
-        ui.horizontal(|ui| {
-            if let Some(n) = shown_total.filter(|_| self.icons.include.icons() && !(self.icons.loading && self.icons.results.is_empty())) {
+            if let Some(n) = shown_total.filter(|_| self.include().icons() && !(self.icons.loading && self.icons.results.is_empty())) {
                 let text = format!("{} {}", thousands(n), if n == 1 { "icon" } else { "icons" });
                 ui.label(egui::RichText::new(text).small().color(theme::text_dim()));
             }
@@ -987,7 +1131,7 @@ impl BioCartoon {
                 ui.label(egui::RichText::new(format!("{} {}", thousands(templates.len() as i64), if templates.len() == 1 { "template" } else { "templates" })).small().color(theme::text_dim()));
             }
         });
-        let icons = self.icons.include.icons();
+        let icons = self.include().icons();
         if !icons && templates.is_empty() {
             ui.label(egui::RichText::new("No templates here").color(theme::text_dim()));
             return;
@@ -2373,6 +2517,11 @@ impl BioCartoon {
 // ---------- widgets ----------
 
 /// A full-width on/off row: highlighted while on, with its icon crossed out while off.
+/// How far a scroll has gone in one direction after a `step` more: turning back starts over.
+fn scroll_travel(travel: f32, step: f32) -> f32 {
+    if step * travel < 0.0 { step } else { travel + step }
+}
+
 fn toggle_row(ui: &mut egui::Ui, icon: &str, label: &str, on: bool) -> egui::Response {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), font.size + 18.0), Sense::click());
@@ -3285,6 +3434,26 @@ fn indent(text: &mut String, more: bool) {
         .join("\n");
 }
 
+/// A row of a small label, a dropdown and the like, with the label level with the dropdown's
+/// middle: `add` returns the dropdown's height, which the row is given on the next frame (a
+/// widget is centered on the row's height as it was when the row began).
+fn control_row(ui: &mut egui::Ui, key: &str, add: impl FnOnce(&mut egui::Ui) -> f32) {
+    let id = egui::Id::new(("control_row", key));
+    let known: Option<f32> = ui.data(|d| d.get_temp(id));
+    let guess = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body) + 2.0 * ui.spacing().button_padding.y);
+    let used = known.unwrap_or(guess);
+    let mut measured = used;
+    // (`horizontal` centers on the interact height, so that is what gives the row its height.)
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = used;
+        ui.horizontal(|ui| measured = add(ui));
+    });
+    if (measured - used).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(id, measured));
+        ui.ctx().request_repaint();
+    }
+}
+
 /// One of the filters, for counting a filter's choices under all the others (see [`local_facets`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Dim {
@@ -3316,8 +3485,9 @@ fn search_help(ui: &mut egui::Ui) {
             code(ui, "(mouse OR rat) AND file_type:svg", "Mouse or rat icons with a vector version");
             code(ui, "author:\"Jane Doe\"", "Quotes keep words together");
             code(ui, "neuron NOT database:servier", "Neurons from any database but Servier");
+            code(ui, "artwork_type:templates", "Only templates (or icons)");
             ui.add_space(4.0);
-            ui.label(dim("Fields: database, author, category, subcategory, database_category, license, file_type, tags, id. \
+            ui.label(dim("Fields: database, author, category, subcategory, database_category, license, file_type, artwork_type, tags, id. \
     Combine with AND, OR, NOT (in capitals) and parentheses; words side by side must all match."));
         });
     });
@@ -3351,6 +3521,7 @@ fn template_match(r: &TemplateRow, q: &str) -> bool {
         Field::Category | Field::Subcategory | Field::DatabaseCategory => contains(&m.category, v),
         Field::License => contains(&m.license, v),
         Field::FileType => false,
+        Field::ArtworkType => syntax::artwork_type_matches(v, false),
         Field::Tags => m.tags.iter().any(|t| contains(t, v)),
         Field::Id => m.id.eq_ignore_ascii_case(v),
     })
@@ -3367,6 +3538,7 @@ fn local_match(row: &AssetRow, q: &str, f: &SearchFilter, skip: Option<Dim>) -> 
         Field::DatabaseCategory => contains(&row.category, v),
         Field::License => contains(&row.license, v),
         Field::FileType => syntax::file_type_matches(v, row.svg_key.is_some()),
+        Field::ArtworkType => syntax::artwork_type_matches(v, true),
         Field::Tags => row.tags.iter().any(|t| contains(t, v)),
         Field::Id => row.id.eq_ignore_ascii_case(v),
     });
@@ -3791,6 +3963,15 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_travel_adds_up_one_way_and_restarts_on_turning_back() {
+        assert_eq!(scroll_travel(10.0, 5.0), 15.0);
+        assert_eq!(scroll_travel(-10.0, -5.0), -15.0);
+        assert_eq!(scroll_travel(20.0, -3.0), -3.0);
+        assert_eq!(scroll_travel(-20.0, 3.0), 3.0);
+        assert_eq!(scroll_travel(7.0, 0.0), 7.0);
+    }
 
     fn fav(id: &str, title: &str, source: &str, svg: bool, taxa: Vec<crate::taxonomy::Taxon>, tags: &[&str]) -> AssetRow {
         AssetRow {

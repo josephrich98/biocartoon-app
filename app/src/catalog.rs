@@ -29,6 +29,8 @@ pub enum Req {
     Categories { source: String },
     /// The search filters' choices that still find icons under `filter` (see [`Worker::facets`]).
     Facets { query: String, filter: Filter },
+    /// Authors with this in their name, and how many icons each has.
+    Authors { part: String },
     Sources,
     /// Style presets of the asset with this id.
     Variants { id: String },
@@ -59,6 +61,7 @@ pub enum Resp {
     Categories { req_id: u64, source: String, cats: Vec<CategoryInfo> },
     MyStars { req_id: u64, ids: Vec<String> },
     Facets { req_id: u64, facets: Facets },
+    Authors { req_id: u64, authors: Vec<(String, i64)> },
     Sources { req_id: u64, sources: Vec<SourceInfo> },
     Variants { req_id: u64, rows: Vec<AssetRow> },
     Lookup { req_id: u64, rows: Vec<AssetRow> },
@@ -159,6 +162,10 @@ fn handle(w: &Worker, req_id: u64, req: Req) -> Resp {
         },
         Req::Facets { query, filter } => match w.facets(&query, &filter) {
             Ok(facets) => Resp::Facets { req_id, facets },
+            Err(e) => err(e),
+        },
+        Req::Authors { part } => match w.authors_like(&part, 3) {
+            Ok(authors) => Resp::Authors { req_id, authors },
             Err(e) => err(e),
         },
         Req::Sources => match w.sources() {

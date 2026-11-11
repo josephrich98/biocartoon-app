@@ -79,7 +79,27 @@ fn err(p: &Path, e: impl std::fmt::Display) -> String {
 
 /// FNV-1a: stable across builds, unlike `DefaultHasher`.
 fn hash(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+    hash_bytes(s.as_bytes())
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ *b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+/// The app's own copy of the image at `path`, so it still shows after the original is moved or
+/// deleted: `<app_dir>/uploads/<hash of its contents>/<its name>`, one copy per distinct picture.
+/// A file already in the app's folder is its own copy.
+pub fn keep_image(path: &Path, app_dir: &Path) -> Result<PathBuf, String> {
+    if path.starts_with(app_dir) {
+        return Ok(path.to_path_buf());
+    }
+    let name = path.file_name().ok_or_else(|| format!("bad image name {}", path.display()))?;
+    let bytes = storage::read(path).map_err(|e| err(path, e))?;
+    let kept = app_dir.join("uploads").join(format!("{:016x}", hash_bytes(&bytes))).join(name);
+    if !storage::exists(&kept) {
+        write_atomic(&kept, &bytes)?;
+    }
+    Ok(kept)
 }
 
 /// Atomic on the desktop (temp file + rename), so a crash never leaves a half-written document.
@@ -263,6 +283,29 @@ impl Store {
         let mut doc: Document = crate::doc::from_json(&s).map_err(|e| err(&p, e))?;
         doc.upgrade();
         Ok(doc)
+    }
+
+    /// Give every project's images that are still elsewhere on this computer a copy in the app's
+    /// folder (see [`keep_image`]); an image whose file is missing is left for when it returns.
+    /// Not an edit: "last modified" stays and no version is added.
+    pub fn keep_images(&self, app_dir: &Path) {
+        for id in storage::subdirs(&self.root) {
+            let Ok(mut doc) = self.load(&id) else { continue };
+            let mut changed = false;
+            for it in doc.slides.iter_mut().flat_map(|s| s.items.iter_mut()) {
+                let ItemKind::Image { source: ImageSource::File { path, .. }, .. } = &mut it.kind else { continue };
+                if let Ok(kept) = keep_image(Path::new(path.as_str()), app_dir) {
+                    let kept = kept.display().to_string();
+                    changed |= kept != *path;
+                    *path = kept;
+                }
+            }
+            if changed {
+                if let Err(e) = to_json(&doc).and_then(|json| write_atomic(&self.doc_path(&id), json.as_bytes())) {
+                    log::warn!("keep images of {id}: {e}");
+                }
+            }
+        }
     }
 
     /// Create a project holding `doc` (with a first version).
@@ -522,6 +565,42 @@ mod tests {
         assert_eq!(store.list().len(), 2);
         store.delete(&copy.id).unwrap();
         assert_eq!(store.list().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Uploads and the projects using them keep showing once the original file is gone.
+    #[test]
+    fn images_survive_their_originals() {
+        use crate::doc::{Item, ItemKind};
+        let root = std::env::temp_dir().join(format!("biocartoon-keep-test-{}", new_id()));
+        let app_dir = root.join("app");
+        let (pic, twin) = (root.join("Downloads/a.png"), root.join("Elsewhere/a.png"));
+        storage::write(&pic, b"png bytes").unwrap();
+        storage::write(&twin, b"png bytes").unwrap();
+
+        let kept = keep_image(&pic, &app_dir).unwrap();
+        assert!(kept.starts_with(app_dir.join("uploads")) && kept.ends_with("a.png"));
+        assert_eq!(keep_image(&twin, &app_dir).unwrap(), kept, "one copy per distinct picture");
+        assert_eq!(keep_image(&kept, &app_dir).unwrap(), kept, "a kept file stays where it is");
+
+        let store = Store::new(root.join("projects"));
+        let image = |path: String| ItemKind::Image { source: ImageSource::file(path), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() };
+        let mut doc = Document::default();
+        for (id, path) in [(1, pic.display().to_string()), (2, "/missing/b.png".to_string())] {
+            doc.slides[0].items.push(Item::new(id, "pic", image(path), egui::Pos2::ZERO, egui::Vec2::splat(10.0)));
+        }
+        let m = store.create(&doc).unwrap();
+        let (modified, versions) = (store.meta(&m.id).unwrap().modified, store.versions(&m.id).len());
+
+        store.keep_images(&app_dir);
+        std::fs::remove_file(&pic).unwrap();
+        let paths: Vec<String> = store.load(&m.id).unwrap().slides[0].items.iter().map(|it| match &it.kind {
+            ItemKind::Image { source: ImageSource::File { path, .. }, .. } => path.clone(),
+            _ => unreachable!(),
+        }).collect();
+        assert_eq!(paths, [kept.display().to_string(), "/missing/b.png".to_string()]);
+        assert_eq!(storage::read(Path::new(&paths[0])).unwrap(), b"png bytes");
+        assert_eq!((store.meta(&m.id).unwrap().modified, store.versions(&m.id).len()), (modified, versions), "not an edit");
         let _ = std::fs::remove_dir_all(root);
     }
 

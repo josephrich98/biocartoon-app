@@ -1770,6 +1770,8 @@ impl BioCartoon {
                 let d = xf.to_doc(p);
                 if let Some(id) = self.item_at(d, tol) {
                     self.select_quietly(vec![id]);
+                    // Unlike a selection, which leaves a hidden options menu hidden.
+                    self.settings.show_rail = true;
                     self.open_edit_tab();
                     match self.item(id).and_then(|it| table_cell_at(it, d)) {
                         Some(cell) => self.actions.push(Action::EditCell(id, cell)),

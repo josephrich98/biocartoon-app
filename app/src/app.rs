@@ -317,8 +317,9 @@ pub enum IconsMode {
 }
 
 /// What a browse or search shows: catalog icons, saved templates, or both.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Include {
+    #[default]
     Both,
     Icons,
     Templates,
@@ -326,6 +327,14 @@ pub enum Include {
 
 impl Include {
     pub const ALL: [Include; 3] = [Include::Both, Include::Icons, Include::Templates];
+    /// The `artwork_type:` value that picks it (none for both).
+    pub fn value(self) -> Option<&'static str> {
+        match self {
+            Include::Both => None,
+            Include::Icons => Some("icons"),
+            Include::Templates => Some("templates"),
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Include::Both => "Icons and templates",
@@ -365,6 +374,8 @@ pub struct SearchFilter {
     pub favorites: bool,
     /// Only the assets downloaded for offline use (their images are in the offline folder).
     pub downloads: bool,
+    /// Artwork type: icons, templates or both.
+    pub artwork: Include,
 }
 
 impl SearchFilter {
@@ -389,6 +400,7 @@ impl SearchFilter {
             !self.tags().is_empty(),
             self.favorites,
             self.downloads,
+            self.artwork != Include::Both,
         ]
             .iter()
             .filter(|&&on| on)
@@ -445,9 +457,9 @@ pub struct IconsState {
     pub mine_show_filters: bool,
     /// The filters are open under the search box.
     pub show_filters: bool,
-    /// The results' scroll offset when the open filters last held still (were opened, edited or
-    /// scrolled back above); scrolling on down from it closes them.
-    pub filters_scroll_from: Option<f32>,
+    /// While the filters are open: the results' scroll offset last frame, and how far the user has
+    /// scrolled them in one direction since (negative: up), which closes the filters once far enough.
+    pub filters_scroll: Option<(f32, f32)>,
     /// The filters were just closed by scrolling: how tall they were, and the results' offset then,
     /// so the next frame can scroll the results back by what the filters gave up and keep them still.
     pub filters_closed: Option<(f32, f32)>,
@@ -469,8 +481,11 @@ pub struct IconsState {
     pub sources: Vec<SourceInfo>,
     pub loading: bool,
     pub error: Option<String>,
-    /// Results: icons, templates or both.
-    pub include: Include,
+    /// Authors the typed query is part of the name of, with their icon counts, for the
+    /// suggestions under the search box (`authors_for` is the query they are for).
+    pub authors: Vec<(String, i64)>,
+    pub authors_for: String,
+    pub authors_req: u64,
     /// Scroll the Icons panel to its top (`Min`) or bottom (`Max`) next frame.
     pub scroll_to: Option<egui::Align>,
     /// The search's sort was picked by hand since the search opened; until then it follows the
@@ -491,7 +506,7 @@ impl Default for IconsState {
             mine_filter: SearchFilter::default(),
             mine_show_filters: false,
             show_filters: false,
-            filters_scroll_from: None,
+            filters_scroll: None,
             filters_closed: None,
             results: Vec::new(),
             colors: HashMap::new(),
@@ -506,7 +521,9 @@ impl Default for IconsState {
             sources: Vec::new(),
             loading: false,
             error: None,
-            include: Include::Both,
+            authors: Vec::new(),
+            authors_for: String::new(),
+            authors_req: 0,
             scroll_to: None,
             sort_picked: false,
         }
@@ -1521,6 +1538,8 @@ impl BioCartoon {
                 Err(e) => log::warn!("{e}"),
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        app.keep_old_uploads();
         app.open_catalog();
         app.refresh_projects();
         app
@@ -2043,14 +2062,38 @@ impl BioCartoon {
         out
     }
 
-    /// Remember a picked or dropped file in Uploads. It is read afresh, so a file uploaded again
-    /// after being changed on disk shows its new contents rather than the cached ones.
-    fn add_upload(&mut self, f: &Path) {
-        let s = f.display().to_string();
+    /// The app's own copy of a picked or dropped file (the file itself if it can't be copied).
+    /// The browser's uploads are in its storage already.
+    fn keep_upload(&self, f: &Path) -> PathBuf {
+        if cfg!(target_arch = "wasm32") {
+            return f.to_path_buf();
+        }
+        crate::projects::keep_image(f, &self.app_dir).unwrap_or_else(|e| {
+            log::warn!("keep upload: {e}");
+            f.to_path_buf()
+        })
+    }
+
+    /// Uploads made before they were copied: those whose files are still there get a copy.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn keep_old_uploads(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let old = std::mem::take(&mut self.settings.uploads);
+        self.settings.uploads = old.iter().map(|p| self.keep_upload(Path::new(p)).display().to_string()).filter(|p| seen.insert(p.clone())).collect();
+        self.store.keep_images(&self.app_dir);
+    }
+
+    /// Remember a picked or dropped file in Uploads, as the app's own copy; returns that copy's
+    /// path. It is read afresh, so a file uploaded again after being changed on disk shows its
+    /// new contents rather than the cached ones.
+    fn add_upload(&mut self, f: &Path) -> PathBuf {
+        let kept = self.keep_upload(f);
+        let s = kept.display().to_string();
         self.images.forget(&format!("file:{s}"));
         if !self.settings.uploads.contains(&s) {
             self.settings.uploads.push(s);
         }
+        kept
     }
 
     /// Images dropped on the canvas: remembered in Uploads and placed on the page, fanned out
@@ -2058,8 +2101,8 @@ impl BioCartoon {
     fn drop_images(&mut self, files: &[PathBuf], at: Option<Pos2>) {
         let mut placed = Vec::new();
         for (i, f) in files.iter().enumerate() {
-            self.add_upload(f);
-            self.insert_file(f);
+            let f = self.add_upload(f);
+            self.insert_file(&f);
             let Some(&id) = self.selection.first() else { continue };
             placed.push(id);
             if let Some(p) = at {
@@ -2475,6 +2518,11 @@ impl BioCartoon {
                 Resp::Categories { source, cats, .. } => {
                     self.icons.categories.insert(source, cats);
                 }
+                Resp::Authors { req_id, authors } => {
+                    if req_id == self.icons.authors_req {
+                        self.icons.authors = authors;
+                    }
+                }
                 Resp::Facets { req_id, facets } => {
                     if req_id == self.icons.facets_req {
                         self.icons.facets = Some(facets);
@@ -2780,6 +2828,23 @@ impl BioCartoon {
         self.request_search_page();
         self.icons.last_sent_query = self.icons.query.clone();
         self.icons.last_sent_filter = self.icons.filter.clone();
+        self.request_authors();
+    }
+
+    /// Ask for the authors the typed words are part of the name of (a plain query only, not
+    /// `field:value` syntax), for the suggestions under the search box.
+    fn request_authors(&mut self) {
+        let q = self.icons.query.trim().to_string();
+        if q == self.icons.authors_for {
+            return;
+        }
+        self.icons.authors_for = q.clone();
+        if q.chars().count() < 2 || biocartoon_catalog::syntax::parse(&q).is_some() || q.contains(':') {
+            self.icons.authors.clear();
+            self.icons.authors_req = 0;
+        } else {
+            self.icons.authors_req = self.catalog.send(Req::Authors { part: q });
+        }
     }
 
     /// Load (or, past offset 0, extend) the results of the current search.
@@ -5336,7 +5401,7 @@ impl BioCartoon {
             }
             Action::LibraryFilePicked(f) => {
                 let Some(f) = self.vector_uploads(vec![f]).pop() else { return };
-                self.add_upload(&f);
+                let f = self.add_upload(&f);
                 self.open_upload_dialog(UploadTarget::File(f), false);
             }
             Action::SubmitUpload => self.submit_upload(),
@@ -6877,6 +6942,7 @@ impl BioCartoon {
                         self.settings.show_icons = true;
                         self.search_database(theme::BIOCARTOON_SOURCE);
                     }
+                    "hidefilters" => self.icons.show_filters = false,
                     "savetemplate" => self.open_upload_dialog(self.template_target(self.cur_slide), false),
                     "sharetemplate" => self.open_upload_dialog(self.template_target(self.cur_slide), true),
                     // The library dialogs for the demo PNG or SVG: Your library (add), or BioCartoon's (share).
