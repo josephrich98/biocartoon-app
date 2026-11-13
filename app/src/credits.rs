@@ -101,9 +101,18 @@ pub fn for_items(items: &[&Item], only_required: bool) -> String {
     list(&collect([&slide], 1), only_required)
 }
 
-/// The credit lines, one per line, optionally just those the licenses require.
+/// The credits that have a line (optionally just those the licenses require), alphabetical by
+/// that line, ignoring case and the opening quote around the title.
+pub fn sorted(credits: &[Credit], only_required: bool) -> Vec<&Credit> {
+    let mut out: Vec<&Credit> = credits.iter().filter(|c| (!only_required || c.required) && !c.credit.is_empty()).collect();
+    let key = |c: &Credit| c.credit.trim_start_matches(['"', '\u{201c}', '\'']).to_lowercase();
+    out.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| a.credit.cmp(&b.credit)));
+    out
+}
+
+/// The credit lines, alphabetical, one per line, optionally just those the licenses require.
 pub fn list(credits: &[Credit], only_required: bool) -> String {
-    credits.iter().filter(|c| !only_required || c.required).map(|c| c.credit.as_str()).filter(|c| !c.is_empty()).collect::<Vec<_>>().join("\n")
+    sorted(credits, only_required).iter().map(|c| c.credit.as_str()).collect::<Vec<_>>().join("\n")
 }
 
 /// Ids of catalog assets in `doc` that don't carry their credit yet (documents saved before
@@ -154,6 +163,23 @@ impl BioCartoon {
             .or_else(|| self.icons.results.iter().chain(self.variants.iter()).find(|r| &r.id == id).map(|r| r.credit.clone()))
             .unwrap_or_else(|| format!("Asset {id}"));
         Some((title.clone(), credit))
+    }
+
+    /// Whether generative AI made a library asset, and how (its uploader's or our record's words;
+    /// empty when not said), from its catalog row once loaded.
+    pub fn asset_ai(&self, id: &str) -> Option<(Option<bool>, String)> {
+        self.asset_row(id).map(|r| (r.generative_ai_used, r.generative_ai_details.clone()))
+    }
+
+    /// Whether generative AI made a library asset (`Some(None)`: the catalog doesn't say), from a
+    /// loaded catalog row or a credit lookup; `None` until one of them has it.
+    pub fn asset_ai_flag(&self, id: &str) -> Option<Option<bool>> {
+        self.asset_row(id).map(|r| r.generative_ai_used).or_else(|| self.asset_ai_flags.get(id).copied())
+    }
+
+    /// A library asset's catalog row, once loaded.
+    pub fn asset_row(&self, id: &str) -> Option<&crate::catalog::AssetRow> {
+        self.icons.results.iter().chain(self.variants.iter()).find(|r| r.id == id)
     }
 
     /// The catalog id of the asset an image item is, or was made from.
@@ -220,6 +246,15 @@ impl BioCartoon {
             (None, false) => (collect([&self.doc.slides[slide]], slide + 1), format!("{}  Attributions: slide {}", ph::QUOTES, slide + 1), format!("{stem}-slide{}", slide + 1)),
             (None, true) => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES), stem),
         };
+        // The AI note beside each credit: ask the catalog about the assets it hasn't told us of yet.
+        if self.catalog.ok {
+            let mut ids: Vec<String> = credits.iter().filter(|c| self.asset_ai_flag(&c.id).is_none()).map(|c| c.id.clone()).collect();
+            ids.retain(|id| self.credit_lookups.insert(id.clone()));
+            if !ids.is_empty() {
+                self.catalog.send(crate::catalog::Req::Lookup { ids });
+            }
+        }
+        let ai: std::collections::HashMap<String, Option<bool>> = credits.iter().filter_map(|c| Some((c.id.clone(), self.asset_ai_flag(&c.id)?))).collect();
         let mut open = true;
         let mut action = None;
         let window = egui::Window::new(title)
@@ -229,7 +264,7 @@ impl BioCartoon {
             .default_size([480.0, 460.0])
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                action = attributions_ui(ui, &credits, &mut self.attributions_required_only, &mut all_slides, export_scope.is_some());
+                action = attributions_ui(ui, &credits, &ai, &mut self.attributions_required_only, &mut all_slides, export_scope.is_some());
             });
         if export_scope.is_none() {
             self.attributions_all_slides = all_slides;
@@ -287,7 +322,19 @@ impl BioCartoon {
 /// required ones stay just what the licenses ask for.
 fn shared_list(credits: &[Credit], only_required: bool) -> String {
     let lines = list(credits, only_required);
-    if only_required { lines } else { format!("{lines}\nMade in BioCartoon.") }
+    if only_required { lines } else { format!("{lines}\n{MADE_IN}") }
+}
+
+/// The line that ends the full credit list.
+const MADE_IN: &str = "Made in BioCartoon.";
+
+/// The gray note beside a credit in the Attributions popup: `None` while the catalog hasn't said,
+/// or when the art was made without AI.
+fn ai_note(used: Option<Option<bool>>) -> Option<&'static str> {
+    match used? {
+        Some(false) => None,
+        u => Some(crate::panels::ai_label(u)),
+    }
 }
 
 /// How long the "Image saved successfully" banner stays above the Attributions popup.
@@ -301,7 +348,8 @@ enum CreditsAction {
 }
 
 /// The body of the Attributions popup. Returns what a copy or save button asked for, if one was clicked.
-fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool, all_slides: &mut bool, export: bool) -> Option<CreditsAction> {
+/// `ai`: whether generative AI made each asset, where the catalog has said.
+fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], ai: &std::collections::HashMap<String, Option<bool>>, only: &mut bool, all_slides: &mut bool, export: bool) -> Option<CreditsAction> {
     let mut action = None;
     let pending = credits.iter().filter(|c| c.credit.is_empty()).count();
     let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
@@ -335,7 +383,9 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool, all_s
     });
     ui.horizontal(|ui| {
         let save_all = egui::RichText::new(format!("{}  Save all credits", ph::FLOPPY_DISK)).color(egui::Color32::WHITE);
-        if ui.add_enabled(has_any, egui::Button::new(save_all).fill(theme::accent())).clicked() {
+        // Just after an export, Enter saves them all. (Not when opened from the menu: that window stays
+        // open beside the canvas, where Enter edits the selected text.)
+        if ui.add_enabled(has_any, egui::Button::new(save_all).fill(theme::accent())).clicked() || (export && has_any && theme::enter_pressed(ui)) {
             action = Some(CreditsAction::Save { required: false });
         }
         if ui.add_enabled(has_required, egui::Button::new(format!("{}  Save required credits", ph::FLOPPY_DISK))).clicked() {
@@ -353,8 +403,20 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], only: &mut bool, all_s
         .on_hover_text("Include credits for artwork on every slide.")
         .on_disabled_hover_text("Fixed to the slides selected for this export.");
     ui.separator();
+    // The lines `shared_list` copies and saves, in its order, each with a small gray note of AI use
+    // for the author (not copied: it isn't part of the credit). Art made without AI gets no note.
     egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-        ui.add(egui::Label::new(shared_list(credits, *only)).wrap().selectable(true));
+        for c in sorted(credits, *only) {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Label::new(&c.credit).wrap().selectable(true));
+                if let Some(note) = ai_note(ai.get(&c.id).copied()) {
+                    ui.add(egui::Label::new(dim(note)).selectable(false));
+                }
+            });
+        }
+        if !*only && has_any {
+            ui.add(egui::Label::new(MADE_IN).selectable(true));
+        }
     });
     action
 }
@@ -385,12 +447,28 @@ mod tests {
         assert!(!c[1].required);
         assert_eq!(list(&c, true), "\"Cell\", Servier Medical Art, CC-BY-4.0");
         assert!(list(&c, false).ends_with("CC-BY-4.0\n\"Tube\", NIAID NIH BioArt Source, public domain"));
+        // Alphabetical whatever the order on the slides, ignoring case and the opening quote.
+        let ant = asset("servier/ant", "ant drawing, CC0", "CC0-1.0");
+        let s3 = Slide { name: String::new(), items: vec![image(6, tube.clone()), image(7, ant), image(8, cell.clone())], comments: Vec::new(), background: None };
+        let c = collect([&s3], 1);
+        assert_eq!(c[0].id, "bioart/tube");
+        assert_eq!(list(&c, false), "ant drawing, CC0\n\"Cell\", Servier Medical Art, CC-BY-4.0\n\"Tube\", NIAID NIH BioArt Source, public domain");
+        assert_eq!(shared_list(&c, true), "\"Cell\", Servier Medical Art, CC-BY-4.0");
+        assert!(shared_list(&c, false).ends_with("public domain\nMade in BioCartoon."));
         // An edit of an edit still points at the catalog asset.
         let twice = ImageSource::file("/tmp/a.png".into()).derived("/tmp/b.png".into());
         assert!(twice.origin().is_none());
         let twice = cell.derived("/tmp/a.png".into());
         let twice = twice.derived("/tmp/b.png".into());
         assert_eq!(twice.origin(), Some(&cell));
+    }
+
+    #[test]
+    fn ai_note_skips_art_made_without_ai() {
+        assert_eq!(ai_note(Some(Some(true))), Some("AI-generated"));
+        assert_eq!(ai_note(Some(None)), Some("AI use not specified"));
+        assert_eq!(ai_note(Some(Some(false))), None);
+        assert_eq!(ai_note(None), None);
     }
 
     #[test]

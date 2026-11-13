@@ -659,7 +659,7 @@ impl BioCartoon {
                     )));
                     ui.add_space(8.0);
                     let busy = self.share.busy;
-                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(format!("{}  Create share link", ph::LINK)).color(Color32::WHITE)).fill(theme::accent())).clicked() {
+                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(format!("{}  Create share link", ph::LINK)).color(Color32::WHITE)).fill(theme::accent())).clicked() || (!busy && theme::enter_pressed(ui)) {
                         act = Some("create");
                     }
                     if busy {

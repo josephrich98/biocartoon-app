@@ -65,6 +65,10 @@ pub struct Settings {
     pub grid_steps: bool,
     /// Moved and resized items snap to guides.
     pub guide_snap: bool,
+    /// Moved and resized items snap to the page's edges and its horizontal and vertical centers.
+    pub page_snap: bool,
+    /// Moved and resized items snap to other items' edges and centers (PowerPoint's smart guides).
+    pub object_snap: bool,
     pub show_grid: bool,
     /// Rulers along the canvas's top and left edges.
     pub show_rulers: bool,
@@ -124,6 +128,19 @@ pub struct Settings {
     pub hide_library_notice: bool,
 }
 
+impl Settings {
+    /// What moved and resized items can snap to: (label, setting, tooltip), in the order the
+    /// "Snap to" checklists show them.
+    pub fn snap_targets(&mut self) -> [(&'static str, &mut bool, &'static str); 4] {
+        [
+            ("Page", &mut self.page_snap, "The page's edges and its horizontal and vertical centers"),
+            ("Guides", &mut self.guide_snap, "The guides you've added"),
+            ("Grid", &mut self.grid_snap, "Edges and centers near a gridline jump onto it"),
+            ("Objects", &mut self.object_snap, "Other objects' edges and centers"),
+        ]
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -147,6 +164,8 @@ impl Default for Settings {
             grid_snap: false,
             grid_steps: false,
             guide_snap: true,
+            page_snap: true,
+            object_snap: true,
             show_grid: false,
             show_rulers: true,
             grid_size: DPI / 4.0,
@@ -1002,7 +1021,7 @@ pub enum Action {
     /// Add a freehand line through these page points (a finished Draw stroke).
     PlaceDrawing(Vec<Pos2>),
     InsertTable(usize, usize),
-    InsertCode { code: String, language: CodeLang, theme: CodeTheme, line_numbers: bool, window: bool, rounded: bool },
+    InsertCode { code: String, language: CodeLang, theme: CodeTheme, colors: crate::doc::CodeColors, line_numbers: bool, window: bool, rounded: bool },
     UseTemplate(usize),
     /// A saved or shared template (from `templates.sqlite`).
     UseSavedTemplate(TemplateRow),
@@ -1170,6 +1189,12 @@ pub struct BioCartoon {
     /// Everyone's stars on each template, as the Worker last reported them (templates are not in
     /// the catalog, so their counts are kept here rather than on a row).
     pub template_stars: HashMap<String, i64>,
+    /// The stars the open results were ranked by, of each icon or template the user starred or
+    /// unstarred since they loaded: Popular keeps ranking by these, so nothing moves under the
+    /// pointer, until the next search or reload ([`Self::release_stars`]).
+    pub rank_stars: HashMap<String, i64>,
+    /// The latest counts of those, which the catalog gets once the results are let go.
+    held_stars: HashMap<String, StarUpdate>,
     /// The stars from before favorites were kept in Settings have been carried over.
     stars_migrated: bool,
     /// Web: the optional account that keeps projects and Your library online.
@@ -1286,6 +1311,8 @@ pub struct BioCartoon {
     pub variants_req: u64,
     /// Asset ids whose credit has been asked of the catalog (see [`crate::credits::missing`]).
     pub credit_lookups: HashSet<String>,
+    /// Whether generative AI made each asset the catalog has looked up (see [`Self::asset_ai_flag`]).
+    pub asset_ai_flags: HashMap<String, Option<bool>>,
     pub show_attributions: bool,
     /// The slide (0-based) shown when all slides is unchecked; defaults to the current slide.
     pub attributions_slide: Option<usize>,
@@ -1305,6 +1332,8 @@ pub struct BioCartoon {
     /// The Attributions window lists only credits the licenses require.
     pub attributions_required_only: bool,
     pub drag: Option<crate::canvas::Drag>,
+    /// Page and object lines the item being dragged has snapped to, drawn while the drag lasts.
+    pub snap_hints: Vec<crate::doc::Guide>,
     /// Set once a finger has touched the screen: the canvas then draws bigger handles and gives
     /// them a finger-sized hit area.
     pub touch_input: bool,
@@ -1428,6 +1457,8 @@ impl BioCartoon {
             stars: StarsClient::new(Some(cc.egui_ctx.clone())),
             stars_in_flight: HashSet::new(),
             template_stars: HashMap::new(),
+            rank_stars: HashMap::new(),
+            held_stars: HashMap::new(),
             stars_migrated: false,
             account: crate::account::Account::new(app_dir.join("account.json"), cc.egui_ctx.clone()),
             share: crate::share::Sharer::new(cc.egui_ctx.clone()),
@@ -1501,6 +1532,7 @@ impl BioCartoon {
             variants_for: None,
             variants_req: 0,
             credit_lookups: HashSet::new(),
+            asset_ai_flags: HashMap::new(),
             show_attributions: false,
             attributions_slide: None,
             attributions_all_slides: false,
@@ -1510,6 +1542,7 @@ impl BioCartoon {
             credit_item: None,
             attributions_required_only: false,
             drag: None,
+            snap_hints: Vec::new(),
             touch_input: false,
             last_canvas_click: None,
             selected_guide: None,
@@ -1565,6 +1598,7 @@ impl BioCartoon {
             self.catalog.status = format!("Catalog not found at {}", self.settings.catalog_path);
         }
         self.credit_lookups.clear();
+        self.asset_ai_flags.clear();
         self.icons.categories.clear();
         self.icons.sources.clear();
         self.icons.facets = None;
@@ -1792,6 +1826,29 @@ impl BioCartoon {
         self.crop_mode = false;
     }
 
+    /// A plain click on an item. The first click on a grouped item takes the whole group; a
+    /// click while the selection is already inside that group (the whole group, or one of its
+    /// items) takes just the item under the pointer.
+    pub(crate) fn click_select(&mut self, id: ItemId) {
+        let Some(g) = self.item(id).and_then(|it| it.group) else {
+            return self.select_quietly(vec![id]);
+        };
+        let items = self.selected_items();
+        let inside = !items.is_empty() && items.iter().all(|i| i.group == Some(g));
+        if inside {
+            self.select_only(id);
+        } else {
+            self.select_quietly(vec![id]);
+        }
+    }
+
+    /// Select just this item, even out of a group, without opening Edit.
+    pub(crate) fn select_only(&mut self, id: ItemId) {
+        self.selected_guide = None;
+        self.selection = vec![id];
+        self.crop_mode = false;
+    }
+
     /// Show the selection's properties on the right, remembering the tab it replaces.
     pub(crate) fn open_edit_tab(&mut self) {
         if self.rail != Some(RailTab::Edit) {
@@ -1807,10 +1864,10 @@ impl BioCartoon {
         }
     }
 
-    /// Start typing into text box `id` on the canvas (a table: its first cell).
+    /// Start typing into text box or code block `id` on the canvas (a table: its first cell).
     pub(crate) fn start_text_edit(&mut self, id: ItemId) {
         match self.item(id) {
-            Some(i) if matches!(i.kind, ItemKind::Text { .. }) && !i.locked => {
+            Some(i) if matches!(i.kind, ItemKind::Text { .. } | ItemKind::Code { .. }) && !i.locked => {
                 self.editing_text = Some(id);
                 self.text_edit_focus = true;
             }
@@ -2145,7 +2202,7 @@ impl BioCartoon {
         for it in &self.clipboard {
             if let ItemKind::Image { source, .. } = &it.kind {
                 let key = source.cache_key();
-                if let Some(img) = self.images.cpu_image(&key) {
+                if let Some(img) = self.images.cached(&key) {
                     cached.insert(key, img);
                 }
             }
@@ -2223,6 +2280,16 @@ impl BioCartoon {
 
     pub fn is_grouped(&self) -> bool {
         self.selected_items().iter().any(|i| i.group.is_some())
+    }
+
+    /// Several items are selected and they aren't already exactly one group.
+    pub fn can_group(&self) -> bool {
+        let items = self.selected_items();
+        if items.len() < 2 {
+            return false;
+        }
+        let first = items[0].group;
+        !(first.is_some() && items.iter().all(|i| i.group == first))
     }
 
     pub fn align(&mut self, kind: AlignKind) {
@@ -2548,6 +2615,7 @@ impl BioCartoon {
                     }
                 }
                 Resp::Lookup { rows, .. } => {
+                    self.asset_ai_flags.extend(rows.iter().map(|r| (r.id.clone(), r.generative_ai_used)));
                     crate::credits::fill(self.doc.slides.iter_mut(), &rows);
                     if let Some(d) = &mut self.export_doc {
                         crate::credits::fill(d.slides.iter_mut(), &rows);
@@ -2677,7 +2745,26 @@ impl BioCartoon {
                 self.template_stars.insert(u.id.clone(), u.n);
             }
         }
+        // Counts the open results were ranked by stay as they were in the catalog for now, so
+        // the next page carries on from the same order (the user's own star is still recorded).
+        let updates = updates.into_iter().map(|u| match self.rank_stars.get(&u.id) {
+            Some(&n) => {
+                self.held_stars.insert(u.id.clone(), u.clone());
+                StarUpdate { n, ..u }
+            }
+            None => u,
+        }).collect();
         self.catalog.send(Req::SetStars { updates });
+    }
+
+    /// New results are on their way: the catalog gets the counts held back for the old ones,
+    /// and Popular ranks by everyone's latest stars again.
+    fn release_stars(&mut self) {
+        self.rank_stars.clear();
+        let updates: Vec<StarUpdate> = std::mem::take(&mut self.held_stars).into_values().collect();
+        if !updates.is_empty() {
+            self.catalog.send(Req::SetStars { updates });
+        }
     }
 
     /// Desktop: download `row`'s PNG, and its SVG when it has one, into the offline folder in the
@@ -2776,12 +2863,14 @@ impl BioCartoon {
         } else {
             self.settings.favorites.retain(|f| *f != id);
         }
-        // The count is shown right away; the Worker's answer corrects it.
+        // The count is shown right away; the Worker's answer corrects it. Its place stays put.
         if let Some(r) = self.icons.results.iter().chain(&self.variants).find(|r| r.id == id) {
+            self.rank_stars.entry(id.clone()).or_insert(r.stars);
             let u = StarUpdate { id: id.clone(), n: (r.stars + if on { 1 } else { -1 }).max(0), mine: on };
             self.apply_stars(vec![u]);
         } else if self.template_rows.iter().any(|t| t.meta.id == id) {
             let n = self.template_stars.get(&id).copied().unwrap_or(0);
+            self.rank_stars.entry(id.clone()).or_insert(n);
             self.apply_stars(vec![StarUpdate { id: id.clone(), n: (n + if on { 1 } else { -1 }).max(0), mine: on }]);
         }
         if self.icons.mode == IconsMode::Favorites {
@@ -2849,6 +2938,9 @@ impl BioCartoon {
 
     /// Load (or, past offset 0, extend) the results of the current search.
     fn request_search_page(&mut self) {
+        if self.icons.browse_offset == 0 {
+            self.release_stars();
+        }
         self.icons.loading = true;
         self.icons.results_req = self.catalog.send(Req::Search {
             query: self.icons.query.clone(),
@@ -2881,6 +2973,9 @@ impl BioCartoon {
             IconsMode::Favorites if offset == 0 => Req::Favorites { ids: self.settings.favorites.clone() },
             _ => return,
         };
+        if offset == 0 {
+            self.release_stars();
+        }
         self.icons.loading = true;
         self.icons.results_req = self.catalog.send(req);
     }
@@ -3685,13 +3780,13 @@ impl BioCartoon {
     }
 
     /// Image loads for rendering `slide` off the UI thread: requests, and decoded copies we have.
-    pub(crate) fn render_inputs(&self, slide: &Slide) -> (HashMap<String, crate::assets::Request>, HashMap<String, std::sync::Arc<image::RgbaImage>>) {
+    pub(crate) fn render_inputs(&self, slide: &Slide) -> (HashMap<String, crate::assets::Request>, HashMap<String, crate::export::Cached>) {
         let mut requests = HashMap::new();
         let mut cached = HashMap::new();
         for it in &slide.items {
             if let ItemKind::Image { source, .. } = &it.kind {
                 let k = source.cache_key();
-                if let Some(img) = self.images.cpu_image(&k) {
+                if let Some(img) = self.images.cached(&k) {
                     cached.insert(k.clone(), img);
                 }
                 if let Ok(req) = self.images.request_for(source) {
@@ -4250,7 +4345,7 @@ impl BioCartoon {
                     ui.add_space(12.0);
                     let w = ui.available_width();
                     let wide = |text: egui::RichText| egui::Button::new(text).min_size(Vec2::new(w, 30.0)).corner_radius(6);
-                    if ui.add(wide(egui::RichText::new("Save").color(Color32::WHITE)).fill(theme::accent())).clicked() {
+                    if ui.add(wide(egui::RichText::new("Save").color(Color32::WHITE)).fill(theme::accent())).clicked() || theme::enter_pressed(ui) {
                         answer = Some(SaveAnswer::Save);
                     }
                     if ui.add(wide("Don't Save".into()).fill(theme::hover())).clicked() {
@@ -4521,7 +4616,7 @@ impl BioCartoon {
             });
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new(egui::RichText::new("Save...").color(Color32::WHITE)).fill(theme::accent())).clicked() { go = true; }
+                if ui.add(egui::Button::new(egui::RichText::new("Save...").color(Color32::WHITE)).fill(theme::accent())).clicked() || theme::enter_pressed(ui) { go = true; }
                 if ui.button("Cancel").clicked() { cancel = true; }
             });
         });
@@ -4532,7 +4627,7 @@ impl BioCartoon {
     }
 
     /// Save the selection as a picture of the type and resolution picked in "Save as picture",
-    /// cropped to it. A PNG leaves the background out.
+    /// cropped to it. The background is left out (but for a JPEG, which can't be see-through).
     fn save_selection_image(&mut self, ctx: &egui::Context) {
         if self.export_job.is_some() {
             self.toast("An export is already running");
@@ -4562,7 +4657,7 @@ impl BioCartoon {
         for it in slides.iter().flat_map(|(_, s)| &s.items) {
             if let ItemKind::Image { source, .. } = &it.kind {
                 let key = source.cache_key();
-                if let Some(img) = self.images.cpu_image(&key) {
+                if let Some(img) = self.images.cached(&key) {
                     fallbacks.insert(key.clone(), img);
                 }
                 if let Ok(req) = self.images.request_for(source) {
@@ -4779,7 +4874,7 @@ impl BioCartoon {
                     size_row(ui);
                 });
                 ui.add_space(6.0);
-                if opts.format == ExportFormat::Png {
+                if opts.format.can_be_transparent() {
                     ui.checkbox(&mut opts.transparent, "Transparent background");
                 }
                 if opts.format == ExportFormat::Pdf {
@@ -4831,7 +4926,7 @@ impl BioCartoon {
                 // left of the scroll area, which cuts it off.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     let can = project_file || deck || !((opts.individual || opts.crop) && n_images == 0);
-                    if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(Color32::WHITE)).fill(theme::accent())).clicked() { go = true; }
+                    if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(Color32::WHITE)).fill(theme::accent())).clicked() || (can && theme::enter_pressed(ui)) { go = true; }
                     if ui.button("Cancel").clicked() { cancel = true; }
                 });
             };
@@ -5202,11 +5297,11 @@ impl BioCartoon {
                 };
                 self.insert_item(Item::new(id, "Table", kind, Pos2::ZERO, Vec2::new(cols as f32 * 110.0, rows as f32 * 32.0)));
             }
-            Action::InsertCode { code, language, theme, line_numbers, window, rounded } => {
+            Action::InsertCode { code, language, theme, colors, line_numbers, window, rounded } => {
                 let id = self.doc.alloc_id();
                 let font_size = 14.0;
                 let size = crate::code::fit_size(ctx, &code, font_size, line_numbers, window);
-                let kind = ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded };
+                let kind = ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded, colors, runs: Vec::new() };
                 self.insert_item(Item::new(id, "Code", kind, Pos2::ZERO, Vec2::new(size[0], size[1])));
             }
             Action::UseTemplate(i) => self.use_template(i),
@@ -5508,6 +5603,15 @@ impl BioCartoon {
             return;
         }
         self.snake_keys(ctx);
+        // These dialogs press their orange button on Enter (drawn after this runs).
+        let enter_for_dialog = self.show_export
+            || self.show_save_picture
+            || self.share.show
+            || self.upload_dialog.is_some()
+            || (self.show_attributions && self.attributions_export.is_some())
+            || self.ai_setup.is_some()
+            || self.leave_prompt.is_some()
+            || self.home.history.is_some();
         let mut acts = Vec::new();
         ctx.input_mut(|i| {
             use egui::{Key, Modifiers};
@@ -5565,7 +5669,7 @@ impl BioCartoon {
                     Action::ClearSelection
                 });
             }
-            if i.key_pressed(Key::Enter) {
+            if i.key_pressed(Key::Enter) && !enter_for_dialog {
                 if let [id] = self.selection[..] {
                     acts.push(Action::EditText(id));
                 }
@@ -5616,6 +5720,7 @@ impl BioCartoon {
             theme::apply(ctx, want.0, want.1.scale());
             self.applied_theme = Some(want);
         }
+        theme::fit_row_height(ctx);
     }
 
     /// A phone-width screen has room for the canvas beside one side panel at most: opening one
@@ -6199,7 +6304,7 @@ impl BioCartoon {
                     } else {
                         !setup.key.trim().is_empty() && !setup.model.trim().is_empty()
                     };
-                    if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Connect").color(Color32::WHITE)).fill(theme::accent())).clicked() { connect = true; }
+                    if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Connect").color(Color32::WHITE)).fill(theme::accent())).clicked() || (can && theme::enter_pressed(ui)) { connect = true; }
                     if ui.button("Cancel").clicked() { cancel = true; }
                 });
             });
@@ -6500,7 +6605,7 @@ impl BioCartoon {
                     } else {
                         "Confirm adding it at the reduced size first"
                     };
-                    if b.on_disabled_hover_text(why).clicked() { *submit = true; }
+                    if b.on_disabled_hover_text(why).clicked() || (can && theme::enter_pressed(ui)) { *submit = true; }
                     if ui.button(if d.queue.is_empty() { "Cancel" } else { "Cancel all" }).clicked() { *cancel = true; }
                 });
             };
@@ -6651,7 +6756,7 @@ impl BioCartoon {
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
     /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, gridsteps, spell, viewspell, dictionary, textedit, equation, tableedit, placetext,
-    /// comments, hidecomments, draftcomment, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|norail|uploads|favorites|library|contribute|addlibrary>, aiyes).
+    /// comments, hidecomments, draftcomment, picker, dropper, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|norail|uploads|favorites|library|contribute|addlibrary>, aiyes).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -6695,6 +6800,12 @@ impl BioCartoon {
                     "history" => {
                         if let Some(p) = self.home.projects.first().cloned() {
                             self.open_version_history(&p.id);
+                        }
+                    }
+                    // A side panel open, by its label (`rail=Page`).
+                    s if s.starts_with("rail=") => {
+                        if let Some(t) = RailTab::ALL.iter().find(|t| t.label().eq_ignore_ascii_case(&s["rail=".len()..])) {
+                            self.actions.push(Action::SetRail(Some(*t)));
                         }
                     }
                     // A project from the store (`BIOCARTOON_PROJECTS_DIR`), as it looks when opened.
@@ -6812,6 +6923,31 @@ impl BioCartoon {
                         self.slide_mut().items.push(Item::new(id, "Table", kind, Pos2::new(200.0, 200.0), Vec2::new(450.0, 150.0)));
                         self.select(vec![id]);
                         self.start_cell_edit(id, 4);
+                    }
+                    // A code block with two colours changed from its theme and `f(x)` in red, its Edit panel open.
+                    "codecolors" => {
+                        self.show_settings = false;
+                        let id = self.doc.alloc_id();
+                        let mut colors = crate::doc::CodeColors::default();
+                        colors.0[3] = Some([255, 140, 0]);
+                        colors.0[4] = Some([120, 220, 255]);
+                        let code = "def f(x):\n    # double it\n    return \"x\" * 2\n".to_string();
+                        let kind = ItemKind::Code { code, language: crate::doc::CodeLang::Python, theme: crate::doc::CodeTheme::Dracula, font_size: 20.0, line_numbers: true, window: true, rounded: true, colors, runs: Vec::new() };
+                        let mut kind = kind;
+                        crate::doc::set_code_color(&mut kind, 4..8, Some([255, 80, 80]));
+                        self.slide_mut().items.push(Item::new(id, "Code", kind, Pos2::new(200.0, 200.0), Vec2::new(450.0, 160.0)));
+                        self.select(vec![id]);
+                    }
+                    // Typing into the selected item on the canvas (after `codecolors`: the code block,
+                    // with `f(x)` selected).
+                    "codeedit" => {
+                        if let [id] = self.selection[..] {
+                            self.start_text_edit(id);
+                            let te = egui::Id::new(("text_editor", id));
+                            let mut state = egui::text_edit::TextEditState::default();
+                            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(4), egui::text::CCursor::new(8))));
+                            state.store(ctx, te);
+                        }
                     }
                     "placetext" => {
                         self.show_settings = false;
@@ -6954,6 +7090,14 @@ impl BioCartoon {
                         }
                     }
                     // The library dialog's AI use answered Yes, with details.
+                    // Opens the first colour picker drawn, with a few recent colours.
+                    "dropper" => crate::color::arm_dropper_for_smoke(ctx),
+                    "picker" => {
+                        for c in [[37, 99, 235, 255], [250, 204, 21, 128], [22, 163, 74, 255]] {
+                            crate::color::remember_for_smoke(ctx, c);
+                        }
+                        ctx.data_mut(|d| d.insert_temp(egui::Id::new("smoke_open_picker"), true));
+                    }
                     "aiyes" => {
                         if let Some(d) = &mut self.upload_dialog {
                             d.ai = AiUse::Yes;
@@ -7200,11 +7344,21 @@ impl eframe::App for BioCartoon {
         if ui.ctx().options(|o| o.input_options.surrender_focus_on != on) {
             ui.ctx().options_mut(|o| o.input_options.surrender_focus_on = on);
         }
+        crate::color::dropper_frame(ui.ctx());
         self.show(ui);
     }
 
     /// On macOS, Ctrl+click is a right click: the press and its release become secondary-button events.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // `BIOCARTOON_SCRIPT=dropper` holds the pointer over the window so the loupe shows.
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var("BIOCARTOON_SCREENSHOT").is_ok()
+            && std::env::var("BIOCARTOON_SCRIPT").unwrap_or_default().split(',').any(|s| s.trim() == "dropper")
+        {
+            if let Some(r) = raw_input.screen_rect {
+                raw_input.events.push(egui::Event::PointerMoved(r.center() + egui::vec2(103.0, 10.0)));
+            }
+        }
         if ctx.os() != egui::os::OperatingSystem::Mac {
             return;
         }

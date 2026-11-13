@@ -180,3 +180,7 @@ depends = ["libxkbcommon0", "libgl1"]
 # The default template plus StartupWMClass, which must match the window's app_id (see main.rs) for
 # GNOME to tie the running window to this entry and show its icon instead of a generic one.
 desktop-template = "assets/biocartoon-app.desktop"
+
+# eframe 0.36.2 with fixes to typing on phones in the web build (see vendor/eframe/PATCHES.md).
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }

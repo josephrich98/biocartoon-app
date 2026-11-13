@@ -8,7 +8,7 @@ use crate::assets::ImgState;
 use crate::canvas::{draw_slide, tool_button, Xform};
 use crate::catalog::{AssetRow, Facets, IconSort, LIBRARY_SOURCE};
 use biocartoon_catalog::syntax::{self, contains, Expr, Field};
-use crate::doc::{c32, c4, CodeLang, CodeTheme, ImageSource, Item, ItemKind, LayerStyle, LineFamily, LineKind, LineStyle, ShapeKind, TextAlign, TextFlag, TextFont, TextVAlign, Unit};
+use crate::doc::{c32, c4, CodeColors, CodeLang, CodeTheme, ImageSource, Item, ItemKind, LayerStyle, LineFamily, LineKind, LineStyle, ShapeKind, TextAlign, TextFlag, TextFont, TextVAlign, Unit};
 use crate::stars::format_stars;
 use crate::theme;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
@@ -1146,7 +1146,7 @@ impl BioCartoon {
         let sort = if self.icons.mode == IconsMode::Search { self.settings.search_sort } else { self.settings.icon_sort };
         let more = icons && self.icons.more;
         let total = shown_total.filter(|_| icons).map_or(rows.len(), |n| n.max(0) as usize);
-        let tiles = mix_templates(&rows, &templates, &self.template_stars, sort, more, total);
+        let tiles = mix_templates(&rows, &templates, &self.template_stars, &self.rank_stars, sort, more, total);
         let mut picked: Option<AssetRow> = None;
         let (per_row, size) = self.icon_grid(ui);
         // Reveal thumbnails in order: hold back each one until the visible tiles before it are in.
@@ -1384,7 +1384,7 @@ impl BioCartoon {
         let star_rect = star_corner(ui, r.rect, stars, fav, self.settings.tile_stars, r.hover_pos());
         let on_star = (self.settings.tile_stars || fav) && r.interact_pointer_pos().is_some_and(|q| star_rect.contains(q));
         // Laid out like an icon's: "Eukaryotic cell  ·  Template", the description and category,
-        // "BioCartoon  ·  CC0-1.0  ·  AI not specified", the ID, and the credit line in grey.
+        // "BioCartoon  ·  CC0-1.0  ·  AI use not specified", the ID, and the credit line in grey.
         let info = |ui: &mut egui::Ui| {
             ui.label(egui::RichText::new(format!("{}  ·  Template", row.meta.title)).strong());
             if !row.meta.description.is_empty() {
@@ -1395,9 +1395,6 @@ impl BioCartoon {
             }
             let line = [row.meta.author.as_str(), row.meta.license.as_str(), ai_label(row.meta.generative_ai_used)];
             ui.label(line.iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  "));
-            if row.meta.generative_ai_used == Some(true) && !row.meta.generative_ai_details.is_empty() {
-                ui.label(format!("AI use: {}", row.meta.generative_ai_details));
-            }
             ui.label(format!("Template ID: {}", row.meta.id));
             ui.label(egui::RichText::new(crate::credits::template_row_credit(&row.meta)).small().color(theme::text_dim()));
         };
@@ -1798,22 +1795,22 @@ impl BioCartoon {
 
     fn code_panel(&mut self, ui: &mut egui::Ui) {
         let id = ui.id().with("code_draft");
-        let (mut code, mut language, mut theme, mut line_numbers, mut window, mut rounded) = ui.ctx().data(|d| d.get_temp::<(String, CodeLang, CodeTheme, bool, bool, bool)>(id)).unwrap_or_else(|| {
-            ("import numpy as np\n\ndef normalize(counts):\n    # counts per million\n    return counts / counts.sum() * 1e6\n".into(), CodeLang::Auto, CodeTheme::Dracula, true, false, false)
+        let (mut code, mut language, mut theme, mut colors, mut line_numbers, mut window, mut rounded) = ui.ctx().data(|d| d.get_temp::<(String, CodeLang, CodeTheme, CodeColors, bool, bool, bool)>(id)).unwrap_or_else(|| {
+            ("import numpy as np\n\ndef normalize(counts):\n    # counts per million\n    return counts / counts.sum() * 1e6\n".into(), CodeLang::Auto, CodeTheme::Dracula, CodeColors::default(), true, false, false)
         });
-        code_options(ui, &code, &mut language, &mut theme);
+        code_options(ui, &code, &mut language, &mut theme, &mut colors);
         ui.horizontal(|ui| {
             ui.checkbox(&mut line_numbers, "Line numbers");
             ui.checkbox(&mut window, "Window");
             ui.checkbox(&mut rounded, "Rounded");
         });
         ui.add_space(4.0);
-        code_editor(ui, &mut code, language, theme, 10);
+        code_editor(ui, &mut code, language, theme, &colors, &[], 10);
         ui.add_space(6.0);
         if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Insert code block", ph::CODE)).color(Color32::WHITE)).fill(theme::accent())).clicked() {
-            self.actions.push(Action::InsertCode { code: code.clone(), language, theme, line_numbers, window, rounded });
+            self.actions.push(Action::InsertCode { code: code.clone(), language, theme, colors, line_numbers, window, rounded });
         }
-        ui.ctx().data_mut(|d| d.insert_temp(id, (code, language, theme, line_numbers, window, rounded)));
+        ui.ctx().data_mut(|d| d.insert_temp(id, (code, language, theme, colors, line_numbers, window, rounded)));
     }
 
     // ---------- Edit (properties) ----------
@@ -1854,13 +1851,15 @@ impl BioCartoon {
         seg_captions(ui, w, &["Bring to front", "Bring forward", "Send backward", "Send to back"]);
     }
 
-    /// What an image is, above Transform: its name, database and license, then its file type
-    /// and size. The user's own images say just User-generated until they are given a license.
+    /// What an image is, above Transform: its name, database and license, then its file type and
+    /// size. An upload in the official BioCartoon library says BioCartoon (once its catalog row has
+    /// come); the user's own images say just User-generated until they are given a license.
     fn image_info(&mut self, ui: &mut egui::Ui, source: &ImageSource) {
         let user = "User-generated".to_string();
         let first = match source {
             ImageSource::Asset { source: db, license, .. } if db == "user" && license.is_empty() => user,
-            ImageSource::Asset { title, source: db, license, .. } => {
+            ImageSource::Asset { id, title, source: db, license, .. } => {
+                let db = self.asset_row(id).map_or(db.as_str(), theme::asset_source);
                 let db = if db == "user" { "User-generated" } else { theme::source_badge(db).2 };
                 [title.as_str(), db, license.as_str()].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  ")
             }
@@ -1988,6 +1987,17 @@ impl BioCartoon {
             });
             ui.separator();
             self.align_arrange_ui(ui);
+            // Mirrors the selection (a group) as a whole: each item flips and swaps sides.
+            let w = ui.available_width();
+            ui.label(egui::RichText::new("Flip").strong());
+            segmented(ui, w, 2, |ui, cell| {
+                for (act, icon, tip) in [(Action::FlipH, ph::FLIP_HORIZONTAL, "Flip horizontal"), (Action::FlipV, ph::FLIP_VERTICAL, "Flip vertical")] {
+                    if seg_toggle(ui, cell, icon, false, tip).clicked() {
+                        self.actions.push(act);
+                    }
+                }
+            });
+            seg_captions(ui, w, &["Horizontal", "Vertical"]);
             return;
         }
         let id = self.selection[0];
@@ -2109,6 +2119,10 @@ impl BioCartoon {
                     let credit = Some(credit.clone()).filter(|c| !c.is_empty()).or_else(|| self.icons.results.iter().chain(self.variants.iter()).find(|r| &r.id == aid).map(|r| r.credit.clone()));
                     let credit = credit.unwrap_or_else(|| format!("Asset {aid}"));
                     ui.add(egui::Label::new(dim(credit.clone())).selectable(true));
+                    // How AI made it, for display only: not part of the credit that is copied.
+                    if let Some((Some(true), details)) = self.asset_ai(aid).filter(|(_, d)| !d.is_empty()) {
+                        ui.add(egui::Label::new(dim(format!("({details})"))).selectable(false));
+                    }
                     if ui.add(egui::Button::new(format!("{}  Copy credit", ph::COPY)).small()).on_hover_text(credit.as_str()).clicked() {
                         ui.ctx().copy_text(credit);
                         self.toast("Copied the credit");
@@ -2222,8 +2236,37 @@ impl BioCartoon {
                 });
                 ui.label(egui::RichText::new("Double-click a cell on the canvas to type in it; Tab moves to the next cell.").small().color(theme::text_dim()));
             }
-            ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded } => {
-                changed |= code_options(ui, code, language, theme);
+            ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded, colors, runs } => {
+                changed |= code_options(ui, code, language, theme, colors);
+                // Colour for the text selected in the block on the canvas.
+                let sel = self.text_selection(it.id);
+                ui.horizontal(|ui| {
+                    ui.label("Text color");
+                    match sel.clone() {
+                        Some(r) => {
+                            let pal = theme.palette_with(colors);
+                            let mut c = crate::code::color_at(code, language.resolve(code), &pal, runs, r.start);
+                            if crate::color::edit_button_rgb(ui, &mut c).on_hover_text("Color the selected text").changed() {
+                                crate::doc::color_code_range(code, runs, r.clone(), Some(c));
+                                changed = true;
+                            }
+                            let custom = crate::doc::expand_runs(runs, code.chars().count()).get(r.clone()).is_some_and(|s| s.iter().any(|s| s.color.is_some()));
+                            if custom && ui.small_button(ph::ARROW_COUNTER_CLOCKWISE).on_hover_text("Back to the theme's colors").clicked() {
+                                crate::doc::color_code_range(code, runs, r, None);
+                                changed = true;
+                            }
+                            // Back to typing, with the text just colored still selected.
+                            self.text_edit_focus |= changed;
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("Double-click the block and select text to color it").small().color(theme::text_dim()));
+                        }
+                    }
+                });
+                if !runs.is_empty() && ui.button(format!("{}  Clear text colors", ph::ARROW_COUNTER_CLOCKWISE)).on_hover_text("Give every character the theme's color again").clicked() {
+                    runs.clear();
+                    changed = true;
+                }
                 ui.horizontal(|ui| {
                     ui.label("Font");
                     changed |= ui.add(egui::DragValue::new(font_size).range(4.0..=72.0)).changed();
@@ -2231,7 +2274,11 @@ impl BioCartoon {
                     changed |= ui.checkbox(window, "Window").changed();
                     changed |= ui.checkbox(rounded, "Rounded").changed();
                 });
-                changed |= code_editor(ui, code, *language, *theme, 14).changed();
+                let old = code.clone();
+                if code_editor(ui, code, *language, *theme, colors, runs, 14).changed() {
+                    *runs = crate::doc::remap_runs(runs, &old, code);
+                    changed = true;
+                }
                 if ui.button(format!("{}  Fit to code", ph::ARROWS_OUT_SIMPLE)).on_hover_text("Resize the block to show every line").clicked() {
                     let s = crate::code::fit_size(ui.ctx(), code, *font_size, *line_numbers, *window);
                     edited.size = s;
@@ -2352,18 +2399,12 @@ impl BioCartoon {
         if action_row(ui, ph::MINUS, "Add horizontal guide", ph::PLUS).on_hover_text("Drag it into place; Delete removes it").clicked() {
             self.actions.push(Action::AddGuide(false));
         }
-        if toggle_row(ui, ph::MAGNET, "Snap to guides", self.settings.guide_snap).on_hover_text("Hold Alt (Option) while dragging to place freely").clicked() {
-            self.settings.guide_snap = !self.settings.guide_snap;
-        }
         let has_guides = !self.doc.guides.is_empty();
         if ui.add_enabled_ui(has_guides, |ui| action_row(ui, ph::TRASH, "Clear all guides", "")).inner.clicked() && has_guides {
             self.actions.push(Action::ClearGuides);
         }
         if toggle_row(ui, ph::GRID_FOUR, "Show gridlines", self.settings.show_grid).clicked() {
             self.settings.show_grid = !self.settings.show_grid;
-        }
-        if toggle_row(ui, ph::MAGNET, "Snap to grid", self.settings.grid_snap).on_hover_text("Edges and centers near a gridline jump onto it; hold Alt (Option) while dragging to place freely").clicked() {
-            self.settings.grid_snap = !self.settings.grid_snap;
         }
         if toggle_row(ui, ph::DOTS_NINE, "Grid increments only", self.settings.grid_steps).on_hover_text("Positions and sizes always land on the grid; hold Alt (Option) while dragging to place freely").clicked() {
             self.settings.grid_steps = !self.settings.grid_steps;
@@ -2397,6 +2438,22 @@ impl BioCartoon {
                 });
             });
         }
+        ui.add_space(4.0);
+        // One "Snap to" row whose checklist picks what moved and resized items snap to.
+        let summary = {
+            let on: Vec<&str> = self.settings.snap_targets().into_iter().filter(|(_, on, _)| **on).map(|(l, _, _)| l).collect();
+            match on.len() {
+                0 => "Off".to_string(),
+                4 => "All".to_string(),
+                _ => on.join(", "),
+            }
+        };
+        let snap_btn = action_row(ui, ph::MAGNET, "Snap to", &format!("{summary}  {}", ph::CARET_DOWN)).on_hover_text("Hold Alt (Option) while dragging to place freely");
+        egui::Popup::menu(&snap_btn).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            for (label, on, tip) in self.settings.snap_targets() {
+                ui.checkbox(on, label).on_hover_text(tip);
+            }
+        });
     }
 
     // ---------- Comments ----------
@@ -2537,9 +2594,19 @@ fn toggle_row(ui: &mut egui::Ui, icon: &str, label: &str, on: bool) -> egui::Res
         let d = r * std::f32::consts::FRAC_1_SQRT_2;
         p.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], stroke);
     }
-    p.text(Pos2::new(rect.min.x + 38.0, rect.center().y), egui::Align2::LEFT_CENTER, label, font.clone(), fg);
-    p.text(Pos2::new(rect.max.x - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, if on { "On" } else { "Off" }, font, dim);
+    row_texts(p, rect, label, font.clone(), fg, if on { "On" } else { "Off" }, font, dim);
     resp
+}
+
+/// A row's label after its icon, and `right` at its right edge, left out when the label leaves
+/// it no room (a long label at a large text size would run under it).
+#[allow(clippy::too_many_arguments)]
+fn row_texts(p: &egui::Painter, rect: Rect, label: &str, font: FontId, fg: Color32, right: &str, right_font: FontId, dim: Color32) {
+    let label_end = p.text(Pos2::new(rect.min.x + 38.0, rect.center().y), egui::Align2::LEFT_CENTER, label, font, fg).max.x;
+    let right_w = p.layout_no_wrap(right.to_string(), right_font.clone(), dim).size().x;
+    if label_end + 8.0 <= rect.max.x - 10.0 - right_w {
+        p.text(Pos2::new(rect.max.x - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, right, right_font, dim);
+    }
 }
 
 /// A row like [`toggle_row`] for a one-shot action, with `right` where the On/Off would be.
@@ -2551,8 +2618,7 @@ fn action_row(ui: &mut egui::Ui, icon: &str, label: &str, right: &str) -> egui::
     p.rect_filled(rect, 6.0, if resp.hovered() && enabled { theme::hover() } else { theme::panel_raised() });
     let (fg, dim) = if enabled { (theme::text(), theme::text_dim()) } else { (theme::text_dim(), theme::text_dim().gamma_multiply(0.5)) };
     p.text(Pos2::new(rect.min.x + 18.0, rect.center().y), egui::Align2::CENTER_CENTER, icon, FontId::proportional(16.0), dim);
-    p.text(Pos2::new(rect.min.x + 38.0, rect.center().y), egui::Align2::LEFT_CENTER, label, font, fg);
-    p.text(Pos2::new(rect.max.x - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, right, FontId::proportional(14.0), dim);
+    row_texts(p, rect, label, font, fg, right, FontId::proportional(14.0), dim);
     resp
 }
 
@@ -2758,11 +2824,12 @@ enum Tile<'a> {
 }
 
 /// The loaded icons with the matching templates mixed in. A to Z and Z to A place each template
-/// by its title, and Popular by its stars (`stars`), ahead of the icons with as many; Relevance
+/// by its title, and Popular by its stars (`stars`, or `ranked` for one whose count changed since
+/// the results loaded, as for icons), ahead of the icons with as many; Relevance
 /// has nothing to rank a template by, so it spreads the templates through the icons, at most a
 /// few tiles apart. A template whose place is past the icons loaded so far waits for the page
 /// that reaches it.
-fn mix_templates<'a>(icons: &'a [AssetRow], templates: &'a [TemplateRow], stars: &std::collections::HashMap<String, i64>, sort: IconSort, more: bool, total: usize) -> Vec<Tile<'a>> {
+fn mix_templates<'a>(icons: &'a [AssetRow], templates: &'a [TemplateRow], stars: &std::collections::HashMap<String, i64>, ranked: &std::collections::HashMap<String, i64>, sort: IconSort, more: bool, total: usize) -> Vec<Tile<'a>> {
     let key = |t: &str| t.to_lowercase();
     let mut temps: Vec<&TemplateRow> = templates.iter().collect();
     let mut at: Vec<usize> = match sort {
@@ -2778,9 +2845,10 @@ fn mix_templates<'a>(icons: &'a [AssetRow], templates: &'a [TemplateRow], stars:
             }).collect()
         }
         IconSort::Popular => {
-            let n = |t: &TemplateRow| stars.get(&t.meta.id).copied().unwrap_or(0);
+            let id = |id: &str, live: i64| ranked.get(id).copied().unwrap_or(live);
+            let n = |t: &TemplateRow| id(&t.meta.id, stars.get(&t.meta.id).copied().unwrap_or(0));
             temps.sort_by_key(|t| std::cmp::Reverse(n(t)));
-            temps.iter().map(|t| icons.iter().position(|a| a.stars <= n(t)).unwrap_or(usize::MAX)).collect()
+            temps.iter().map(|t| icons.iter().position(|a| id(&a.id, a.stars) <= n(t)).unwrap_or(usize::MAX)).collect()
         }
         IconSort::Relevance => {
             let step = (total / (temps.len() + 1)).clamp(1, 6);
@@ -2847,12 +2915,12 @@ struct TileMarks {
 /// `unsent` says whether one of the user's own icons can still go to the BioCartoon library
 /// (asked only when its menu is open).
 #[allow(clippy::too_many_arguments)]
-/// Whether generative AI made an asset, for its hover text (`None`: nobody said).
-fn ai_label(used: Option<bool>) -> &'static str {
+/// Whether generative AI made an asset, for its hover text, credit and Edit panel (`None`: nobody said).
+pub(crate) fn ai_label(used: Option<bool>) -> &'static str {
     match used {
-        Some(true) => "AI",
-        Some(false) => "No AI",
-        None => "AI not specified",
+        Some(true) => "AI-generated",
+        Some(false) => "Not AI-generated",
+        None => "AI use not specified",
     }
 }
 
@@ -2885,9 +2953,6 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, images: &mut crate::
             ui.label(format!("Database category: {}", row.category));
         }
         ui.label([name, row.license.as_str(), ai_label(row.generative_ai_used)].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  "));
-        if row.generative_ai_used == Some(true) && !row.generative_ai_details.is_empty() {
-            ui.label(format!("AI use: {}", row.generative_ai_details));
-        }
         let mut file = (if row.svg_key.is_some() { crate::catalog::FORMAT_SVG } else { crate::catalog::FORMAT_PNG }).to_string();
         if row.png_width > 0 && row.png_height > 0 {
             file += &format!("  ·  {} × {} px", row.png_width, row.png_height);
@@ -2994,8 +3059,9 @@ fn color_wheel(p: &egui::Painter, c: Pos2, radius: f32) {
     p.circle_stroke(c, radius, Stroke::new(1.5, Color32::WHITE));
 }
 
-/// Language and theme pickers for a code block; auto-detect shows what it found.
-fn code_options(ui: &mut egui::Ui, code: &str, language: &mut CodeLang, theme: &mut CodeTheme) -> bool {
+/// Language and theme pickers for a code block; auto-detect shows what it found. Under the theme,
+/// a collapsible list of its colours, each of which can be changed for this block.
+fn code_options(ui: &mut egui::Ui, code: &str, language: &mut CodeLang, theme: &mut CodeTheme, colors: &mut CodeColors) -> bool {
     let mut changed = false;
     egui::Grid::new(ui.id().with("code_opts")).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
         ui.label("Language");
@@ -3009,28 +3075,58 @@ fn code_options(ui: &mut egui::Ui, code: &str, language: &mut CodeLang, theme: &
         ui.label("Theme");
         egui::ComboBox::from_id_salt("code_theme").selected_text(theme.label()).width(170.0).show_ui(ui, |ui| {
             for t in CodeTheme::ALL {
-                changed |= ui.selectable_value(theme, t, t.label()).changed();
+                if ui.selectable_value(theme, t, t.label()).changed() {
+                    // A new theme starts from its own colours.
+                    *colors = CodeColors::default();
+                    changed = true;
+                }
             }
         });
         ui.end_row();
+    });
+    let base = theme.palette();
+    let current = theme.palette_with(colors);
+    egui::CollapsingHeader::new(format!("{} colors", theme.label())).id_salt(ui.id().with("code_colors")).default_open(!colors.is_empty()).show(ui, |ui| {
+        egui::Grid::new(ui.id().with("code_color_grid")).num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+            for (i, (_, label)) in crate::code::Palette::ROLES.iter().enumerate() {
+                ui.label(*label);
+                let mut c = current.slot(i);
+                if crate::color::edit_button_rgb(ui, &mut c).changed() {
+                    colors.0[i] = if c == base.slot(i) { None } else { Some(c) };
+                    changed = true;
+                }
+                if colors.0[i].is_some() && ui.small_button(ph::ARROW_COUNTER_CLOCKWISE).on_hover_text("Back to the theme's color").clicked() {
+                    colors.0[i] = None;
+                    changed = true;
+                }
+                ui.end_row();
+            }
+        });
+        if !colors.is_empty() && ui.button(format!("{}  Reset all to {}", ph::ARROW_COUNTER_CLOCKWISE, theme.label())).clicked() {
+            *colors = CodeColors::default();
+            changed = true;
+        }
     });
     changed
 }
 
 /// A multiline editor that highlights `code` as it is typed, in the block's theme.
-fn code_editor(ui: &mut egui::Ui, code: &mut String, language: CodeLang, theme: CodeTheme, rows: usize) -> egui::Response {
-    let pal = theme.palette();
+fn code_editor(ui: &mut egui::Ui, code: &mut String, language: CodeLang, theme: CodeTheme, colors: &CodeColors, runs: &[crate::doc::TextRun], rows: usize) -> egui::Response {
+    let pal = theme.palette_with(colors);
     let col = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
+    let old = code.clone();
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
         let text = buf.as_str();
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let mut job = egui::text::LayoutJob::default();
-        for (i, spans) in crate::code::highlight_exact(text, language.resolve(text)).iter().enumerate() {
+        // The runs belong to the code as it was before this frame's typing.
+        let runs = crate::doc::remap_runs(runs, &old, text);
+        for (i, spans) in crate::code::highlight_colored(text, language.resolve(text), &runs, true).iter().enumerate() {
             if i > 0 {
                 job.append("\n", 0.0, egui::TextFormat::simple(font.clone(), col(pal.fg)));
             }
-            for (t, k) in spans {
-                job.append(t, 0.0, egui::TextFormat::simple(font.clone(), col(pal.color(*k))));
+            for (t, k, c) in spans {
+                job.append(t, 0.0, egui::TextFormat::simple(font.clone(), col(c.unwrap_or(pal.color(*k)))));
             }
         }
         job.wrap.max_width = wrap;
@@ -3273,23 +3369,10 @@ fn text_color_field(ui: &mut egui::Ui, id: &str, color: [u8; 4], w: f32, extra_w
 /// The common colours as a row of swatches, the one matching `current` ringed (none when it is
 /// clear, unless `transparent` adds a last swatch for clear); the one clicked.
 pub(crate) fn color_presets(ui: &mut egui::Ui, current: [u8; 4], transparent: bool) -> Option<[u8; 4]> {
-    const PRESETS: [(&str, [u8; 3]); 11] = [
-        ("White", [255, 255, 255]),
-        ("Pink", [244, 143, 177]),
-        ("Red", [220, 38, 38]),
-        ("Orange", [249, 115, 22]),
-        ("Yellow", [250, 204, 21]),
-        ("Green", [22, 163, 74]),
-        ("Cyan", [6, 182, 212]),
-        ("Blue", [37, 99, 235]),
-        ("Purple", [147, 51, 234]),
-        ("Brown", [133, 77, 14]),
-        ("Black", [0, 0, 0]),
-    ];
     let mut picked = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::splat(4.0);
-        for (name, [r, g, b]) in PRESETS {
+        for (name, [r, g, b]) in crate::color::COMMON {
             let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
             let on = current[3] > 0 && current[..3] == [r, g, b];
             let ring = if on { Stroke::new(2.0, theme::accent()) } else if resp.hovered() { Stroke::new(1.5, theme::text()) } else { Stroke::new(1.0, theme::border()) };
@@ -3883,7 +3966,10 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
                 ui.label(format!("{}:", row.name));
             }
             ui.add_enabled_ui(live, |ui| {
-                let mut rgb = style.color.unwrap_or(style.colors[0]);
+                // The picker's opacity is the layer's, the same value as the box beside it.
+                let [r, g, b] = style.color.unwrap_or(style.colors[0]);
+                let alpha = (style.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mut rgba = [r, g, b, alpha];
                 let several = style.colors.len() > 1;
                 let hover = if several {
                     let hex: Vec<String> = style.colors.iter().map(|c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect();
@@ -3891,7 +3977,7 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
                 } else {
                     "Color".to_string()
                 };
-                let swatch = ui.color_edit_button_srgb(&mut rgb);
+                let swatch = crate::color::edit_button(ui, &mut rgba);
                 if several && style.color.is_none() && ui.is_rect_visible(swatch.rect) {
                     // Inside the button's 1 px border, as egui fills it.
                     let inner = swatch.rect.shrink(1.0);
@@ -3904,7 +3990,13 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
                     }
                 }
                 if swatch.on_hover_text(hover).on_disabled_hover_text("Crossed out: its color stays as drawn").changed() {
-                    style.color = Some(rgb);
+                    // Only what was changed: a new opacity alone keeps the layer's own colors.
+                    if rgba[..3] != [r, g, b] {
+                        style.color = Some([rgba[0], rgba[1], rgba[2]]);
+                    }
+                    if rgba[3] != alpha {
+                        style.opacity = rgba[3] as f32 / 255.0;
+                    }
                 }
             });
             ui.add_enabled_ui(live, |ui| {

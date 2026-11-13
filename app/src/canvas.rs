@@ -3,7 +3,7 @@
 
 use crate::app::{Action, AlignKind, ArrangeKind, BioCartoon, UploadTarget};
 use crate::assets::{ImageCache, ImgState, IMAGE_EXTS};
-use crate::doc::{c32, screen_font, CodeLang, CodeTheme, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, Script, ShapeKind, Slide, TextAlign, TextFlag, TextVAlign, Unit, DPI};
+use crate::doc::{c32, screen_font, CodeLang, Guide, Item, ItemId, ItemKind, LineFamily, LineHead, LineKind, Script, ShapeKind, Slide, TextAlign, TextFlag, TextVAlign, Unit, DPI};
 use crate::theme;
 use egui::emath::Rot2;
 use std::path::Path;
@@ -656,22 +656,20 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
                 }
             }
         }
-        ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded } => {
-            draw_code(painter, xf.rect(it.rect()), z, op, code, *language, *theme, *font_size, *line_numbers, *window, *rounded);
+        ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded, colors, runs } => {
+            draw_code(painter, xf.rect(it.rect()), z, op, code, runs, *language, theme.palette_with(colors), *font_size, *line_numbers, *window, *rounded, false);
         }
     }
 }
 
 /// A code block: themed window, optional title-bar dots and line numbers, highlighted code
-/// clipped to the item's rect.
-fn draw_code(painter: &egui::Painter, rs: Rect, z: f32, op: f32, code: &str, language: CodeLang, theme: CodeTheme, font_size: f32, line_numbers: bool, window: bool, rounded: bool) {
-    let pal = theme.palette();
+/// clipped to the item's rect. While `editing`, the code itself is left to the on-canvas editor
+/// ([`code_geometry`]), and every line of the raw text is numbered, trailing blank ones included.
+#[allow(clippy::too_many_arguments)]
+fn draw_code(painter: &egui::Painter, rs: Rect, z: f32, op: f32, code: &str, runs: &[crate::doc::TextRun], language: CodeLang, pal: crate::code::Palette, font_size: f32, line_numbers: bool, window: bool, rounded: bool, editing: bool) {
     let col = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]).gamma_multiply(op);
-    let fs = screen_font(painter.ctx(), font_size * z);
-    let font = FontId::monospace(fs);
-    let (char_w, line_h) = painter.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    let lines = crate::code::highlight(code, language.resolve(code));
-    let lay = crate::code::BlockLayout::new(fs, lines.len(), line_numbers, window, char_w, line_h);
+    let (fs, font, line_h, lay) = code_geometry(painter.ctx(), code, z, font_size, line_numbers, window, editing);
+    let lines = if editing { vec![Vec::new(); code.split('\n').count()] } else { crate::code::highlight_colored(code, language.resolve(code), runs, false) };
     painter.rect_filled(rs, if rounded { lay.radius } else { 0.0 }, col(pal.bg));
     if window {
         for (c, r, rgb) in lay.dots(fs) {
@@ -693,11 +691,21 @@ fn draw_code(painter: &egui::Painter, rs: Rect, z: f32, op: f32, code: &str, lan
             p.galley(Pos2::new(rs.min.x + o[0] - fs * 1.4 - g.size().x, y), g, Color32::PLACEHOLDER);
         }
         let mut job = egui::text::LayoutJob::default();
-        for (t, k) in spans {
-            job.append(t, 0.0, egui::TextFormat::simple(font.clone(), col(pal.color(*k))));
+        for (t, k, c) in spans {
+            job.append(t, 0.0, egui::TextFormat::simple(font.clone(), col(c.unwrap_or(pal.color(*k)))));
         }
         p.galley(Pos2::new(rs.min.x + o[0], y), p.layout_job(job), Color32::PLACEHOLDER);
     }
+}
+
+/// A code block's screen font size, font, row height and layout at zoom `z`; `editing` counts the
+/// raw text's lines (as the on-canvas editor shows them) rather than the displayed ones.
+fn code_geometry(ctx: &egui::Context, code: &str, z: f32, font_size: f32, line_numbers: bool, window: bool, editing: bool) -> (f32, FontId, f32, crate::code::BlockLayout) {
+    let fs = screen_font(ctx, font_size * z);
+    let font = FontId::monospace(fs);
+    let (char_w, line_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
+    let lines = if editing { code.split('\n').count() } else { crate::code::line_count(code) };
+    (fs, font, line_h, crate::code::BlockLayout::new(fs, lines, line_numbers, window, char_w, line_h))
 }
 
 /// The layout job for a text item's text at `zoom`, wrapped to `width` screen px, faded to
@@ -866,8 +874,8 @@ pub fn draw_slide(painter: &egui::Painter, xf: &Xform, slide: &Slide, page: Rect
     draw_slide_except(painter, xf, slide, page, bg, images, None, true);
 }
 
-/// [`draw_slide`] leaving out `skip`: the text of the box being edited (its fill stays), or for a
-/// table the text of the cell being edited, which its editor draws.
+/// [`draw_slide`] leaving out `skip`: the text of the box being edited (its fill stays), for a
+/// table the text of the cell being edited, or a code block's code, which its editor draws.
 /// Unless `clip_to_page`, items hanging off the page stay visible (they just don't export).
 fn draw_slide_except(painter: &egui::Painter, xf: &Xform, slide: &Slide, page: Rect, bg: Color32, images: &mut ImageCache, skip: Option<(ItemId, usize)>, clip_to_page: bool) {
     let rs = xf.rect(page);
@@ -886,6 +894,11 @@ fn draw_slide_except(painter: &egui::Painter, xf: &Xform, slide: &Slide, page: R
                     ItemKind::Text { text, runs, fill, .. } if fill[3] > 0 => {
                         text.clear();
                         runs.clear();
+                    }
+                    ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded, colors, .. } => {
+                        let op = it.opacity.clamp(0.0, 1.0);
+                        draw_code(&p, xf.rect(it.rect()), xf.zoom, op, code, &[], *language, theme.palette_with(colors), *font_size, *line_numbers, *window, *rounded, true);
+                        continue;
                     }
                     _ => continue,
                 }
@@ -1011,6 +1024,7 @@ impl BioCartoon {
                 }
             }
             self.draw_guides(&painter, rect, &xf);
+            self.draw_snap_hints(&painter, rect, &xf);
             if self.settings.show_rulers {
                 self.draw_rulers(&painter, rect, &xf);
             }
@@ -1147,12 +1161,15 @@ impl BioCartoon {
     /// canvas draws it, so typing happens in place.
     fn text_editor(&mut self, ui: &mut egui::Ui, canvas: Rect, xf: &Xform) {
         let Some(id) = self.editing_text else { return };
-        let Some(before) = self.item(id).filter(|i| matches!(i.kind, ItemKind::Text { .. } | ItemKind::Table { .. }) && self.selection.contains(&id)).cloned() else {
+        let Some(before) = self.item(id).filter(|i| matches!(i.kind, ItemKind::Text { .. } | ItemKind::Table { .. } | ItemKind::Code { .. }) && self.selection.contains(&id)).cloned() else {
             self.finish_text_edit();
             return;
         };
         if let ItemKind::Table { .. } = before.kind {
             return self.cell_editor(ui, canvas, xf, before);
+        }
+        if let ItemKind::Code { .. } = before.kind {
+            return self.code_block_editor(ui, canvas, xf, before);
         }
         let z = xf.zoom;
         let rs = xf.rect(before.rect());
@@ -1211,6 +1228,80 @@ impl BioCartoon {
             if let ItemKind::Text { text, .. } = &before.kind {
                 edited.remap_text_runs(text);
             }
+            self.update_item(&before, edited);
+        }
+    }
+
+    /// The code block being edited: a `TextEdit` laid over its code, highlighted and placed as the
+    /// canvas draws it. Tab indents with spaces (as blocks show tabs); the block grows to fit.
+    fn code_block_editor(&mut self, ui: &mut egui::Ui, canvas: Rect, xf: &Xform, before: Item) {
+        let (id, z) = (before.id, xf.zoom);
+        let rs = xf.rect(before.rect());
+        let mut edited = before.clone();
+        let ItemKind::Code { code, language, theme, font_size, line_numbers, window, colors, runs, .. } = &mut edited.kind else { return };
+        let old = code.clone();
+        let op = before.opacity.clamp(0.0, 1.0);
+        let pal = theme.palette_with(colors);
+        let col = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]).gamma_multiply(op);
+        let (_, font, _, lay) = code_geometry(ui.ctx(), code, z, *font_size, *line_numbers, *window, true);
+        let te_id = egui::Id::new(("text_editor", id));
+        let tab = ui.memory(|m| m.has_focus(te_id)) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+        let lang = language.resolve(code);
+        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+            let mut job = egui::text::LayoutJob::default();
+            // The runs belong to the code as it was before this frame's typing.
+            let runs = crate::doc::remap_runs(runs, &old, buf.as_str());
+            for (k, spans) in crate::code::highlight_colored(buf.as_str(), lang, &runs, true).iter().enumerate() {
+                if k > 0 {
+                    job.append("\n", 0.0, egui::TextFormat::simple(font.clone(), col(pal.fg)));
+                }
+                for (t, tok, c) in spans {
+                    job.append(t, 0.0, egui::TextFormat::simple(font.clone(), col(c.unwrap_or(pal.color(*tok)))));
+                }
+            }
+            ui.painter().layout_job(job)
+        };
+        let o = lay.text_origin();
+        let inner = Rect::from_min_max(rs.min + Vec2::new(o[0], o[1]), rs.max.max(rs.min + Vec2::new(o[0], o[1])));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)));
+        child.set_clip_rect(rs.shrink(1.0).intersect(canvas).intersect(ui.clip_rect()));
+        let caret = &mut child.visuals_mut().text_cursor;
+        caret.stroke = Stroke::new((1.5 * z.sqrt()).clamp(1.0, 3.0), col(pal.fg));
+        caret.blink = true;
+        let out = egui::TextEdit::multiline(code)
+            .id(te_id)
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::ZERO)
+            .desired_width(f32::INFINITY)
+            .min_size(inner.size())
+            .lock_focus(true)
+            .layouter(&mut layouter)
+            .show(&mut child);
+        if std::mem::take(&mut self.text_edit_focus) {
+            out.response.request_focus();
+        }
+        if tab {
+            if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), te_id) {
+                if let Some(r) = state.cursor.char_range() {
+                    let (a, b) = (r.primary.index.min(r.secondary.index).0, r.primary.index.max(r.secondary.index).0);
+                    let byte = |c: usize| code.char_indices().nth(c).map_or(code.len(), |(i, _)| i);
+                    code.replace_range(byte(a)..byte(b), crate::code::TAB);
+                    let at = egui::text::CCursor::new(a + crate::code::TAB.chars().count());
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(at)));
+                    state.store(ui.ctx(), te_id);
+                }
+            }
+        }
+        ui.painter().with_clip_rect(canvas).rect_stroke(rs.expand(2.0), 0.0, Stroke::new(1.0, Color32::from_gray(160)), StrokeKind::Outside);
+        // Grow the block to show what has been typed.
+        let need = crate::code::fit_size(ui.ctx(), code, *font_size, *line_numbers, *window);
+        edited.size[0] = edited.size[0].max(need[0]);
+        edited.size[1] = edited.size[1].max(need[1]);
+        if out.response.lost_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.finish_text_edit();
+        }
+        if edited != before {
+            edited.remap_text_runs(&old);
             self.update_item(&before, edited);
         }
     }
@@ -1310,6 +1401,47 @@ impl BioCartoon {
                 let align = if g.vertical { egui::Align2::LEFT_TOP } else { egui::Align2::LEFT_BOTTOM };
                 painter.text(at, align, text, FontId::proportional(11.0), theme::accent());
             }
+        }
+    }
+
+    /// The lines a moved or resized selection snaps to besides the user's guides: the page's edges
+    /// and centers, and the edges and centers of every unselected item on the slide.
+    fn smart_lines(&self) -> Vec<Guide> {
+        let mut v = Vec::new();
+        let mut add = |r: Rect| {
+            for x in [r.min.x, r.center().x, r.max.x] {
+                v.push(Guide { vertical: true, pos: x });
+            }
+            for y in [r.min.y, r.center().y, r.max.y] {
+                v.push(Guide { vertical: false, pos: y });
+            }
+        };
+        if self.settings.page_snap {
+            add(self.doc.page_rect());
+        }
+        if self.settings.object_snap {
+            for it in self.slide().items.iter().filter(|i| !self.selection.contains(&i.id)) {
+                add(Rect::from_points(&corners(it)));
+            }
+        }
+        v
+    }
+
+    /// The page and object lines the dragged selection has snapped to, dashed across the canvas.
+    fn draw_snap_hints(&self, painter: &egui::Painter, rect: Rect, xf: &Xform) {
+        if !matches!(self.drag, Some(Drag::Move { .. } | Drag::Resize { .. } | Drag::LineEnd { .. })) {
+            return;
+        }
+        let stroke = Stroke::new(1.0, theme::accent());
+        for g in &self.snap_hints {
+            let ends = if g.vertical {
+                let x = xf.to_screen(Pos2::new(g.pos, 0.0)).x;
+                [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)]
+            } else {
+                let y = xf.to_screen(Pos2::new(0.0, g.pos)).y;
+                [Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)]
+            };
+            painter.extend(egui::Shape::dashed_line(&ends, stroke, 6.0, 4.0));
         }
     }
 
@@ -1417,7 +1549,18 @@ impl BioCartoon {
         // Grid steps round every position to the grid; grid snapping only pulls onto gridlines in reach.
         let snapping = self.settings.grid_steps && !alt;
         let grid = (self.settings.grid_snap && !self.settings.grid_steps && !alt).then_some(g);
-        let guides: Vec<Guide> = if self.settings.guide_snap && !alt { self.doc.guides.clone() } else { Vec::new() };
+        // Page and object lines (PowerPoint's smart guides) are drawn while something snaps to them;
+        // the user's own guides are always visible.
+        let smart: Vec<Guide> = if alt { Vec::new() } else { self.smart_lines() };
+        let mut guides: Vec<Guide> = if self.settings.guide_snap && !alt { self.doc.guides.clone() } else { Vec::new() };
+        guides.extend_from_slice(&smart);
+        let hints = |xs: &[f32], ys: &[f32]| -> Vec<Guide> {
+            smart
+                .iter()
+                .filter(|l| (if l.vertical { xs } else { ys }).iter().any(|v| (v - l.pos).abs() < 0.01))
+                .copied()
+                .collect()
+        };
         let tol = 6.0 / xf.zoom;
 
         // Cursor feedback
@@ -1538,7 +1681,8 @@ impl BioCartoon {
                             self.selection.push(id);
                             self.expand_groups();
                         } else {
-                            self.select_quietly(vec![id]);
+                            // Inside a selected group, pressing a sibling takes just it.
+                            self.click_select(id);
                         }
                     }
                     let locked = self.selected_items().iter().any(|i| i.locked);
@@ -1559,6 +1703,9 @@ impl BioCartoon {
             }
         }
 
+        if !matches!(self.drag, Some(Drag::Move { .. } | Drag::Resize { .. } | Drag::LineEnd { .. })) {
+            self.snap_hints.clear();
+        }
         if response.dragged() {
             if let Some(p) = ptr {
                 let d = xf.to_doc(p);
@@ -1610,6 +1757,8 @@ impl BioCartoon {
                         if shift {
                             if dv.x.abs() > dv.y.abs() { dv.y = 0.0 } else { dv.x = 0.0 }
                         }
+                        let r = sel_rect.translate(dv);
+                        self.snap_hints = hints(&[r.min.x, r.center().x, r.max.x], &[r.min.y, r.center().y, r.max.y]);
                         let moves: Vec<(ItemId, Rect)> = start_rects.iter().map(|(id, r)| (*id, r.translate(dv))).collect();
                         for (id, r) in moves {
                             if let Some(it) = self.item_mut(id) {
@@ -1622,6 +1771,14 @@ impl BioCartoon {
                         if shift {
                             let s = 15f32.to_radians();
                             a = (a / s).round() * s;
+                        } else if !alt {
+                            // A gentle magnet at every 45°: within a few degrees it clicks onto the
+                            // angle, further out it rotates freely. Alt turns it off.
+                            let s = 45f32.to_radians();
+                            let near = (a / s).round() * s;
+                            if (a - near).abs() <= 4f32.to_radians() {
+                                a = near;
+                            }
                         }
                         let id = *id;
                         if let Some(it) = self.item_mut(id) {
@@ -1637,6 +1794,7 @@ impl BioCartoon {
                             q = Pos2::new(snap(q.x, g), snap(q.y, g));
                         }
                         q = snap_point_to_guides(&guides, grid, q, tol);
+                        self.snap_hints = hints(&[q.x], &[q.y]);
                         if let Some(it) = self.item_mut(id) {
                             if !path.is_empty() {
                                 set_freehand_path(it, &move_path_end(&path, end, q));
@@ -1668,6 +1826,7 @@ impl BioCartoon {
                                 lp = Pos2::new(snap(lp.x, g), snap(lp.y, g));
                             }
                             lp = snap_point_to_guides(&guides, grid, lp, tol);
+                            self.snap_hints = hints(&[lp.x], &[lp.y]);
                         }
                         let mut min = local_start.min;
                         let mut max = local_start.max;
@@ -1736,7 +1895,13 @@ impl BioCartoon {
                     ids.extend(self.selection.iter().copied());
                     ids.dedup();
                 }
-                self.select(ids);
+                // Like a click, a marquee only selects; it doesn't open Edit. Catching nothing
+                // clears the selection (and closes Edit) like a click on empty canvas.
+                if ids.is_empty() {
+                    self.select(ids);
+                } else {
+                    self.select_quietly(ids);
+                }
             }
             self.drag = None;
         }
@@ -1751,7 +1916,7 @@ impl BioCartoon {
                     match self.item_at(d, tol) {
                         Some(id) if alt => self.actions.push(Action::ToggleSelect(id, false)),
                         Some(id) if shift => self.actions.push(Action::ToggleSelect(id, true)),
-                        Some(id) => self.select_quietly(vec![id]),
+                        Some(id) => self.click_select(id),
                         None => self.select(Vec::new()),
                     }
                 }
@@ -1769,7 +1934,8 @@ impl BioCartoon {
             if let Some(p) = ptr {
                 let d = xf.to_doc(p);
                 if let Some(id) = self.item_at(d, tol) {
-                    self.select_quietly(vec![id]);
+                    // Edit the item itself, even inside a group.
+                    self.select_only(id);
                     // Unlike a selection, which leaves a hidden options menu hidden.
                     self.settings.show_rail = true;
                     self.open_edit_tab();
@@ -1788,7 +1954,7 @@ impl BioCartoon {
                 } else {
                     match self.item_at(xf.to_doc(p), tol) {
                         Some(id) if self.selection.contains(&id) => self.selected_guide = None,
-                        Some(id) => self.select_quietly(vec![id]),
+                        Some(id) => self.click_select(id),
                         None => self.select(Vec::new()),
                     }
                 }
@@ -1881,9 +2047,6 @@ impl BioCartoon {
             self.actions.push(Action::AddGuide(false));
             ui.close();
         }
-        if ui.add(egui::Button::new(format!("{}  Snap to guides", ph::MAGNET)).right_text(check(self.settings.guide_snap))).on_hover_text("Hold Alt (Option) while dragging to place freely").clicked() {
-            self.settings.guide_snap = !self.settings.guide_snap;
-        }
         if ui.add_enabled(!self.doc.guides.is_empty(), egui::Button::new(format!("{}  Clear all guides", ph::TRASH))).clicked() {
             self.actions.push(Action::ClearGuides);
             ui.close();
@@ -1892,12 +2055,18 @@ impl BioCartoon {
         if ui.add(egui::Button::new(format!("{}  Show gridlines", ph::GRID_FOUR)).right_text(check(self.settings.show_grid))).clicked() {
             self.settings.show_grid = !self.settings.show_grid;
         }
-        if ui.add(egui::Button::new(format!("{}  Snap to grid", ph::MAGNET)).right_text(check(self.settings.grid_snap))).on_hover_text("Edges and centers near a gridline jump onto it; hold Alt (Option) while dragging to place freely").clicked() {
-            self.settings.grid_snap = !self.settings.grid_snap;
-        }
         if ui.add(egui::Button::new(format!("{}  Grid increments only", ph::DOTS_NINE)).right_text(check(self.settings.grid_steps))).on_hover_text("Positions and sizes always land on the grid; hold Alt (Option) while dragging to place freely").clicked() {
             self.settings.grid_steps = !self.settings.grid_steps;
         }
+        ui.menu_button(format!("{}  Snap to", ph::MAGNET), |ui| {
+            for (label, on, tip) in self.settings.snap_targets() {
+                if ui.add(egui::Button::new(label).right_text(check(*on))).on_hover_text(tip).clicked() {
+                    *on = !*on;
+                }
+            }
+        })
+        .response
+        .on_hover_text("Hold Alt (Option) while dragging to place freely");
         ui.separator();
         if ui.button(format!("{}  Show credits", ph::QUOTES)).on_hover_text("Credits for the library artwork on this slide").clicked() {
             self.show_attributions = true;
@@ -1929,7 +2098,7 @@ impl BioCartoon {
         };
         let locked = has && items.iter().all(|i| i.locked);
         let grouped = self.is_grouped();
-        let multi = items.len() > 1;
+        let can_group = self.can_group();
         // A single library image (or an edit of one) has a credit to show.
         let (credited, icon_name, credit_text) = match items[..] {
             [it] => self.item_credit(it).map(|(title, credit)| (Some(it.id), Some(title), Some(credit))).unwrap_or_default(),
@@ -1973,10 +2142,13 @@ impl BioCartoon {
                 }
             });
         });
+        // Group whenever the selection isn't already one whole group; Ungroup whenever any of it
+        // is grouped. A group plus a loose item offers both.
+        if can_group || !grouped {
+            item(ui, can_group, ph::SELECTION_ALL, "Group", "⌘G", Action::Group);
+        }
         if grouped {
             item(ui, has, ph::SELECTION_SLASH, "Ungroup", "⇧⌘G", Action::Ungroup);
-        } else {
-            item(ui, multi, ph::SELECTION_ALL, "Group", "⌘G", Action::Group);
         }
         ui.add_enabled_ui(has, |ui| {
             ui.menu_button(format!("{}  Arrange", ph::STACK), |ui| {

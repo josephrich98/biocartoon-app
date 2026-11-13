@@ -217,6 +217,16 @@ fn color(args: &Value, k: &str) -> Option<[u8; 4]> {
     let c = |i: usize, d: u8| a.get(i).and_then(Value::as_u64).map(|v| v.min(255) as u8).unwrap_or(d);
     Some([c(0, 0), c(1, 0), c(2, 0), c(3, 255)])
 }
+/// Apply `{"keyword": [r, g, b], "string": null, ...}`: a colour overrides that role, null restores
+/// the theme's.
+fn set_code_colors(colors: &mut crate::doc::CodeColors, m: &Value) -> Result<(), String> {
+    let roles = crate::code::Palette::ROLES;
+    for (k, v) in m.as_object().ok_or("colors must be an object of role: [r, g, b]")? {
+        let i = roles.iter().position(|(name, _)| key(name) == key(k)).ok_or_else(|| format!("unknown code color {k:?}; one of {}", roles.map(|r| r.0).join(", ")))?;
+        colors.0[i] = if v.is_null() { None } else { color(&json!({ "c": v }), "c").map(|c| [c[0], c[1], c[2]]) };
+    }
+    Ok(())
+}
 /// Enum names are accepted in any case, with or without underscores ("rounded_rectangle").
 fn key(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
@@ -235,7 +245,7 @@ fn name_of<T: std::fmt::Debug>(v: T) -> String {
 const ITEM_ARGS: &[&str] = &[
     "x", "y", "width", "height", "x1", "y1", "x2", "y2", "rotation", "flip_h", "flip_v", "locked", "opacity", "name", "crop", "overlay",
     "text", "font_size", "color", "highlight", "bold", "italic", "underline", "strikethrough", "superscript", "subscript", "font", "line_spacing", "align", "valign", "shape", "fill", "stroke",
-    "stroke_width", "line_kind", "line_style", "line_width", "header", "cells", "code", "language", "theme", "line_numbers", "window", "rounded",
+    "stroke_width", "line_kind", "line_style", "line_width", "header", "cells", "code", "language", "theme", "line_numbers", "window", "rounded", "colors", "text_colors",
 ];
 
 /// The arguments `cmd` takes; `None` for an unknown command (which fails on its own).
@@ -358,8 +368,12 @@ pub fn item_json(it: &Item) -> Value {
             o.insert("header".into(), json!(header));
             o.insert("font_size".into(), json!(font_size));
         }
-        ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded } => {
+        ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded, colors, runs } => {
             o.insert("code".into(), json!(code));
+            let spans: Vec<Value> = runs.iter().filter_map(|r| r.style.color.map(|c| json!({"start": r.start, "end": r.end, "color": [c[0], c[1], c[2]]}))).collect();
+            if !spans.is_empty() {
+                o.insert("text_colors".into(), json!(spans));
+            }
             o.insert("language".into(), json!(name_of(language)));
             if *language == CodeLang::Auto {
                 o.insert("detected_language".into(), json!(name_of(language.resolve(code))));
@@ -369,6 +383,10 @@ pub fn item_json(it: &Item) -> Value {
             o.insert("line_numbers".into(), json!(line_numbers));
             o.insert("window".into(), json!(window));
             o.insert("rounded".into(), json!(rounded));
+            let changed: serde_json::Map<String, Value> = colors.0.iter().zip(crate::code::Palette::ROLES).filter_map(|(c, (k, _))| c.map(|c| (k.to_string(), json!(c)))).collect();
+            if !changed.is_empty() {
+                o.insert("colors".into(), Value::Object(changed));
+            }
         }
     }
     v
@@ -452,10 +470,29 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
                 }
             }
         }
-        ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded } => {
-            if let Some(v) = s(args, "code") { *code = v.to_string(); }
+        ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded, colors, runs } => {
+            if let Some(v) = s(args, "code") {
+                *runs = crate::doc::remap_runs(runs, code, v);
+                *code = v.to_string();
+            }
+            if let Some(v) = args.get("text_colors") {
+                let Some(list) = v.as_array() else { return Err("text_colors must be a list of {start, end, color}".into()) };
+                if list.is_empty() {
+                    runs.clear();
+                }
+                for t in list {
+                    let n = |k: &str| t.get(k).and_then(Value::as_u64).map(|v| v as usize).ok_or_else(|| format!("text_colors: each needs {k}"));
+                    let c = if t.get("color").is_none_or(Value::is_null) { None } else { color(t, "color").map(|c| [c[0], c[1], c[2]]) };
+                    crate::doc::color_code_range(code, runs, n("start")?..n("end")?, c);
+                }
+            }
             if let Some(v) = s(args, "language") { *language = parse_enum(&CodeLang::ALL, v, "language")?; }
-            if let Some(v) = s(args, "theme") { *theme = parse_enum(&CodeTheme::ALL, v, "theme")?; }
+            if let Some(v) = s(args, "theme") {
+                let t = parse_enum(&CodeTheme::ALL, v, "theme")?;
+                if t != *theme { *colors = Default::default(); }
+                *theme = t;
+            }
+            if let Some(m) = args.get("colors") { set_code_colors(colors, m)?; }
             if let Some(v) = f(args, "font_size") { *font_size = v.clamp(1.0, MAX_FONT_SIZE); }
             if let Some(v) = b(args, "line_numbers") { *line_numbers = v; }
             if let Some(v) = b(args, "window") { *window = v; }
@@ -642,7 +679,9 @@ impl BioCartoon {
                 let window = b(args, "window").unwrap_or(false);
                 let rounded = b(args, "rounded").unwrap_or(false);
                 let size = crate::code::fit_size(ctx, &code, 14.0, line_numbers, window);
-                let kind = ItemKind::Code { code, language, theme, font_size: 14.0, line_numbers, window, rounded };
+                let mut colors = crate::doc::CodeColors::default();
+                if let Some(m) = args.get("colors") { set_code_colors(&mut colors, m)?; }
+                let kind = ItemKind::Code { code, language, theme, font_size: 14.0, line_numbers, window, rounded, colors, runs: Vec::new() };
                 let item = Item::new(0, "Code", kind, Pos2::ZERO, Vec2::new(size[0], size[1]));
                 self.insert_new(item, args)
             }

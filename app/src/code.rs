@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Spaces a tab expands to, everywhere code is shown.
-const TAB: &str = "    ";
+pub const TAB: &str = "    ";
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CodeLang {
@@ -29,23 +29,24 @@ pub enum CodeLang {
 }
 
 impl CodeLang {
+    /// Menu order: Auto-detect (the default) first, then alphabetical by label.
     pub const ALL: [CodeLang; 17] = [
         CodeLang::Auto,
+        CodeLang::Bash,
+        CodeLang::C,
+        CodeLang::Cpp,
+        CodeLang::Go,
+        CodeLang::Java,
+        CodeLang::JavaScript,
+        CodeLang::Json,
+        CodeLang::Julia,
+        CodeLang::Matlab,
         CodeLang::Plain,
         CodeLang::Python,
         CodeLang::R,
-        CodeLang::Julia,
-        CodeLang::Matlab,
         CodeLang::Rust,
-        CodeLang::C,
-        CodeLang::Cpp,
-        CodeLang::Java,
-        CodeLang::JavaScript,
-        CodeLang::TypeScript,
-        CodeLang::Go,
-        CodeLang::Bash,
         CodeLang::Sql,
-        CodeLang::Json,
+        CodeLang::TypeScript,
         CodeLang::Yaml,
     ];
 
@@ -88,6 +89,17 @@ pub enum CodeTheme {
     SolarizedLight,
 }
 
+/// Per-block overrides of a theme's colours, one slot per [`Palette::ROLES`] entry; `None` keeps
+/// the theme's colour.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeColors(pub [Option<[u8; 3]>; 11]);
+
+impl CodeColors {
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+}
+
 /// A theme's colours, as rgb.
 pub struct Palette {
     pub bg: [u8; 3],
@@ -101,6 +113,43 @@ pub struct Palette {
     pub operator: [u8; 3],
     pub property: [u8; 3],
     pub line_number: [u8; 3],
+}
+
+impl Palette {
+    /// The colour roles, in [`CodeColors`] slot order: (name for scripts, label).
+    pub const ROLES: [(&'static str, &'static str); 11] = [
+        ("background", "Background"),
+        ("text", "Text"),
+        ("comment", "Comments"),
+        ("keyword", "Keywords"),
+        ("string", "Strings"),
+        ("number", "Numbers"),
+        ("function", "Functions"),
+        ("type", "Types"),
+        ("operator", "Operators"),
+        ("property", "Properties"),
+        ("line_number", "Line numbers"),
+    ];
+
+    pub fn slot(&self, i: usize) -> [u8; 3] {
+        [self.bg, self.fg, self.comment, self.keyword, self.string, self.number, self.function, self.ty, self.operator, self.property, self.line_number][i]
+    }
+
+    pub fn slot_mut(&mut self, i: usize) -> &mut [u8; 3] {
+        match i {
+            0 => &mut self.bg,
+            1 => &mut self.fg,
+            2 => &mut self.comment,
+            3 => &mut self.keyword,
+            4 => &mut self.string,
+            5 => &mut self.number,
+            6 => &mut self.function,
+            7 => &mut self.ty,
+            8 => &mut self.operator,
+            9 => &mut self.property,
+            _ => &mut self.line_number,
+        }
+    }
 }
 
 const fn rgb(c: u32) -> [u8; 3] {
@@ -119,6 +168,17 @@ impl CodeTheme {
             CodeTheme::GitHubLight => "GitHub Light",
             CodeTheme::SolarizedLight => "Solarized Light",
         }
+    }
+
+    /// This theme's palette with a block's overrides applied.
+    pub fn palette_with(self, colors: &CodeColors) -> Palette {
+        let mut p = self.palette();
+        for (i, c) in colors.0.iter().enumerate() {
+            if let Some(c) = c {
+                *p.slot_mut(i) = *c;
+            }
+        }
+        p
     }
 
     pub fn palette(self) -> Palette {
@@ -374,6 +434,84 @@ pub type Span = (String, Tok);
 /// `code` as a block shows it: tabs expanded, no trailing blank lines.
 fn display(code: &str) -> String {
     code.replace("\r\n", "\n").replace('\t', TAB).trim_end_matches(['\n', ' ']).to_string()
+}
+
+/// [`display`] carrying each character's own colour (from `styles`, one per char of `code`) along.
+fn display_with(code: &str, styles: &[crate::doc::RunStyle]) -> (String, Vec<Option<[u8; 3]>>) {
+    let cs: Vec<char> = code.chars().collect();
+    let (mut s, mut cols) = (String::new(), Vec::new());
+    for (i, ch) in cs.iter().enumerate() {
+        let c = styles.get(i).and_then(|r| r.color).map(|c| [c[0], c[1], c[2]]);
+        match ch {
+            '\r' if cs.get(i + 1) == Some(&'\n') => {}
+            '\t' => {
+                s.push_str(TAB);
+                cols.extend(std::iter::repeat_n(c, TAB.len()));
+            }
+            _ => {
+                s.push(*ch);
+                cols.push(c);
+            }
+        }
+    }
+    while s.ends_with(['\n', ' ']) {
+        s.pop();
+        cols.pop();
+    }
+    (s, cols)
+}
+
+/// A run of code in one colour: its text, its token, and the colour set on those characters.
+pub type ColoredSpan = (String, Tok, Option<[u8; 3]>);
+
+/// `code`'s lines as [`highlight`] (or, when `exact`, [`highlight_exact`]) splits them, split
+/// further where the characters' own colours change. `runs` index `code`'s chars.
+pub fn highlight_colored(code: &str, lang: CodeLang, runs: &[crate::doc::TextRun], exact: bool) -> Vec<Vec<ColoredSpan>> {
+    let styles = crate::doc::expand_runs(runs, code.chars().count());
+    let (text, cols) = if exact { (code.to_string(), styles.iter().map(|r| r.color.map(|c| [c[0], c[1], c[2]])).collect()) } else { display_with(code, &styles) };
+    let mut i = 0;
+    let mut out = Vec::new();
+    for (n, spans) in highlight_exact(&text, lang).into_iter().enumerate() {
+        if n > 0 {
+            i += 1; // the line break
+        }
+        let mut line = Vec::new();
+        for (t, k) in spans {
+            let (mut cur, mut cur_c) = (String::new(), None);
+            for ch in t.chars() {
+                let c = cols.get(i).copied().flatten();
+                if !cur.is_empty() && c != cur_c {
+                    line.push((std::mem::take(&mut cur), k, cur_c));
+                }
+                cur_c = c;
+                cur.push(ch);
+                i += 1;
+            }
+            if !cur.is_empty() {
+                line.push((cur, k, cur_c));
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// The colour character `at` (of `code`, as typed) is drawn in.
+pub fn color_at(code: &str, lang: CodeLang, pal: &Palette, runs: &[crate::doc::TextRun], at: usize) -> [u8; 3] {
+    let mut i = 0;
+    for (n, line) in highlight_colored(code, lang, runs, true).iter().enumerate() {
+        if n > 0 {
+            i += 1;
+        }
+        for (t, k, c) in line {
+            let len = t.chars().count();
+            if at < i + len {
+                return c.unwrap_or(pal.color(*k));
+            }
+            i += len;
+        }
+    }
+    pal.fg
 }
 
 /// Split `code` into lines of coloured runs, as a block shows it (see [`display`]).
@@ -634,6 +772,23 @@ mod tests {
         assert_eq!(detect("const x = (a) => a + 1;\nconsole.log(x(2));\n"), CodeLang::JavaScript);
         assert_eq!(detect("package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n"), CodeLang::Go);
         assert_eq!(detect("hello there"), CodeLang::Plain);
+    }
+
+    #[test]
+    fn colored_runs_follow_tabs_and_lines() {
+        use crate::doc::{RunStyle, TextRun};
+        let red = TextRun { start: 4, end: 7, style: RunStyle { color: Some([255, 0, 0, 255]), ..Default::default() } };
+        // "a\tb" then "x = 12": chars 4..7 are "x =" on the second line.
+        let lines = highlight_colored("a\tb\nx = 12\n\n", CodeLang::Python, &[red], false);
+        assert_eq!(lines.len(), 2);
+        let text = |l: &Vec<ColoredSpan>| l.iter().map(|s| s.0.as_str()).collect::<String>();
+        assert_eq!(text(&lines[0]), "a    b");
+        assert_eq!(text(&lines[1]), "x = 12");
+        let red_text: String = lines[1].iter().filter(|s| s.2.is_some()).map(|s| s.0.as_str()).collect();
+        assert_eq!(red_text, "x =");
+        let (shown, cols) = display_with("a\tb\r\n  \n", &[]);
+        assert_eq!(shown, display("a\tb\r\n  \n"));
+        assert_eq!(cols.len(), shown.chars().count());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use egui::{Color32, Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
 
-pub use crate::code::{CodeLang, CodeTheme};
+pub use crate::code::{CodeColors, CodeLang, CodeTheme};
 
 pub const DPI: f32 = 96.0;
 pub type ItemId = u64;
@@ -775,6 +775,12 @@ pub enum ItemKind {
         /// Rounded corners (square when off).
         #[serde(default)]
         rounded: bool,
+        /// Colours changed from the theme's.
+        #[serde(default, skip_serializing_if = "CodeColors::is_empty")]
+        colors: CodeColors,
+        /// Colours set on some characters of `code` (only `color` is used), over the theme's.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        runs: Vec<TextRun>,
     },
 }
 
@@ -1081,11 +1087,28 @@ pub fn set_color(kind: &mut ItemKind, range: Option<std::ops::Range<usize>>, c: 
     );
 }
 
+/// Colour the characters in `range` of a code block, or give them back the theme's colours for `None`.
+pub fn set_code_color(kind: &mut ItemKind, range: std::ops::Range<usize>, c: Option<[u8; 3]>) {
+    if let ItemKind::Code { code, runs, .. } = kind {
+        color_code_range(code, runs, range, c);
+    }
+}
+
+/// [`set_code_color`] on a block's `code` and `runs`.
+pub fn color_code_range(code: &str, runs: &mut Vec<TextRun>, range: std::ops::Range<usize>, c: Option<[u8; 3]>) {
+    let n = code.chars().count();
+    let mut styles = expand_runs(runs, n);
+    for s in styles.iter_mut().take(range.end.min(n)).skip(range.start) {
+        s.color = c.map(|c| [c[0], c[1], c[2], 255]);
+    }
+    *runs = pack_runs(&styles);
+}
+
 impl Item {
-    /// After this text box's text was changed from `old`, move its runs onto the new text.
+    /// After this text box's text (or code block's code) was changed from `old`, move its runs onto the new text.
     pub fn remap_text_runs(&mut self, old: &str) {
-        if let ItemKind::Text { text, runs, .. } = &mut self.kind {
-            *runs = remap_runs(runs, old, text);
+        if let ItemKind::Text { text: new, runs, .. } | ItemKind::Code { code: new, runs, .. } = &mut self.kind {
+            *runs = remap_runs(runs, old, new);
         }
     }
 }

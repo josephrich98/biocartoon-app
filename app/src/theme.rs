@@ -95,6 +95,14 @@ fn pick(dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// Enter, with no modifier keys, to press a dialog's orange button. Only while no text field or
+/// button has keyboard focus: a multi-line field keeps Enter for new lines, a button tabbed to
+/// presses itself, and a one-line field gives up focus on Enter, so Enter there submits. The key
+/// is consumed, so nothing else answers it too.
+pub fn enter_pressed(ui: &egui::Ui) -> bool {
+    ui.memory(|m| m.focused().is_none()) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+}
+
 pub fn bg() -> Color32 { pick((0x1b, 0x1b, 0x1b), (0xec, 0xec, 0xef)) }
 pub fn panel() -> Color32 { pick((0x25, 0x25, 0x27), (0xff, 0xff, 0xff)) }
 pub fn panel_raised() -> Color32 { pick((0x2d, 0x2d, 0x30), (0xf2, 0xf2, 0xf5)) }
@@ -162,6 +170,21 @@ pub fn apply(ctx: &egui::Context, dark: bool, text_scale: f32) {
     });
 }
 
+/// Makes the interact height as tall as a text field or dropdown at the current text size, so
+/// a label in a row or grid sits level with the control beside it: egui centers each widget on
+/// the row's height as it began (the interact height), and a control taller than that pushes
+/// the row down from under the labels already placed. Cheap, and run every frame, since the
+/// fonts (and so the text's height) can change after the style is set.
+pub fn fit_row_height(ctx: &egui::Context) {
+    let style = ctx.global_style();
+    let fonts = [egui::TextStyle::Button.resolve(&style), egui::TextStyle::Body.resolve(&style)];
+    let text = ctx.fonts_mut(|f| fonts.iter().map(|font| f.row_height(font)).fold(0.0, f32::max));
+    let want = (text + 2.0 * style.spacing.button_padding.y).ceil().max(24.0);
+    if (style.spacing.interact_size.y - want).abs() > 0.5 {
+        ctx.all_styles_mut(|s| s.spacing.interact_size.y = want);
+    }
+}
+
 /// The virtual database holding BioCartoon's own assets: its templates, and the uploads
 /// (source `user`) a reviewer accepted to it, whose `source_name` is BioCartoon (or, from before
 /// authors were kept, whose author is).
@@ -209,5 +232,40 @@ mod tests {
         for t in TextSize::ALL {
             assert_eq!(load(serde_json::to_string(&t).unwrap().trim_matches('"')), t);
         }
+    }
+
+    /// Enter presses a dialog's orange button, except while a multi-line field (a new line) or a
+    /// button (pressing that one) has keyboard focus. A one-line field gives up focus on Enter.
+    #[test]
+    fn enter_presses_the_orange_button() {
+        use egui::{Event, Key, Modifiers, RawInput};
+        let enter = || RawInput {
+            events: vec![Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
+            ..Default::default()
+        };
+        // `field`: 0 none, 1 one-line, 2 multi-line. Runs a frame to focus it, then one with Enter.
+        let run = |field: u8| {
+            let ctx = egui::Context::default();
+            let mut text = String::from("abc");
+            let mut fired = false;
+            for (frame, input) in [RawInput::default(), enter()].into_iter().enumerate() {
+                let mut out = ctx.run_ui(input, |ui| {
+                    let r = match field {
+                        1 => Some(ui.text_edit_singleline(&mut text)),
+                        2 => Some(ui.text_edit_multiline(&mut text)),
+                        _ => None,
+                    };
+                    if let Some(r) = r {
+                        if frame == 0 { r.request_focus(); }
+                    }
+                    fired |= super::enter_pressed(ui);
+                });
+                out.textures_delta.clear();
+            }
+            fired
+        };
+        assert!(run(0));
+        assert!(run(1));
+        assert!(!run(2));
     }
 }

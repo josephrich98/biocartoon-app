@@ -99,6 +99,8 @@ fn style_props() -> Map<String, Value> {
         "window": {"type": "boolean", "description": "Code blocks: show the title bar with window dots."},
         "rounded": {"type": "boolean", "description": "Code blocks: rounded corners (default square)."},
     }));
+    props.insert("text_colors".into(), json!({"type": "array", "items": {"type": "object"}, "description": "Code blocks: colors on specific characters, over the theme's, as [{start, end, color: [r, g, b]}] (char indices into code, end exclusive); color null gives them back the theme's, and an empty list clears every one."}));
+    props.insert("colors".into(), json!({"type": "object", "description": "Code blocks: colors changed from the theme's, as {role: [r, g, b]}; null restores the theme's. Roles: background, text, comment, keyword, string, number, function, type, operator, property, line_number. Changing the theme clears them."}));
     // Past what one json! can hold.
     props.insert("highlight".into(), color_prop("Text: color behind every character; alpha 0 removes it"));
     props

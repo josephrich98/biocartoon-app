@@ -35,6 +35,10 @@ pub enum ExportFormat {
 }
 
 impl ExportFormat {
+    /// Whether a file of this type can leave the background out (a JPEG can't).
+    pub fn can_be_transparent(self) -> bool {
+        matches!(self, ExportFormat::Png | ExportFormat::Tif | ExportFormat::Pdf | ExportFormat::Svg)
+    }
     pub const ALL: [ExportFormat; 7] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Pptx, ExportFormat::Biocartoon];
     pub fn label(self) -> &'static str {
         match self {
@@ -81,7 +85,7 @@ pub struct ExportOptions {
     pub format: ExportFormat,
     /// Raster formats, and PDF images when `pdf_raster` is on.
     pub dpi: u32,
-    /// PNG only: leave the slide background out.
+    /// Leave the slide background out (formats that can be see-through: PNG, TIFF, PDF, SVG).
     pub transparent: bool,
     /// One file per image item, cropped to its bounding box, instead of the whole slide.
     pub individual: bool,
@@ -149,8 +153,8 @@ pub struct ExportJob {
     pub background: [u8; 4],
     /// Cache key -> where to load the full-resolution original from.
     pub requests: HashMap<String, Request>,
-    /// Cache key -> the decoded (possibly downscaled) copy, used if the original can't be loaded.
-    pub fallbacks: HashMap<String, Arc<RgbaImage>>,
+    /// Cache key -> the editor's loaded copy, used if the original can't be loaded.
+    pub fallbacks: HashMap<String, Cached>,
     /// Web build: cache key -> the original's bytes, which `start` downloads first.
     pub downloads: HashMap<String, Vec<u8>>,
     /// How far along the export is, for the progress bar.
@@ -329,7 +333,7 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
             Err(e) => match job.fallbacks.get(key) {
                 Some(img) => {
                     log::warn!("export: using cached copy of {key}: {e}");
-                    images.insert(key.clone(), Picture::Pixels((**img).clone()));
+                    images.insert(key.clone(), img.picture());
                 }
                 None => {
                     log::warn!("export: {key}: {e}");
@@ -342,7 +346,7 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
     if opts.format == ExportFormat::Pptx {
         return render_pptx(ctx, job, &images, missing, out);
     }
-    let transparent = opts.format == ExportFormat::Png && opts.transparent;
+    let transparent = opts.format.can_be_transparent() && opts.transparent;
     let raster = (opts.format == ExportFormat::Pdf && opts.pdf_raster).then(|| opts.dpi.clamp(MIN_DPI, MAX_DPI));
     let mut written = Vec::new();
     let multi = job.slides.len() > 1;
@@ -639,9 +643,9 @@ fn emit(svg: &str, region: Rect, opts: &ExportOptions, max_pixels: Option<u64>, 
 /// `items` cropped to their bounds on a transparent background, at twice screen resolution (the
 /// longest side capped at `max_side` px), for copying to the clipboard. Images come from `cached`;
 /// ones not loaded yet are left out.
-pub fn snapshot(ctx: &egui::Context, items: &[&Item], cached: &HashMap<String, Arc<RgbaImage>>, max_side: u32) -> Result<RgbaImage, String> {
+pub fn snapshot(ctx: &egui::Context, items: &[&Item], cached: &HashMap<String, Cached>, max_side: u32) -> Result<RgbaImage, String> {
     let region = items.iter().map(|it| item_bounds(it)).reduce(|a, b| a.union(b)).ok_or("Nothing to copy")?;
-    let images: HashMap<String, Picture> = cached.iter().map(|(k, img)| (k.clone(), Picture::Pixels((**img).clone()))).collect();
+    let images: HashMap<String, Picture> = cached.iter().map(|(k, img)| (k.clone(), img.picture())).collect();
     let svg = build_svg(ctx, items, region, None, &images);
     let dpi = (DPI * 2.0).min(max_side as f32 * DPI / region.width().max(region.height()).max(1.0)).round().max(1.0) as u32;
     rasterise(&parse(&svg)?, region, dpi)
@@ -655,13 +659,13 @@ pub fn thumbnail(
     page: Rect,
     background: [u8; 4],
     requests: &HashMap<String, Request>,
-    cached: &HashMap<String, Arc<RgbaImage>>,
+    cached: &HashMap<String, Cached>,
     max_side: u32,
 ) -> Result<RgbaImage, String> {
     let mut images: HashMap<String, Picture> = HashMap::new();
     for (key, req) in requests {
         let img = match cached.get(key) {
-            Some(img) => Ok(Picture::Pixels((**img).clone())),
+            Some(img) => Ok(img.picture()),
             None => fetch(req).and_then(|b| Picture::from_bytes(&b)),
         };
         match img {
@@ -998,14 +1002,32 @@ fn rasterised_png(ctx: &egui::Context, it: &Item, images: &HashMap<String, Pictu
 /// vector shapes.
 pub enum Picture {
     Pixels(RgbaImage),
-    Vector(Box<Vector>),
+    Vector(Arc<Vector>),
+}
+
+/// An image the editor has already loaded, handed to a render so it need not be fetched again.
+/// SVGs come as their vector form, so the render restyles their colour layers as the canvas does
+/// (their decoded pixels show the file's own colours).
+#[derive(Clone)]
+pub enum Cached {
+    Pixels(Arc<RgbaImage>),
+    Vector(Arc<Vector>),
+}
+
+impl Cached {
+    fn picture(&self) -> Picture {
+        match self {
+            Cached::Pixels(img) => Picture::Pixels((**img).clone()),
+            Cached::Vector(v) => Picture::Vector(v.clone()),
+        }
+    }
 }
 
 impl Picture {
     /// Decode an image file; SVGs are parsed, not rasterised.
     fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         if crate::assets::is_svg(bytes) {
-            Vector::parse(bytes).map(|v| Picture::Vector(Box::new(v)))
+            Vector::parse(bytes).map(|v| Picture::Vector(Arc::new(v)))
         } else {
             image::load_from_memory(bytes).map(|i| Picture::Pixels(i.to_rgba8())).map_err(|e| e.to_string())
         }
@@ -1027,17 +1049,28 @@ fn vector_image(s: &mut String, vector: &Vector, it: &Item, crop: [f32; 4], over
     // Keep what is inside the file's root <svg> element; it gets our own below.
     let body = xml.find("<svg").and_then(|i| xml[i..].find('>').map(|j| i + j + 1)).zip(xml.rfind("</svg>")).map_or("", |(a, b)| &xml[a..b]);
 
+    // The tint multiplies every colour, as the canvas does: its paints are recoloured, so the
+    // drawing stays vector shapes (a PDF holds a filtered group as pixels). Only pictures inside
+    // the file need a filter, over the whole item, as an object-bounding-box region leaves out
+    // the strokes.
+    let a = overlay[3] as f32 / 255.0;
+    let tint = [0, 1, 2].map(|i| (1.0 - a) + overlay[i] as f32 / 255.0 * a);
+    let tinted = tint.iter().any(|&t| t < 1.0);
+    let mut filter = String::new();
+    let body = if tinted { tint_xml(body, tint) } else { body.to_string() };
     let op = it.opacity.clamp(0.0, 1.0);
     let op_attr = if op < 1.0 { format!(r#" opacity="{}""#, n(op)) } else { String::new() };
     let _ = writeln!(s, r#"<g{op_attr}{}>"#, rotate_attr(it, c));
     let _ = writeln!(s, r#"<clipPath id="{id}"><rect x="{}" y="{}" width="{}" height="{}"/></clipPath>"#, n(r.min.x), n(r.min.y), n(r.width()), n(r.height()));
-    let mut filter = String::new();
-    if overlay[3] > 0 {
-        let a = overlay[3] as f32 / 255.0;
-        let [tr, tg, tb] = [0, 1, 2].map(|i| n((1.0 - a) + overlay[i] as f32 / 255.0 * a));
+    if tinted && body.contains("<image") {
+        let [tr, tg, tb] = tint.map(n);
         let _ = writeln!(
             s,
-            r#"<filter id="{id}-tint" x="0" y="0" width="1" height="1" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="{tr} 0 0 0 0 0 {tg} 0 0 0 0 0 {tb} 0 0 0 0 0 1 0"/></filter>"#
+            r#"<filter id="{id}-tint" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="{tr} 0 0 0 0 0 {tg} 0 0 0 0 0 {tb} 0 0 0 0 0 1 0"/></filter>"#,
+            n(r.min.x),
+            n(r.min.y),
+            n(r.width()),
+            n(r.height())
         );
         filter = format!(r#" filter="url(#{id}-tint)""#);
     }
@@ -1228,8 +1261,8 @@ fn svg_document(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[
                     }
                 }
             }
-            ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded } => {
-                let pal = theme.palette();
+            ItemKind::Code { code, language, theme, font_size, line_numbers, window, rounded, colors, runs } => {
+                let pal = theme.palette_with(colors);
                 let fill = |c: [u8; 3]| paint("fill", [c[0], c[1], c[2], 255], op);
                 let fs = font_size.max(1.0);
                 let font = FontId::monospace(fs);
@@ -1237,7 +1270,7 @@ fn svg_document(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[
                     let g = f.layout_no_wrap("0".into(), font.clone(), Color32::WHITE);
                     (f.glyph_width(&font, '0'), f.row_height(&font), g.rows.first().and_then(|r| r.row.glyphs.first()).map_or(fs * 0.8, |gl| gl.pos.y))
                 });
-                let lines = crate::code::highlight(code, language.resolve(code));
+                let lines = crate::code::highlight_colored(code, language.resolve(code), runs, false);
                 let lay = crate::code::BlockLayout::new(fs, lines.len(), *line_numbers, *window, char_w, line_h);
                 let _ = writeln!(s, r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}" {}/>"#, n(r.min.x), n(r.min.y), n(r.width()), n(r.height()), n(if *rounded { lay.radius } else { 0.0 }), fill(pal.bg));
                 if *window {
@@ -1259,11 +1292,11 @@ fn svg_document(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[
                     }
                     // Place each run at its column so the layout matches the canvas whatever font the viewer substitutes.
                     let mut col = 0usize;
-                    for (t, k) in spans {
+                    for (t, k, c) in spans {
                         let body = t.trim_start();
                         let lead = t.chars().count() - body.chars().count();
                         if !body.is_empty() {
-                            let _ = writeln!(s, r#"<text x="{}" y="{}" {}>{}</text>"#, n(r.min.x + o[0] + (col + lead) as f32 * char_w), n(y + baseline), fill(pal.color(*k)), esc(body));
+                            let _ = writeln!(s, r#"<text x="{}" y="{}" {}>{}</text>"#, n(r.min.x + o[0] + (col + lead) as f32 * char_w), n(y + baseline), fill(c.unwrap_or(pal.color(*k))), esc(body));
                         }
                         col += lead + body.chars().count();
                     }
@@ -1488,6 +1521,25 @@ fn paint_colors(tree: &usvg::Tree) -> Vec<[u8; 3]> {
     walk(tree.root(), &mut out);
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
     out.into_iter().map(|(c, _)| c).collect()
+}
+
+/// `xml` (as usvg writes it) with every fill, stroke and gradient stop colour multiplied by
+/// `tint`, the way [`prepared_png`] tints pixels. Pictures inside it are left as they are.
+fn tint_xml(xml: &str, tint: [f32; 3]) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = ["fill=\"#", "stroke=\"#", "stop-color=\"#", "flood-color=\"#"].iter().filter_map(|p| rest.find(p).map(|i| i + p.len())).min() {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let rgb = rest.get(..6).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit())).map(|h| [0, 2, 4].map(|j| u8::from_str_radix(&h[j..j + 2], 16).unwrap_or(0)));
+        if let Some(rgb) = rgb {
+            let [r, g, b] = [0, 1, 2].map(|k| (rgb[k] as f32 * tint[k]).round() as u8);
+            let _ = write!(out, "{r:02x}{g:02x}{b:02x}");
+            rest = &rest[6..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// [`Vector::restyled`]'s rewrite of a file as usvg writes it, which states every paint as an
@@ -1908,6 +1960,27 @@ mod tests {
         assert!(svg.contains("#0000ff") && !svg.contains("#f49dc0"), "the export has the layer's new colour");
     }
 
+    /// Copying and thumbnails draw from the editor's cache: an SVG there is its vector form, so
+    /// recoloured layers come out recoloured, not in the file's own colours.
+    #[test]
+    fn copy_and_thumbnail_restyle_cached_svgs() {
+        let file = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="#f49dc0"/></svg>"##;
+        let source = ImageSource::file("flask.svg".into());
+        let key = source.cache_key();
+        let layer = LayerStyle { colors: vec![[0xf4, 0x9d, 0xc0]], color: Some([0, 0, 255]), opacity: 1.0 };
+        let it = Item::new(1, "Flask", ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: vec![layer] }, Pos2::ZERO, Vec2::splat(100.0));
+        let cached = HashMap::from([(key.clone(), Cached::Vector(Arc::new(Vector::parse(file).unwrap())))]);
+        let ctx = egui::Context::default();
+
+        let copy = snapshot(&ctx, &[&it], &cached, 200).unwrap();
+        assert_eq!(copy.get_pixel(copy.width() / 2, copy.height() / 2).0, [0, 0, 255, 255], "the copy has the layer's new colour");
+
+        let slide = Slide { items: vec![it], ..Default::default() };
+        let requests = HashMap::from([(key, Request::Path(PathBuf::from("/nonexistent/flask.svg")))]);
+        let thumb = thumbnail(&ctx, &slide, Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)), [255; 4], &requests, &cached, 100).unwrap();
+        assert_eq!(thumb.get_pixel(50, 50).0, [0, 0, 255, 255], "the thumbnail has the layer's new colour");
+    }
+
     /// Exports a slide with every item kind in every format. Set BIOCARTOON_EXPORT_TEST_DIR to
     /// keep the files for inspection.
     #[test]
@@ -1943,7 +2016,7 @@ mod tests {
         slide.items.push(Item::new(5, "Arrow", ItemKind::Line { kind: crate::doc::LineKind::BentArrow, color: [200, 50, 50, 255], width: 3.0, style: Default::default(), points: Vec::new() }, Pos2::new(100.0, 400.0), Vec2::new(300.0, 150.0)));
         slide.items.push(Item::new(6, "Inhibit", ItemKind::Line { kind: crate::doc::LineKind::Inhibitor, color: [0, 0, 0, 255], width: 2.0, style: Default::default(), points: Vec::new() }, Pos2::new(100.0, 600.0), Vec2::new(200.0, 0.0)));
         slide.items.push(Item::new(7, "Table", ItemKind::Table { rows: 2, cols: 2, cells: vec!["Gene".into(), "Fold".into(), "TP53".into(), "2.4".into()], header: true, border: [100, 100, 100, 255], fill: [255, 255, 255, 255], header_fill: [220, 230, 250, 255], text_color: [0, 0, 0, 255], font_size: 14.0 }, Pos2::new(650.0, 450.0), Vec2::new(240.0, 80.0)));
-        slide.items.push(Item::new(8, "Code", ItemKind::Code { code: "def f(x):\n    return x * 2  # double\n".into(), language: crate::doc::CodeLang::Auto, theme: crate::doc::CodeTheme::Dracula, font_size: 14.0, line_numbers: true, window: true, rounded: true }, Pos2::new(600.0, 200.0), Vec2::new(300.0, 140.0)));
+        slide.items.push(Item::new(8, "Code", ItemKind::Code { code: "def f(x):\n    return x * 2  # double\n".into(), language: crate::doc::CodeLang::Auto, theme: crate::doc::CodeTheme::Dracula, font_size: 14.0, line_numbers: true, window: true, rounded: true, colors: Default::default(), runs: Vec::new() }, Pos2::new(600.0, 200.0), Vec2::new(300.0, 140.0)));
 
         let page = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 672.0));
         let mut requests = HashMap::new();
@@ -2074,6 +2147,32 @@ mod tests {
         let bytes = std::fs::read(dir.join("deck-raster.pptx")).unwrap();
         assert_eq!(bytes.windows(20).filter(|w| *w == b"ppt/media/image1.png").count(), 2);
         assert_eq!(bytes.windows(4).filter(|w| *w == b".svg").count(), 0);
+    }
+
+    /// A tinted SVG image keeps its edges and stays vector: the tint recolours its paints rather
+    /// than going through a filter (whose box, the shapes without their strokes, cut the strokes
+    /// off, and which a PDF can only hold as pixels).
+    #[test]
+    fn tinted_vector_keeps_strokes_and_stays_vector() {
+        // A cylinder top whose stroke reaches the artboard's top and bottom edges.
+        let file = br##"<svg xmlns="http://www.w3.org/2000/svg" width="130" height="50"><ellipse cx="65" cy="25" rx="63" ry="23" fill="#ffffff" stroke="#404040" stroke-width="4"/></svg>"##;
+        let source = ImageSource::file("cylinder.svg".into());
+        let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
+        let ctx = egui::Context::default();
+        for overlay in [[255, 255, 255, 255], [255, 0, 0, 128]] {
+            let it = Item { fitted: true, ..Item::new(1, "Cylinder", ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay, layers: Vec::new() }, Pos2::new(10.0, 10.0), Vec2::new(130.0, 50.0)) };
+            let region = item_bounds(&it);
+            let svg = build_svg(&ctx, &[&it], region, None, &pics);
+            assert!(!svg.contains("<filter"), "{overlay:?}: tinted without a filter");
+            let img = rasterise(&parse(&svg).unwrap(), region, 288).unwrap();
+            let dark = |y: u32| (0..img.width()).any(|x| img.get_pixel(x, y).0[3] > 200 && img.get_pixel(x, y).0[1] < 100);
+            assert!(dark(0) && dark(img.height() - 1), "{overlay:?}: the stroke reaches the top and bottom edges");
+            let opts = ExportOptions { format: ExportFormat::Pdf, ..Default::default() };
+            let pdf = encode(&svg, region, &opts, 300, "").unwrap();
+            assert!(!pdf.windows(13).any(|w| w == b"/Subtype /Ima"), "{overlay:?}: the PDF has no pictures in it");
+        }
+        // Only the paints change.
+        assert_eq!(tint_xml(r##"<path fill="#ff8000" stroke="#404040" d="M0 0"/><stop stop-color="#ffffff"/>"##, [1.0, 0.5, 0.0]), r##"<path fill="#ff4000" stroke="#402000" d="M0 0"/><stop stop-color="#ff8000"/>"##);
     }
 
     fn text_only_slide(slide: &Slide) -> Slide {

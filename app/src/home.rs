@@ -872,9 +872,11 @@ impl BioCartoon {
                     ui.add_space(6.0);
                     let is_current = h.selected.is_some() && h.selected == h.versions.first().map(|v| v.time);
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(h.selected.is_some() && !is_current, egui::Button::new(egui::RichText::new(format!("{}  Restore this version", ph::ARROW_COUNTER_CLOCKWISE)).color(Color32::WHITE)).fill(theme::accent()))
+                        let can = h.selected.is_some() && !is_current;
+                        if ui.add_enabled(can, egui::Button::new(egui::RichText::new(format!("{}  Restore this version", ph::ARROW_COUNTER_CLOCKWISE)).color(Color32::WHITE)).fill(theme::accent()))
                             .on_hover_text("The current version stays in the history, so a restore can be undone.")
                             .clicked()
+                            || (can && theme::enter_pressed(ui))
                         {
                             restore = h.selected;
                         }

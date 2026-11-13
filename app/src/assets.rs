@@ -597,6 +597,13 @@ impl ImageCache {
         self.cpu.get(cache_key).cloned()
     }
 
+    /// What a render can draw a loaded image from: an SVG's vector form (so its colour layers can
+    /// be restyled), else its decoded pixels.
+    pub fn cached(&self, cache_key: &str) -> Option<crate::export::Cached> {
+        use crate::export::Cached;
+        self.vector(cache_key).map(Cached::Vector).or_else(|| self.cpu_image(cache_key).map(Cached::Pixels))
+    }
+
     /// A loaded SVG's vector form (its artboard and drawing), if the key is one.
     pub fn vector(&self, cache_key: &str) -> Option<Arc<Vector>> {
         self.svg.get(cache_key).cloned()
