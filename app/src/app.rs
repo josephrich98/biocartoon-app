@@ -6810,6 +6810,16 @@ impl BioCartoon {
                     }
                     // A project from the store (`BIOCARTOON_PROJECTS_DIR`), as it looks when opened.
                     s if s.starts_with("open=") => self.open_project(&s["open=".len()..]),
+                    // The Attributions popup for every slide, as Show credits... opens it.
+                    "credits" => {
+                        self.show_attributions = true;
+                        self.attributions_all_slides = true;
+                        self.attributions_export = None;
+                    }
+                    // Show credit for the current slide's first library image.
+                    "credit" => {
+                        self.credit_item = self.doc.slides[self.cur_slide].items.iter().find(|it| self.item_asset_id(it).is_some()).map(|it| it.id);
+                    }
                     "demo" => {
                         self.show_settings = false;
                         self.actions.push(Action::UseTemplate(3));

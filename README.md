@@ -34,11 +34,11 @@ Install Desktop application: [app.biocartoon.com/download](https://app.biocartoo
 
 <details><summary>Example icon credits</summary>
 
-- "Plasmid" by Joseph Rich, BioCartoon community contribution, CC0
-- "Stem Cell" by Joseph Rich, BioCartoon community contribution, CC0
-- "Human Heart" by Joseph Rich, BioCartoon community contribution, CC0
+- "Plasmid" by Joseph Rich, BioCartoon, CC0
+- "Stem Cell" by Joseph Rich, BioCartoon, CC0
+- "Human Heart" by Joseph Rich, BioCartoon, CC0
 - "C57BL/6J founder mouse" by Lior Pachter, BioCartoon community contribution, CC0
-- "Man" by Joseph Rich, BioCartoon community contribution, CC0
+- "Man" by Joseph Rich, BioCartoon, CC0
 - "DNA colored" by DBCLS, Bioicons (https://togotv.dbcls.jp/en/pics.html), CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)
 - "Lymphocyte" by DBCLS, Bioicons (https://togotv.dbcls.jp/en/pics.html), CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)
 - "heart" by Servier, Bioicons (https://smart.servier.com/), CC-BY-3.0 (https://creativecommons.org/licenses/by/3.0/)

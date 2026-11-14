@@ -1851,17 +1851,17 @@ impl BioCartoon {
         seg_captions(ui, w, &["Bring to front", "Bring forward", "Send backward", "Send to back"]);
     }
 
-    /// What an image is, above Transform: its name, database and license, then its file type and
-    /// size. An upload in the official BioCartoon library says BioCartoon (once its catalog row has
+    /// What an image is, above Transform: its name and database (the license is in the credit below),
+    /// then its file type and size. An upload in the official BioCartoon library says BioCartoon (once its catalog row has
     /// come); the user's own images say just User-generated until they are given a license.
     fn image_info(&mut self, ui: &mut egui::Ui, source: &ImageSource) {
         let user = "User-generated".to_string();
         let first = match source {
             ImageSource::Asset { source: db, license, .. } if db == "user" && license.is_empty() => user,
-            ImageSource::Asset { id, title, source: db, license, .. } => {
+            ImageSource::Asset { id, title, source: db, .. } => {
                 let db = self.asset_row(id).map_or(db.as_str(), theme::asset_source);
                 let db = if db == "user" { "User-generated" } else { theme::source_badge(db).2 };
-                [title.as_str(), db, license.as_str()].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  ")
+                [title.as_str(), db].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join("  ·  ")
             }
             ImageSource::File { .. } => user,
         };
@@ -2110,15 +2110,20 @@ impl BioCartoon {
                     self.actions.push(Action::OpenAiEdit);
                 }
                 // The credit this image owes, also when it is an edited copy of a library asset.
-                if let Some(ImageSource::Asset { id: aid, credit, .. }) = source.origin() {
+                if let Some(ImageSource::Asset { id: aid, credit, license, .. }) = source.origin() {
                     ui.separator();
                     let dim = |t: String| egui::RichText::new(t).small().color(theme::text_dim());
                     if matches!(source, ImageSource::File { .. }) {
                         ui.label(dim("Edited from a library asset. Credit the original:".into()));
                     }
                     let credit = Some(credit.clone()).filter(|c| !c.is_empty()).or_else(|| self.icons.results.iter().chain(self.variants.iter()).find(|r| &r.id == aid).map(|r| r.credit.clone()));
-                    let credit = credit.unwrap_or_else(|| format!("Asset {aid}"));
-                    ui.add(egui::Label::new(dim(credit.clone())).selectable(true));
+                    let credit = credit.unwrap_or_else(|| match license.as_str() {
+                        "" => format!("Asset {aid}"),
+                        "CC0-1.0" => format!("Asset {aid}, CC0"),
+                        l => format!("Asset {aid}, {l}"),
+                    });
+                    self.look_up_ai([aid.clone()]);
+                    crate::credits::credit_line(ui, dim(credit.clone()), self.asset_ai_note(aid));
                     // How AI made it, for display only: not part of the credit that is copied.
                     if let Some((Some(true), details)) = self.asset_ai(aid).filter(|(_, d)| !d.is_empty()) {
                         ui.add(egui::Label::new(dim(format!("({details})"))).selectable(false));

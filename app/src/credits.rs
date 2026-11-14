@@ -177,6 +177,23 @@ impl BioCartoon {
         self.asset_row(id).map(|r| r.generative_ai_used).or_else(|| self.asset_ai_flags.get(id).copied())
     }
 
+    /// Ask the catalog whether AI made those of `ids` it hasn't told us about yet (each once), for
+    /// the note beside their credits.
+    pub fn look_up_ai(&mut self, ids: impl IntoIterator<Item = String>) {
+        if !self.catalog.ok {
+            return;
+        }
+        let ids: Vec<String> = ids.into_iter().filter(|id| self.asset_ai_flag(id).is_none() && self.credit_lookups.insert(id.clone())).collect();
+        if !ids.is_empty() {
+            self.catalog.send(crate::catalog::Req::Lookup { ids });
+        }
+    }
+
+    /// The gray note beside one asset's credit (see [`ai_note`]).
+    pub fn asset_ai_note(&self, id: &str) -> Option<&'static str> {
+        ai_note(self.asset_ai_flag(id))
+    }
+
     /// A library asset's catalog row, once loaded.
     pub fn asset_row(&self, id: &str) -> Option<&crate::catalog::AssetRow> {
         self.icons.results.iter().chain(self.variants.iter()).find(|r| r.id == id)
@@ -195,6 +212,9 @@ impl BioCartoon {
             self.credit_item = None;
             return;
         };
+        let asset = self.item(id).and_then(|it| self.item_asset_id(it));
+        self.look_up_ai(asset.clone());
+        let note = asset.and_then(|a| self.asset_ai_note(&a));
         let mut open = true;
         let mut copied = false;
         egui::Window::new(format!("{}  Credit", ph::QUOTES))
@@ -205,7 +225,7 @@ impl BioCartoon {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new(&title).strong());
-                ui.add(egui::Label::new(&credit).selectable(true));
+                credit_line(ui, &credit, note);
                 ui.add_space(6.0);
                 if ui.button(format!("{}  Copy credit", ph::COPY)).clicked() {
                     ui.ctx().copy_text(credit.clone());
@@ -246,14 +266,7 @@ impl BioCartoon {
             (None, false) => (collect([&self.doc.slides[slide]], slide + 1), format!("{}  Attributions: slide {}", ph::QUOTES, slide + 1), format!("{stem}-slide{}", slide + 1)),
             (None, true) => (collect(&self.doc.slides, 1), format!("{}  Attributions", ph::QUOTES), stem),
         };
-        // The AI note beside each credit: ask the catalog about the assets it hasn't told us of yet.
-        if self.catalog.ok {
-            let mut ids: Vec<String> = credits.iter().filter(|c| self.asset_ai_flag(&c.id).is_none()).map(|c| c.id.clone()).collect();
-            ids.retain(|id| self.credit_lookups.insert(id.clone()));
-            if !ids.is_empty() {
-                self.catalog.send(crate::catalog::Req::Lookup { ids });
-            }
-        }
+        self.look_up_ai(credits.iter().map(|c| c.id.clone()));
         let ai: std::collections::HashMap<String, Option<bool>> = credits.iter().filter_map(|c| Some((c.id.clone(), self.asset_ai_flag(&c.id)?))).collect();
         let mut open = true;
         let mut action = None;
@@ -323,6 +336,16 @@ impl BioCartoon {
 fn shared_list(credits: &[Credit], only_required: bool) -> String {
     let lines = list(credits, only_required);
     if only_required { lines } else { format!("{lines}\n{MADE_IN}") }
+}
+
+/// A credit, selectable to copy, then "· " and its AI note in small gray (not part of the credit).
+pub fn credit_line(ui: &mut egui::Ui, credit: impl Into<egui::WidgetText>, note: Option<&str>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add(egui::Label::new(credit).wrap().selectable(true));
+        if let Some(note) = note {
+            ui.add(egui::Label::new(egui::RichText::new(format!("· {note}")).small().color(theme::text_dim())).selectable(false));
+        }
+    });
 }
 
 /// The line that ends the full credit list.
@@ -407,12 +430,7 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], ai: &std::collections:
     // for the author (not copied: it isn't part of the credit). Art made without AI gets no note.
     egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
         for c in sorted(credits, *only) {
-            ui.horizontal_wrapped(|ui| {
-                ui.add(egui::Label::new(&c.credit).wrap().selectable(true));
-                if let Some(note) = ai_note(ai.get(&c.id).copied()) {
-                    ui.add(egui::Label::new(dim(note)).selectable(false));
-                }
-            });
+            credit_line(ui, &c.credit, ai_note(ai.get(&c.id).copied()));
         }
         if !*only && has_any {
             ui.add(egui::Label::new(MADE_IN).selectable(true));
