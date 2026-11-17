@@ -677,6 +677,10 @@ fn one() -> f32 {
     1.0
 }
 
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
+}
+
 /// One colour layer of an SVG image restyled: every shape the file paints in one of `colors`
 /// (rgb) is painted in `color` instead (its own colours when `None`), at `opacity` of its own.
 /// The layers come from the catalog's `layers` (named by hand) or from the drawing's colours.
@@ -708,6 +712,9 @@ pub enum ItemKind {
         /// restyled ones.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         layers: Vec<LayerStyle>,
+        /// Colour saturation: 1 as drawn, 0 grey, up to 2 twice as vivid.
+        #[serde(default = "one", skip_serializing_if = "is_one")]
+        saturation: f32,
     },
     Text {
         text: String,
@@ -1529,7 +1536,7 @@ mod tests {
     }
 
     fn image_item(pos: Pos2, size: Vec2, crop: [f32; 4]) -> Item {
-        Item::new(1, "i", ItemKind::Image { source: ImageSource::file("a.svg".into()), crop, overlay: [0; 4], layers: Vec::new() }, pos, size)
+        Item::new(1, "i", ItemKind::Image { source: ImageSource::file("a.svg".into()), crop, overlay: [0; 4], layers: Vec::new(), saturation: 1.0 }, pos, size)
     }
 
     fn close(r: Rect, want: Rect) -> bool {
@@ -1562,7 +1569,7 @@ mod tests {
         let (r, crop) = fit_to_drawing(&flipped, art, drawing).unwrap();
         assert!(close(r, Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(200.0, 200.0))), "{r:?}");
         assert_eq!(crop, full);
-        flipped.kind = ItemKind::Image { source: ImageSource::file("a.svg".into()), crop: [0.25, 0.0, 0.75, 1.0], overlay: [0; 4], layers: Vec::new() };
+        flipped.kind = ItemKind::Image { source: ImageSource::file("a.svg".into()), crop: [0.25, 0.0, 0.75, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0 };
         flipped.size = [100.0, 200.0];
         let (r, crop) = fit_to_drawing(&flipped, art, drawing).unwrap();
         assert!(close(r, Rect::from_min_max(Pos2::new(50.0, 0.0), Pos2::new(100.0, 200.0))), "{r:?}");

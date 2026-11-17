@@ -389,7 +389,7 @@ impl BioCartoon {
         for b in order {
             match b {
                 0 => {
-                    if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Download a backup", ph::DOWNLOAD_SIMPLE)).color(Color32::WHITE)).fill(theme::accent()))
+                    if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Download a backup", ph::DOWNLOAD_SIMPLE)).color(theme::on_accent())).fill(theme::accent()))
                         .on_hover_text("Every project as a .biocartoon file, in one .zip. Open the .zip here to restore them.")
                         .clicked()
                     {
@@ -724,7 +724,7 @@ impl BioCartoon {
                 }
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(egui::RichText::new("Rename").color(Color32::WHITE)).fill(theme::accent())).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("Rename").color(theme::on_accent())).fill(theme::accent())).clicked() {
                         done = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -873,11 +873,12 @@ impl BioCartoon {
                     let is_current = h.selected.is_some() && h.selected == h.versions.first().map(|v| v.time);
                     ui.horizontal(|ui| {
                         let can = h.selected.is_some() && !is_current;
-                        if ui.add_enabled(can, egui::Button::new(egui::RichText::new(format!("{}  Restore this version", ph::ARROW_COUNTER_CLOCKWISE)).color(Color32::WHITE)).fill(theme::accent()))
-                            .on_hover_text("The current version stays in the history, so a restore can be undone.")
-                            .clicked()
-                            || (can && theme::enter_pressed(ui))
-                        {
+                        let (clicked, entered) = theme::press_on_enter(ui, can, |ui| {
+                            ui.add_enabled(can, egui::Button::new(egui::RichText::new(format!("{}  Restore this version", ph::ARROW_COUNTER_CLOCKWISE)).color(theme::on_accent())).fill(theme::accent()))
+                                .on_hover_text("The current version stays in the history, so a restore can be undone.")
+                                .clicked()
+                        });
+                        if clicked || entered {
                             restore = h.selected;
                         }
                     });

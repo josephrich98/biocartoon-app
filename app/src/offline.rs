@@ -1340,6 +1340,7 @@ mod tests {
             crop: [0.0, 0.0, 1.0, 1.0],
             overlay: [255, 255, 255, 0],
             layers: Vec::new(),
+            saturation: 1.0,
         };
         let items = vec![
             Item::new(1, "cell", image("bioart/cell.png", Some("bioart/cell.svg")), egui::Pos2::ZERO, egui::Vec2::splat(10.0)),

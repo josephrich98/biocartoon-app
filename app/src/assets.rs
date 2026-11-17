@@ -61,7 +61,10 @@ enum Work {
     Render(Arc<Vector>, u32),
     /// Restyle the layers of an SVG that is already loaded (see [`Vector::restyled`]), keeping
     /// its vector form as a loaded file's.
-    Restyle(Arc<Vector>, Vec<LayerStyle>),
+    Restyle(Arc<Vector>, Vec<LayerStyle>, f32),
+    /// Scale the saturation of a raster image that is already loaded (see
+    /// [`crate::export::saturate_image`]).
+    Saturate(Arc<RgbaImage>, f32),
 }
 
 /// A decoded image, and its vector form when the file was an SVG.
@@ -327,9 +330,14 @@ fn run(work: &Work) -> Result<(Loaded, Option<Vec<u8>>), String> {
     match work {
         Work::Fetch(req) => fetch_decode(req),
         Work::Render(vector, side) => Ok((loaded(vector.render(*side)?, None), None)),
-        Work::Restyle(vector, layers) => {
-            let v = vector.restyled(layers).ok_or("svg: could not restyle its layers")?;
+        Work::Restyle(vector, layers, saturation) => {
+            let v = vector.adjusted(layers, *saturation).ok_or("svg: could not restyle its layers")?;
             Ok((loaded(v.render(MAX_SIDE)?, Some(Arc::new(v))), None))
+        }
+        Work::Saturate(img, saturation) => {
+            let mut img = (**img).clone();
+            crate::export::saturate_image(&mut img, *saturation);
+            Ok((loaded(img, None), None))
         }
     }
 }
@@ -358,11 +366,14 @@ fn is_lod_key(key: &str) -> bool {
     key.starts_with("lod:")
 }
 
-/// Cache key of `key`'s SVG with `layers` restyled.
-fn restyle_key(key: &str, layers: &[LayerStyle]) -> String {
+/// Cache key of `key`'s image with `layers` restyled and its saturation scaled.
+fn restyle_key(key: &str, layers: &[LayerStyle], saturation: f32) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     format!("{layers:?}").hash(&mut h);
+    if saturation != 1.0 {
+        saturation.to_bits().hash(&mut h);
+    }
     format!("layers:{:016x}:{key}", h.finish())
 }
 
@@ -407,7 +418,7 @@ impl ImageCache {
                     match &work {
                         Work::Fetch(req) => log::debug!("loading {req:?}"),
                         Work::Render(_, side) => log::debug!("rendering {key} at {side} px"),
-                        Work::Restyle(..) => log::debug!("restyling {key}"),
+                        Work::Restyle(..) | Work::Saturate(..) => log::debug!("restyling {key}"),
                     }
                     let res = run(&work).map(|(l, fetched)| {
                         if let (Some(b), Some(dir), Some(k)) = (fetched, cache_dir.read().unwrap().clone(), key.strip_prefix("asset:")) {
@@ -708,11 +719,21 @@ impl ImageCache {
     /// is) for a picture that is not a loaded SVG, or with nothing restyled. Call every frame
     /// the image is drawn.
     pub fn restyled(&mut self, cache_key: &str, layers: &[LayerStyle]) -> Option<(String, TextureHandle)> {
-        if layers.iter().all(LayerStyle::is_plain) {
+        self.adjusted(cache_key, layers, 1.0)
+    }
+
+    /// [`restyled`](Self::restyled), with the colours' saturation scaled by `saturation` too,
+    /// which works for raster images as well (their layers are ignored).
+    pub fn adjusted(&mut self, cache_key: &str, layers: &[LayerStyle], saturation: f32) -> Option<(String, TextureHandle)> {
+        let plain = layers.iter().all(LayerStyle::is_plain);
+        if plain && saturation == 1.0 {
             return None;
         }
-        let vector = self.svg.get(cache_key)?.clone();
-        let rk = restyle_key(cache_key, layers);
+        let vector = self.svg.get(cache_key).cloned();
+        if vector.is_none() && (saturation == 1.0 || !self.cpu.contains_key(cache_key)) {
+            return None;
+        }
+        let rk = restyle_key(cache_key, if vector.is_some() { layers } else { &[] }, saturation);
         match self.map.get(&rk) {
             Some(ImgState::Ready { tex, .. }) => {
                 let tex = tex.clone();
@@ -722,7 +743,13 @@ impl ImageCache {
             }
             Some(ImgState::Loading) => self.want(&rk),
             Some(ImgState::Failed(_)) => return None,
-            None => self.queue(rk, Work::Restyle(vector, layers.to_vec())),
+            None => {
+                let work = match vector {
+                    Some(vector) => Work::Restyle(vector, layers.to_vec(), saturation),
+                    None => Work::Saturate(self.cpu.get(cache_key)?.clone(), saturation),
+                };
+                self.queue(rk, work);
+            }
         }
         let last = self.last_restyled.get(cache_key)?.clone();
         match self.map.get(&last) {

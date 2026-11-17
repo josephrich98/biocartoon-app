@@ -405,10 +405,11 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], ai: &std::collections:
         }
     });
     ui.horizontal(|ui| {
-        let save_all = egui::RichText::new(format!("{}  Save all credits", ph::FLOPPY_DISK)).color(egui::Color32::WHITE);
+        let save_all = egui::RichText::new(format!("{}  Save all credits", ph::FLOPPY_DISK)).color(theme::on_accent());
         // Just after an export, Enter saves them all. (Not when opened from the menu: that window stays
         // open beside the canvas, where Enter edits the selected text.)
-        if ui.add_enabled(has_any, egui::Button::new(save_all).fill(theme::accent())).clicked() || (export && has_any && theme::enter_pressed(ui)) {
+        let (clicked, entered) = theme::press_on_enter(ui, export && has_any, |ui| ui.add_enabled(has_any, egui::Button::new(save_all).fill(theme::accent())).clicked());
+        if clicked || entered {
             action = Some(CreditsAction::Save { required: false });
         }
         if ui.add_enabled(has_required, egui::Button::new(format!("{}  Save required credits", ph::FLOPPY_DISK))).clicked() {
@@ -449,7 +450,7 @@ mod tests {
     }
 
     fn image(n: u64, source: ImageSource) -> Item {
-        Item::new(n, "img", ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() }, Pos2::ZERO, Vec2::splat(10.0))
+        Item::new(n, "img", ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0 }, Pos2::ZERO, Vec2::splat(10.0))
     }
 
     #[test]

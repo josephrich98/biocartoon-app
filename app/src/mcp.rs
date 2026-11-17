@@ -103,6 +103,7 @@ fn style_props() -> Map<String, Value> {
     props.insert("colors".into(), json!({"type": "object", "description": "Code blocks: colors changed from the theme's, as {role: [r, g, b]}; null restores the theme's. Roles: background, text, comment, keyword, string, number, function, type, operator, property, line_number. Changing the theme clears them."}));
     // Past what one json! can hold.
     props.insert("highlight".into(), color_prop("Text: color behind every character; alpha 0 removes it"));
+    props.insert("saturation".into(), num_prop("Images: color saturation, 0 (grey) to 2; 1 is as drawn."));
     props
 }
 

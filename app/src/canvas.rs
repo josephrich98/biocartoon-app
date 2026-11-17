@@ -494,7 +494,7 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
     let z = xf.zoom;
     let op = it.opacity.clamp(0.0, 1.0);
     match &it.kind {
-        ItemKind::Image { source, crop, overlay, layers } => {
+        ItemKind::Image { source, crop, overlay, layers, saturation } => {
             let rs = xf.rect(it.rect());
             let key = source.cache_key();
             let state = match source {
@@ -510,7 +510,7 @@ pub fn draw_item(painter: &egui::Painter, xf: &Xform, it: &Item, images: &mut Im
             match state {
                 Ok(base) => {
                     // Restyled layers are a drawing of their own, with its own renderings.
-                    let (key, base) = images.restyled(&key, layers).unwrap_or((key, base));
+                    let (key, base) = images.adjusted(&key, layers, *saturation).unwrap_or((key, base));
                     let (mut u0, mut u1) = (crop[0], crop[2]);
                     let (mut v0, mut v1) = (crop[1], crop[3]);
                     if it.flip_h {
@@ -1140,7 +1140,7 @@ impl BioCartoon {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can = !draft.text.trim().is_empty();
                         let label = if draft.editing.is_some() { "Save" } else { "Post" };
-                        let post = egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent());
+                        let post = egui::Button::new(egui::RichText::new(label).color(theme::on_accent()).strong()).fill(theme::accent());
                         if ui.add_enabled(can, post).on_hover_text("⌘/Ctrl+Enter").clicked() || (post_key && can) {
                             acts.push(Action::PostComment);
                         }
@@ -2333,6 +2333,6 @@ fn comment_bubble(painter: &egui::Painter, tip: Pos2, label: &str, opacity: f32)
     painter.rect(body, 8.0, fill, outline, StrokeKind::Outside);
     // Cover the tail's outline where it joins the body.
     painter.add(Shape::convex_polygon(vec![tail[0], tail[1] - Vec2::new(0.0, 1.5), tail[2] - Vec2::new(0.0, 1.5)], fill, Stroke::NONE));
-    painter.text(body.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(12.0), Color32::WHITE.gamma_multiply(opacity));
+    painter.text(body.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(12.0), theme::on_accent().gamma_multiply(opacity));
     body
 }

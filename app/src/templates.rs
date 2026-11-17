@@ -571,7 +571,7 @@ mod tests {
         let pic = dir.join("pic.png");
         image::RgbaImage::from_pixel(40, 30, image::Rgba([200, 60, 60, 255])).save(&pic).unwrap();
         let meta = SubmitMeta { title: "Rust test template".into(), description: String::new(), category: "test".into(), tags: vec!["test".into()], layers: Vec::new(), author: "tester".into(), license: "CC0-1.0".into(), generative_ai_used: Some(false), generative_ai_details: String::new(), email: String::new(), official: false };
-        let image = ItemKind::Image { source: ImageSource::file(pic.display().to_string()), crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0], layers: Vec::new() };
+        let image = ItemKind::Image { source: ImageSource::file(pic.display().to_string()), crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0], layers: Vec::new(), saturation: 1.0 };
         let text = ItemKind::text("Step 1", 20.0, [0, 0, 0, 255], crate::doc::TextAlign::Left, true);
         let slide = Slide { name: "x".into(), items: vec![Item::new(1, "pic", image, egui::Pos2::ZERO, egui::Vec2::splat(50.0)), Item::new(2, "t", text, egui::Pos2::ZERO, egui::Vec2::splat(50.0))], comments: Vec::new(), background: None };
         let tmeta = TemplateMeta { id: "local-id".into(), title: meta.title.clone(), thumb_key: "templates/local-id/thumb.png".into(), ..Default::default() };

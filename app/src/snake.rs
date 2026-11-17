@@ -364,7 +364,7 @@ impl BioCartoon {
                 ui.add_space(12.0);
                 let w = ui.available_width();
                 let wide = |text: RichText| egui::Button::new(text).min_size(Vec2::new(w, 30.0)).corner_radius(6);
-                if ui.add(wide(RichText::new("Play again").color(Color32::WHITE)).fill(theme::accent())).clicked() {
+                if ui.add(wide(RichText::new("Play again").color(theme::on_accent())).fill(theme::accent())).clicked() {
                     choice = Some(Choice::PlayAgain);
                 }
                 if ui.add(wide("Exit".into()).fill(theme::hover())).clicked() {
@@ -747,7 +747,7 @@ mod tests {
     fn icon(pos: Pos2, size: Vec2) -> Item {
         Item::new(1, "tube", ItemKind::Image {
             source: crate::doc::ImageSource::file("tube.svg".into()),
-            crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(),
+            crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0,
         }, pos, size)
     }
 

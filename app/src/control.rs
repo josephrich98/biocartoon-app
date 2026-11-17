@@ -243,7 +243,7 @@ fn name_of<T: std::fmt::Debug>(v: T) -> String {
 
 /// Item fields `update_item` and the `insert_*` commands take (see [`patch_item`]).
 const ITEM_ARGS: &[&str] = &[
-    "x", "y", "width", "height", "x1", "y1", "x2", "y2", "rotation", "flip_h", "flip_v", "locked", "opacity", "name", "crop", "overlay",
+    "x", "y", "width", "height", "x1", "y1", "x2", "y2", "rotation", "flip_h", "flip_v", "locked", "opacity", "name", "crop", "overlay", "saturation",
     "text", "font_size", "color", "highlight", "bold", "italic", "underline", "strikethrough", "superscript", "subscript", "font", "line_spacing", "align", "valign", "shape", "fill", "stroke",
     "stroke_width", "line_kind", "line_style", "line_width", "header", "cells", "code", "language", "theme", "line_numbers", "window", "rounded", "colors", "text_colors",
 ];
@@ -301,7 +301,7 @@ pub fn item_json(it: &Item) -> Value {
     });
     let o = v.as_object_mut().unwrap();
     match &it.kind {
-        ItemKind::Image { source, crop, overlay, layers } => {
+        ItemKind::Image { source, crop, overlay, layers, saturation } => {
             match source {
                 ImageSource::Asset { id, key, svg, title, source, credit, license } => {
                     o.insert("asset_id".into(), json!(id));
@@ -324,6 +324,7 @@ pub fn item_json(it: &Item) -> Value {
             }
             o.insert("crop".into(), json!(crop));
             o.insert("overlay".into(), json!(overlay));
+            o.insert("saturation".into(), json!(saturation));
             if !layers.is_empty() {
                 o.insert("layers".into(), json!(layers));
             }
@@ -428,7 +429,8 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
         }
     }
     match &mut it.kind {
-        ItemKind::Image { crop, overlay, .. } => {
+        ItemKind::Image { crop, overlay, saturation, .. } => {
+            if let Some(v) = args.get("saturation").and_then(Value::as_f64) { *saturation = (v as f32).clamp(0.0, 2.0); }
             if let Some(c) = args.get("crop").and_then(Value::as_array) {
                 if c.len() == 4 {
                     let g = |i: usize| c[i].as_f64().unwrap_or(0.0) as f32;

@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(keep_image(&kept, &app_dir).unwrap(), kept, "a kept file stays where it is");
 
         let store = Store::new(root.join("projects"));
-        let image = |path: String| ItemKind::Image { source: ImageSource::file(path), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() };
+        let image = |path: String| ItemKind::Image { source: ImageSource::file(path), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0 };
         let mut doc = Document::default();
         for (id, path) in [(1, pic.display().to_string()), (2, "/missing/b.png".to_string())] {
             doc.slides[0].items.push(Item::new(id, "pic", image(path), egui::Pos2::ZERO, egui::Vec2::splat(10.0)));
@@ -610,7 +610,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("biocartoon-file-test-{}", new_id()));
         let pic = root.join("a.png");
         storage::write(&pic, b"png bytes").unwrap();
-        let image = |path: String| ItemKind::Image { source: ImageSource::file(path), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() };
+        let image = |path: String| ItemKind::Image { source: ImageSource::file(path), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0 };
         let mut doc = Document::default();
         for (id, path) in [(1, pic.display().to_string()), (2, pic.display().to_string()), (3, "/missing.png".to_string())] {
             doc.slides[0].items.push(Item::new(id, "pic", image(path), egui::Pos2::ZERO, egui::Vec2::splat(10.0)));

@@ -659,7 +659,8 @@ impl BioCartoon {
                     )));
                     ui.add_space(8.0);
                     let busy = self.share.busy;
-                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(format!("{}  Create share link", ph::LINK)).color(Color32::WHITE)).fill(theme::accent())).clicked() || (!busy && theme::enter_pressed(ui)) {
+                    let (clicked, entered) = theme::press_on_enter(ui, !busy, |ui| ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(format!("{}  Create share link", ph::LINK)).color(theme::on_accent())).fill(theme::accent())).clicked());
+                    if clicked || entered {
                         act = Some("create");
                     }
                     if busy {
@@ -783,7 +784,7 @@ impl BioCartoon {
                 ui.set_max_width(520.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("{}  {text}", ph::USERS));
-                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(load).color(Color32::WHITE)).fill(theme::accent())).on_hover_text("What is here now is kept in Version history").clicked() {
+                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(load).color(theme::on_accent())).fill(theme::accent())).on_hover_text("What is here now is kept in Version history").clicked() {
                         choice = Some("load");
                     }
                     if let Some(k) = keep.filter(|_| can_keep) {
@@ -833,7 +834,7 @@ impl BioCartoon {
             if !self.share.open_text.trim().is_empty() && link.is_none() {
                 ui.label(egui::RichText::new("That isn't a whole BioCartoon share link.").color(theme::danger()));
             }
-            if ui.add_enabled(link.is_some(), egui::Button::new(egui::RichText::new("Open").color(Color32::WHITE)).fill(theme::accent())).clicked() || (enter && link.is_some()) {
+            if ui.add_enabled(link.is_some(), egui::Button::new(egui::RichText::new("Open").color(theme::on_accent())).fill(theme::accent())).clicked() || (enter && link.is_some()) {
                 go = true;
             }
         });

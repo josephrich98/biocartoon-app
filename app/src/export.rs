@@ -580,13 +580,13 @@ fn pptx_picture(ctx: &egui::Context, it: &Item, images: &HashMap<String, Picture
         svg,
         group: it.group,
     };
-    if let ItemKind::Image { source, crop, overlay, .. } = &it.kind {
+    if let ItemKind::Image { source, crop, overlay, saturation, .. } = &it.kind {
         let alpha = it.opacity.clamp(0.0, 1.0);
         match images.get(&source.cache_key()) {
             None => return Ok(None),
             Some(p) if raster && should_rasterise(p, it, *crop, dpi) => return Ok(rasterised_png(ctx, it, images, dpi).map(|png| picture(it.rect(), alpha, png_with_dpi(png, dpi), None))),
             Some(Picture::Pixels(img)) => {
-                return Ok(prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v).map(|png| picture(it.rect(), alpha, png, None)));
+                return Ok(prepared_png(img, *crop, *overlay, *saturation, it.flip_h, it.flip_v).map(|png| picture(it.rect(), alpha, png, None)));
             }
             Some(Picture::Vector(_)) => {}
         }
@@ -938,8 +938,27 @@ fn text_item_rows(out: &mut String, ctx: &egui::Context, it: &Item, op: f32) {
     }
 }
 
-/// Crop, flip and tint an image the way the canvas draws it, as PNG bytes.
-fn prepared_png(img: &RgbaImage, crop: [f32; 4], overlay: [u8; 4], flip_h: bool, flip_v: bool) -> Option<Vec<u8>> {
+/// `rgb` with its saturation scaled by `s` (0 grey, 1 unchanged, above 1 more vivid), keeping
+/// its luminance: the colour matrix of SVG's `feColorMatrix type="saturate"`.
+pub fn saturate(rgb: [u8; 3], s: f32) -> [u8; 3] {
+    let [r, g, b] = rgb.map(|v| v as f32);
+    let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    [r, g, b].map(|v| (l + (v - l) * s).round().clamp(0.0, 255.0) as u8)
+}
+
+/// `img` with every pixel's saturation scaled by `s` (see [`saturate`]).
+pub fn saturate_image(img: &mut RgbaImage, s: f32) {
+    if s == 1.0 {
+        return;
+    }
+    for p in img.pixels_mut() {
+        let [r, g, b] = saturate([p.0[0], p.0[1], p.0[2]], s);
+        p.0[..3].copy_from_slice(&[r, g, b]);
+    }
+}
+
+/// Crop, flip, saturate and tint an image the way the canvas draws it, as PNG bytes.
+fn prepared_png(img: &RgbaImage, crop: [f32; 4], overlay: [u8; 4], saturation: f32, flip_h: bool, flip_v: bool) -> Option<Vec<u8>> {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return None;
@@ -958,6 +977,7 @@ fn prepared_png(img: &RgbaImage, crop: [f32; 4], overlay: [u8; 4], flip_h: bool,
     if flip_v {
         image::imageops::flip_vertical_in_place(&mut out);
     }
+    saturate_image(&mut out, saturation);
     if overlay[3] > 0 {
         let s = overlay[3] as f32 / 255.0;
         let tint = [0, 1, 2].map(|i| (1.0 - s) + overlay[i] as f32 / 255.0 * s);
@@ -1128,17 +1148,17 @@ fn svg_document(ctx: &egui::Context, items: &[&Item], region: Rect, bg: Option<[
         let r = it.rect();
         let c = r.center();
         match &it.kind {
-            ItemKind::Image { source, crop, overlay, layers } => {
+            ItemKind::Image { source, crop, overlay, layers, saturation } => {
                 let picture = images.get(&source.cache_key());
                 let png = match (picture, raster) {
                     (Some(p), Some(dpi)) if should_rasterise(p, it, *crop, dpi) => rasterised_png(ctx, it, images, dpi),
                     (Some(Picture::Vector(vector)), _) => {
                         clip_id += 1;
-                        let restyled = vector.restyled(layers);
+                        let restyled = vector.adjusted(layers, *saturation);
                         vector_image(&mut s, restyled.as_ref().unwrap_or(vector), it, *crop, *overlay, &format!("svg{clip_id}"));
                         continue;
                     }
-                    (Some(Picture::Pixels(img)), _) => prepared_png(img, *crop, *overlay, it.flip_h, it.flip_v),
+                    (Some(Picture::Pixels(img)), _) => prepared_png(img, *crop, *overlay, *saturation, it.flip_h, it.flip_v),
                     (None, _) => None,
                 };
                 let Some(png) = png else { continue };
@@ -1438,10 +1458,20 @@ impl Vector {
     /// anything (or the restyled file fails to parse). Keeps the drawing's box, so a layer faded
     /// out does not resize the image.
     pub fn restyled(&self, layers: &[LayerStyle]) -> Option<Vector> {
-        if layers.iter().all(LayerStyle::is_plain) {
+        self.adjusted(layers, 1.0)
+    }
+
+    /// [`restyled`](Self::restyled), then every paint's saturation scaled by `saturation` (see
+    /// [`saturate`]). `None` when neither changes anything.
+    pub fn adjusted(&self, layers: &[LayerStyle], saturation: f32) -> Option<Vector> {
+        let plain = layers.iter().all(LayerStyle::is_plain);
+        if plain && saturation == 1.0 {
             return None;
         }
-        let xml = restyle_xml(&self.to_svg(), layers);
+        let mut xml = if plain { self.to_svg() } else { restyle_xml(&self.to_svg(), layers) };
+        if saturation != 1.0 {
+            xml = recolor_xml(&xml, |c| saturate(c, saturation));
+        }
         match parse(&xml) {
             Ok(tree) => Some(Self { tree, content: self.content, colors: self.colors.clone() }),
             Err(e) => {
@@ -1526,6 +1556,11 @@ fn paint_colors(tree: &usvg::Tree) -> Vec<[u8; 3]> {
 /// `xml` (as usvg writes it) with every fill, stroke and gradient stop colour multiplied by
 /// `tint`, the way [`prepared_png`] tints pixels. Pictures inside it are left as they are.
 fn tint_xml(xml: &str, tint: [f32; 3]) -> String {
+    recolor_xml(xml, |rgb| [0, 1, 2].map(|k| (rgb[k] as f32 * tint[k]).round() as u8))
+}
+
+/// `xml` (as usvg writes it) with every fill, stroke and gradient stop colour mapped by `f`.
+fn recolor_xml(xml: &str, f: impl Fn([u8; 3]) -> [u8; 3]) -> String {
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     while let Some(i) = ["fill=\"#", "stroke=\"#", "stop-color=\"#", "flood-color=\"#"].iter().filter_map(|p| rest.find(p).map(|i| i + p.len())).min() {
@@ -1533,7 +1568,7 @@ fn tint_xml(xml: &str, tint: [f32; 3]) -> String {
         rest = &rest[i..];
         let rgb = rest.get(..6).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit())).map(|h| [0, 2, 4].map(|j| u8::from_str_radix(&h[j..j + 2], 16).unwrap_or(0)));
         if let Some(rgb) = rgb {
-            let [r, g, b] = [0, 1, 2].map(|k| (rgb[k] as f32 * tint[k]).round() as u8);
+            let [r, g, b] = f(rgb);
             let _ = write!(out, "{r:02x}{g:02x}{b:02x}");
             rest = &rest[6..];
         }
@@ -1802,6 +1837,19 @@ mod tests {
     use super::*;
     use crate::doc::{ImageSource, ShapeKind};
 
+    #[test]
+    fn saturation_greys_or_keeps_colours() {
+        assert_eq!(saturate([200, 40, 40], 1.0), [200, 40, 40]);
+        let [r, g, b] = saturate([200, 40, 40], 0.0);
+        assert!(r == g && g == b, "grey at 0");
+        let [r, g, _] = saturate([200, 40, 40], 2.0);
+        assert!(r > 200 && g < 40, "more vivid above 1");
+        let v = Vector::parse(br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#c82828"/></svg>"##).unwrap();
+        assert!(v.adjusted(&[], 1.0).is_none(), "nothing to change");
+        let grey = v.adjusted(&[], 0.0).unwrap().to_svg();
+        assert!(!grey.contains("#c82828"), "{grey}");
+    }
+
     /// Characters a text item's font lacks get a fallback `<tspan>` of their own, so the rest of
     /// the row keeps its font.
     #[test]
@@ -1879,7 +1927,7 @@ mod tests {
 
         let source = ImageSource::file("padded.svg".into());
         let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
-        let kind = ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() };
+        let kind = ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0 };
         let old = Item::new(1, "old", kind.clone(), Pos2::ZERO, Vec2::splat(200.0));
         let mut new = Item::new(2, "new", kind, Pos2::new(300.0, 0.0), Vec2::new(200.0, 100.0));
         new.fitted = true;
@@ -1896,7 +1944,7 @@ mod tests {
         let file = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><defs><linearGradient id="g"><stop stop-color="#00f"/><stop offset="1" stop-color="#00f" stop-opacity="0.999"/></linearGradient></defs><rect width="100" height="100" fill="#fff"/><rect x="100" width="100" height="100" fill="url(#g)"/></svg>"##;
         let source = ImageSource::file("upload.svg".into());
         let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
-        let image = |id, crop, overlay, pos: Pos2, size: Vec2| Item::new(id, "Upload", ItemKind::Image { source: source.clone(), crop, overlay, layers: Vec::new() }, pos, size);
+        let image = |id, crop, overlay, pos: Pos2, size: Vec2| Item::new(id, "Upload", ItemKind::Image { source: source.clone(), crop, overlay, layers: Vec::new(), saturation: 1.0 }, pos, size);
         let cropped = image(1, [0.5, 0.0, 1.0, 1.0], [0; 4], Pos2::new(0.0, 0.0), Vec2::splat(100.0));
         let mut flipped = image(2, [0.0, 0.0, 1.0, 1.0], [0; 4], Pos2::new(200.0, 0.0), Vec2::new(200.0, 100.0));
         flipped.flip_h = true;
@@ -1954,7 +2002,7 @@ mod tests {
 
         let source = ImageSource::file("flask.svg".into());
         let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
-        let it = Item::new(1, "Flask", ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: vec![liquid(Some([0, 0, 255]), 1.0)] }, Pos2::ZERO, Vec2::splat(100.0));
+        let it = Item::new(1, "Flask", ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: vec![liquid(Some([0, 0, 255]), 1.0)], saturation: 1.0 }, Pos2::ZERO, Vec2::splat(100.0));
         let region = Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0));
         let svg = build_svg(&egui::Context::default(), &[&it], region, None, &pics);
         assert!(svg.contains("#0000ff") && !svg.contains("#f49dc0"), "the export has the layer's new colour");
@@ -1968,7 +2016,7 @@ mod tests {
         let source = ImageSource::file("flask.svg".into());
         let key = source.cache_key();
         let layer = LayerStyle { colors: vec![[0xf4, 0x9d, 0xc0]], color: Some([0, 0, 255]), opacity: 1.0 };
-        let it = Item::new(1, "Flask", ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: vec![layer] }, Pos2::ZERO, Vec2::splat(100.0));
+        let it = Item::new(1, "Flask", ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: vec![layer], saturation: 1.0 }, Pos2::ZERO, Vec2::splat(100.0));
         let cached = HashMap::from([(key.clone(), Cached::Vector(Arc::new(Vector::parse(file).unwrap())))]);
         let ctx = egui::Context::default();
 
@@ -2000,10 +2048,10 @@ mod tests {
         // An AI edit of a catalog asset: exports still credit the original.
         let catalog = ImageSource::Asset { id: "servier/cell".into(), key: "x".into(), svg: None, title: "Cell".into(), source: "servier".into(), credit: "\"Cell\", Servier Medical Art, CC-BY-4.0 & co".into(), license: "CC-BY-4.0".into() };
         let edited = catalog.derived(icon.display().to_string());
-        let mut img = Item::new(1, "Cell icon", ItemKind::Image { source: edited, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() }, Pos2::new(40.0, 40.0), Vec2::splat(200.0));
+        let mut img = Item::new(1, "Cell icon", ItemKind::Image { source: edited, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0 }, Pos2::new(40.0, 40.0), Vec2::splat(200.0));
         img.rotation = 0.3;
         slide.items.push(img);
-        slide.items.push(Item::new(2, "Tinted", ItemKind::Image { source: src.clone(), crop: [0.25, 0.25, 0.75, 0.75], overlay: [255, 0, 0, 128], layers: Vec::new() }, Pos2::new(300.0, 40.0), Vec2::splat(120.0)));
+        slide.items.push(Item::new(2, "Tinted", ItemKind::Image { source: src.clone(), crop: [0.25, 0.25, 0.75, 0.75], overlay: [255, 0, 0, 128], layers: Vec::new(), saturation: 1.0 }, Pos2::new(300.0, 40.0), Vec2::splat(120.0)));
         // Some of its letters styled apart: "fairly" plain red, "long" struck, "wraps" italic underlined.
         let mut title = ItemKind::text("Hello BioCartoon, a fairly long title that wraps", 28.0, [20, 20, 20, 255], TextAlign::Center, true);
         crate::doc::set_flag(&mut title, Some(20..26), crate::doc::TextFlag::Bold, false);
@@ -2113,7 +2161,7 @@ mod tests {
         grouped.items[2].group = Some(9);
         grouped.items[3].group = Some(9);
         grouped.items[3].rotation = 0.5;
-        grouped.items.push(Item::new(10, "Drawing", ItemKind::Image { source: svg_src.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() }, Pos2::new(100.0, 250.0), Vec2::new(160.0, 80.0)));
+        grouped.items.push(Item::new(10, "Drawing", ItemKind::Image { source: svg_src.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0 }, Pos2::new(100.0, 250.0), Vec2::new(160.0, 80.0)));
         let mut deck = job(ExportFormat::Pptx, 150, false, true, "deck.pptx");
         deck.requests.insert(svg_src.cache_key(), Request::Path(dir.join("shape.svg")));
         deck.slides = vec![(1, grouped), (2, text_only_slide(&slide))];
@@ -2141,7 +2189,7 @@ mod tests {
         let mut raster = job(ExportFormat::Pptx, 150, false, false, "deck-raster.pptx");
         raster.opts.pdf_raster = true;
         raster.requests.insert(svg_src.cache_key(), Request::Path(dir.join("shape.svg")));
-        let drawing = Item::new(10, "Drawing", ItemKind::Image { source: svg_src, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new() }, Pos2::new(100.0, 250.0), Vec2::new(160.0, 80.0));
+        let drawing = Item::new(10, "Drawing", ItemKind::Image { source: svg_src, crop: [0.0, 0.0, 1.0, 1.0], overlay: [0; 4], layers: Vec::new(), saturation: 1.0 }, Pos2::new(100.0, 250.0), Vec2::new(160.0, 80.0));
         raster.slides = vec![(1, Slide { items: vec![drawing], ..Slide::default() })];
         run(&ctx, raster).unwrap();
         let bytes = std::fs::read(dir.join("deck-raster.pptx")).unwrap();
@@ -2160,7 +2208,7 @@ mod tests {
         let pics = HashMap::from([(source.cache_key(), Picture::from_bytes(file).unwrap())]);
         let ctx = egui::Context::default();
         for overlay in [[255, 255, 255, 255], [255, 0, 0, 128]] {
-            let it = Item { fitted: true, ..Item::new(1, "Cylinder", ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay, layers: Vec::new() }, Pos2::new(10.0, 10.0), Vec2::new(130.0, 50.0)) };
+            let it = Item { fitted: true, ..Item::new(1, "Cylinder", ItemKind::Image { source: source.clone(), crop: [0.0, 0.0, 1.0, 1.0], overlay, layers: Vec::new(), saturation: 1.0 }, Pos2::new(10.0, 10.0), Vec2::new(130.0, 50.0)) };
             let region = item_bounds(&it);
             let svg = build_svg(&ctx, &[&it], region, None, &pics);
             assert!(!svg.contains("<filter"), "{overlay:?}: tinted without a filter");

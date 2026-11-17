@@ -78,6 +78,10 @@ pub struct Settings {
     /// The grid spacing is a custom value rather than one of `GRID_PRESETS`.
     pub grid_custom: bool,
     pub theme: theme::ThemeMode,
+    /// The colour theme shown when Appearance is dark.
+    pub dark_theme: theme::ColorTheme,
+    /// The colour theme shown when Appearance is light.
+    pub light_theme: theme::ColorTheme,
     pub text_size: theme::TextSize,
     /// The Icons panel on the left is open.
     pub show_icons: bool,
@@ -172,6 +176,8 @@ impl Default for Settings {
             grid_unit: Unit::Inch,
             grid_custom: false,
             theme: theme::ThemeMode::System,
+            dark_theme: theme::ColorTheme::DEFAULT_DARK,
+            light_theme: theme::ColorTheme::DEFAULT_LIGHT,
             text_size: theme::TextSize::Medium,
             show_icons: true,
             show_rail: true,
@@ -1148,7 +1154,7 @@ fn storage_notice(ctx: &egui::Context, title: &str, what: &str, keep: &str, hide
         ui.label(egui::RichText::new(format!("To keep them safe, {keep}.")).color(theme::text_dim()));
         ui.add_space(12.0);
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 30.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(egui::Button::new(egui::RichText::new("Accept").color(Color32::WHITE)).fill(theme::accent()).min_size(Vec2::new(90.0, 30.0)).corner_radius(6)).clicked() {
+            if ui.add(egui::Button::new(egui::RichText::new("Accept").color(theme::on_accent())).fill(theme::accent()).min_size(Vec2::new(90.0, 30.0)).corner_radius(6)).clicked() {
                 accept = true;
             }
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1212,7 +1218,7 @@ pub struct BioCartoon {
     /// The settings before the last restore, so it can be undone until the Settings window closes.
     settings_before_restore: Option<Settings>,
     /// The theme last applied: dark or not, and the text size.
-    applied_theme: Option<(bool, theme::TextSize)>,
+    applied_theme: Option<(theme::ColorTheme, theme::TextSize)>,
     pub show_about: bool,
     /// Web: how projects are saved without an account, shown when a new project is started signed out.
     show_storage_notice: bool,
@@ -1993,6 +1999,7 @@ impl BioCartoon {
             crop: [0.0, 0.0, 1.0, 1.0],
             overlay: [255, 255, 255, 0],
             layers: Vec::new(),
+            saturation: 1.0,
         };
         let item = Item::new(id, row.title.clone(), kind, Pos2::ZERO, size);
         self.pending_fit.push((id, Fit::Side(self.insert_side(0.25))));
@@ -2015,6 +2022,7 @@ impl BioCartoon {
             crop: [0.0, 0.0, 1.0, 1.0],
             overlay: [255, 255, 255, 0],
             layers: Vec::new(),
+            saturation: 1.0,
         };
         let mut item = Item::new(id, name, kind, Pos2::ZERO, Vec2::splat(target));
         match size {
@@ -4345,7 +4353,8 @@ impl BioCartoon {
                     ui.add_space(12.0);
                     let w = ui.available_width();
                     let wide = |text: egui::RichText| egui::Button::new(text).min_size(Vec2::new(w, 30.0)).corner_radius(6);
-                    if ui.add(wide(egui::RichText::new("Save").color(Color32::WHITE)).fill(theme::accent())).clicked() || theme::enter_pressed(ui) {
+                    let (clicked, entered) = theme::press_on_enter(ui, true, |ui| ui.add(wide(egui::RichText::new("Save").color(theme::on_accent())).fill(theme::accent())).clicked());
+                    if clicked || entered {
                         answer = Some(SaveAnswer::Save);
                     }
                     if ui.add(wide("Don't Save".into()).fill(theme::hover())).clicked() {
@@ -4616,7 +4625,8 @@ impl BioCartoon {
             });
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new(egui::RichText::new("Save...").color(Color32::WHITE)).fill(theme::accent())).clicked() || theme::enter_pressed(ui) { go = true; }
+                let (clicked, entered) = theme::press_on_enter(ui, true, |ui| ui.add(egui::Button::new(egui::RichText::new("Save...").color(theme::on_accent())).fill(theme::accent())).clicked());
+                if clicked || entered { go = true; }
                 if ui.button("Cancel").clicked() { cancel = true; }
             });
         });
@@ -4926,7 +4936,8 @@ impl BioCartoon {
                 // left of the scroll area, which cuts it off.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     let can = project_file || deck || !((opts.individual || opts.crop) && n_images == 0);
-                    if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(Color32::WHITE)).fill(theme::accent())).clicked() || (can && theme::enter_pressed(ui)) { go = true; }
+                    let (clicked, entered) = theme::press_on_enter(ui, can, |ui| ui.add_enabled(can, egui::Button::new(egui::RichText::new("Export...").color(theme::on_accent())).fill(theme::accent())).clicked());
+                    if clicked || entered { go = true; }
                     if ui.button("Cancel").clicked() { cancel = true; }
                 });
             };
@@ -5242,7 +5253,8 @@ impl BioCartoon {
                 // Typing into the new box is part of the same undo step as placing it.
                 self.pending_edits.insert(id, serde_json::to_string(&item).unwrap_or_default());
                 self.slide_mut().items.push(item);
-                self.select(vec![id]);
+                // Type straight into it on the canvas, leaving the sidebar as it was (no Edit tab).
+                self.select_quietly(vec![id]);
                 self.start_text_edit(id);
             }
             Action::EditText(id) => self.start_text_edit(id),
@@ -5715,7 +5727,15 @@ impl BioCartoon {
 
     /// Applies the theme and text size when they (or, for "Match system", the system's theme) change.
     fn apply_theme(&mut self, ctx: &egui::Context) {
-        let want = (self.settings.theme.is_dark(ctx), self.settings.text_size);
+        let s = &self.settings;
+        let t = if s.theme.is_dark(ctx) { s.dark_theme } else { s.light_theme };
+        // A theme saved in the wrong slot (hand-edited settings) falls back to that slot's default.
+        let t = match (s.theme.is_dark(ctx), t.is_dark()) {
+            (true, false) => theme::ColorTheme::DEFAULT_DARK,
+            (false, true) => theme::ColorTheme::DEFAULT_LIGHT,
+            _ => t,
+        };
+        let want = (t, s.text_size);
         if self.applied_theme != Some(want) {
             theme::apply(ctx, want.0, want.1.scale());
             self.applied_theme = Some(want);
@@ -5943,7 +5963,7 @@ impl BioCartoon {
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(egui::RichText::new("Export").color(Color32::WHITE)).fill(theme::accent())).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("Export").color(theme::on_accent())).fill(theme::accent())).clicked() {
                         self.actions.push(Action::OpenExport);
                     }
                     // Left of Export (this layout runs right to left). Only the icon on a phone.
@@ -6124,6 +6144,35 @@ impl BioCartoon {
                                 }
                             });
                             ui.end_row();
+                            // Like VS Code's preferred dark and light themes: Appearance picks which
+                            // one shows. Picking one that isn't showing switches to it, unless
+                            // Appearance follows the system.
+                            let showing_dark = d.theme.is_dark(ctx);
+                            for dark in [true, false] {
+                                ui.label(if dark { "Dark theme" } else { "Light theme" });
+                                let slot = if dark { &mut d.dark_theme } else { &mut d.light_theme };
+                                let before = *slot;
+                                ui.horizontal(|ui| {
+                                    theme::swatch(ui, *slot);
+                                    egui::ComboBox::from_id_salt(if dark { "dark_theme" } else { "light_theme" }).selected_text(slot.label()).width(220.0).show_ui(ui, |ui| {
+                                        for t in theme::ColorTheme::of(dark) {
+                                            ui.horizontal(|ui| {
+                                                theme::swatch(ui, t);
+                                                ui.selectable_value(slot, t, t.label());
+                                            });
+                                        }
+                                    });
+                                    if dark != showing_dark {
+                                        let mode = if dark { "dark" } else { "light" };
+                                        let hint = if d.theme == theme::ThemeMode::System { format!("Shown when the system is {mode}") } else { format!("Picking one switches to {mode}") };
+                                        ui.label(egui::RichText::new(hint).small().color(theme::text_dim()));
+                                    }
+                                });
+                                if *slot != before && dark != showing_dark && d.theme != theme::ThemeMode::System {
+                                    d.theme = if dark { theme::ThemeMode::Dark } else { theme::ThemeMode::Light };
+                                }
+                                ui.end_row();
+                            }
                             ui.label("Text size");
                             egui::ComboBox::from_id_salt("text_size").selected_text(d.text_size.label()).width(160.0).show_ui(ui, |ui| {
                                 for t in theme::TextSize::ALL {
@@ -6304,7 +6353,8 @@ impl BioCartoon {
                     } else {
                         !setup.key.trim().is_empty() && !setup.model.trim().is_empty()
                     };
-                    if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Connect").color(Color32::WHITE)).fill(theme::accent())).clicked() || (can && theme::enter_pressed(ui)) { connect = true; }
+                    let (clicked, entered) = theme::press_on_enter(ui, can, |ui| ui.add_enabled(can, egui::Button::new(egui::RichText::new("Connect").color(theme::on_accent())).fill(theme::accent())).clicked());
+                    if clicked || entered { connect = true; }
                     if ui.button("Cancel").clicked() { cancel = true; }
                 });
             });
@@ -6411,7 +6461,7 @@ impl BioCartoon {
                 ui.horizontal(|ui| {
                     let r = ui.add(egui::TextEdit::singleline(&mut ce.input).hint_text("Or describe the edit you want...").desired_width(ui.available_width() - 48.0));
                     let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (ui.add(egui::Button::new(egui::RichText::new(ph::PAPER_PLANE_RIGHT).color(Color32::WHITE)).fill(theme::accent())).clicked() || enter) && !ce.input.trim().is_empty() && !ce.waiting {
+                    if (ui.add(egui::Button::new(egui::RichText::new(ph::PAPER_PLANE_RIGHT).color(theme::on_accent())).fill(theme::accent())).clicked() || enter) && !ce.input.trim().is_empty() && !ce.waiting {
                         send = Some(ce.input.trim().to_string());
                         ce.input.clear();
                     }
@@ -6588,7 +6638,7 @@ impl BioCartoon {
                     let too_many = crate::panels::kept(&d.layers) > crate::panels::MAX_LAYERS;
                     let can = !d.name.trim().is_empty() && credited && (!d.share || can_submit) && (!png || d.png_ok) && (reduced.is_none() || d.reduced_ok) && !over && !too_many;
                     let label = if d.share { "Submit" } else { "Save" };
-                    let b = ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(theme::accent()));
+                    let (b, entered) = theme::press_on_enter(ui, can, |ui| ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(theme::on_accent())).fill(theme::accent())));
                     let too_many_why = format!("Too many layers (max {})", crate::panels::MAX_LAYERS);
                     let why = if d.name.trim().is_empty() {
                         "Give it a name first"
@@ -6605,7 +6655,7 @@ impl BioCartoon {
                     } else {
                         "Confirm adding it at the reduced size first"
                     };
-                    if b.on_disabled_hover_text(why).clicked() || (can && theme::enter_pressed(ui)) { *submit = true; }
+                    if b.on_disabled_hover_text(why).clicked() || entered { *submit = true; }
                     if ui.button(if d.queue.is_empty() { "Cancel" } else { "Cancel all" }).clicked() { *cancel = true; }
                 });
             };
@@ -6755,8 +6805,8 @@ impl BioCartoon {
     /// Headless-ish smoke test: `BIOCARTOON_SCREENSHOT=out.png` captures the window after a
     /// couple of seconds and quits. `BIOCARTOON_SCRIPT` can seed the document first
     /// (comma-separated: demo, svgzoom, alllines, attributions, search=<q>, stars, select, aiedit, generate, page,
-    /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, grid, snap, gridsteps, spell, viewspell, dictionary, textedit, equation, tableedit, placetext,
-    /// comments, hidecomments, draftcomment, picker, dropper, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|norail|uploads|favorites|library|contribute|addlibrary>, aiyes).
+    /// settings, noautosave, quitprompt, restoresettings, restoredsettings, about, templates, savetemplate, addpng, addsvg, sharepng, sharesvg, sharebigpng, export=<path>, savepicture, light, dark, theme=<slug, e.g. nord or solarizedlight>, grid, snap, gridsteps, spell, viewspell, dictionary, textedit, equation, tableedit, placetext,
+    /// comments, hidecomments, draftcomment, picker, pickermode=<f|u8|h>, dropper, fav=<id>, open=<project id>, lucky, snake, rail=<text|lines|shapes|table|code|edit|comments|slides|page|none|icons|noicons|norail|uploads|favorites|library|contribute|addlibrary>, aiyes).
     fn debug_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("BIOCARTOON_SCREENSHOT") else { return };
         let frame = ctx.cumulative_frame_nr();
@@ -7053,7 +7103,7 @@ impl BioCartoon {
                             if i == 1 {
                                 source = source.derived(self.app_dir.join("generated").join("missing.png").display().to_string());
                             }
-                            let item = Item::new(self.doc.alloc_id(), title, ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0], layers: Vec::new() }, Pos2::new(80.0 + 280.0 * i as f32, 200.0), Vec2::splat(240.0));
+                            let item = Item::new(self.doc.alloc_id(), title, ItemKind::Image { source, crop: [0.0, 0.0, 1.0, 1.0], overlay: [255, 255, 255, 0], layers: Vec::new(), saturation: 1.0 }, Pos2::new(80.0 + 280.0 * i as f32, 200.0), Vec2::splat(240.0));
                             self.doc.slides[self.cur_slide].items.push(item);
                         }
                         self.show_attributions = true;
@@ -7069,6 +7119,12 @@ impl BioCartoon {
                     "restoredsettings" => { self.open_settings(SettingsTab::General); self.settings_before_restore = Some(self.settings.clone()); }
                     "canvasedit" | "page" => { self.show_settings = false; self.rail = Some(RailTab::Page); }
                     "light" => self.settings.theme = theme::ThemeMode::Light,
+                    s if s.starts_with("theme=") => {
+                        if let Some(t) = theme::ColorTheme::ALL.into_iter().find(|t| t.slug() == s["theme=".len()..]) {
+                            self.settings.theme = if t.is_dark() { theme::ThemeMode::Dark } else { theme::ThemeMode::Light };
+                            if t.is_dark() { self.settings.dark_theme = t } else { self.settings.light_theme = t }
+                        }
+                    }
                     "dark" => self.settings.theme = theme::ThemeMode::Dark,
                     "grid" => self.settings.show_grid = true,
                     "snap" => self.settings.grid_snap = true,
@@ -7108,6 +7164,7 @@ impl BioCartoon {
                         }
                         ctx.data_mut(|d| d.insert_temp(egui::Id::new("smoke_open_picker"), true));
                     }
+                    s if s.starts_with("pickermode=") => crate::color::set_mode_for_smoke(ctx, &s["pickermode=".len()..]),
                     "aiyes" => {
                         if let Some(d) = &mut self.upload_dialog {
                             d.ai = AiUse::Yes;

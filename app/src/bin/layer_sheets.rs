@@ -17,7 +17,7 @@ use biocartoon::export::Vector;
 use image::{Rgba, RgbaImage};
 
 /// As many layers as the Layers panel offers from a drawing's own colours (panels.rs).
-const MAX_LAYERS: usize = 8;
+const MAX_LAYERS: usize = 20;
 /// How much of its own opacity the rest of the drawing keeps around a highlighted layer.
 const FADE: f32 = 0.15;
 

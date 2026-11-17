@@ -50,6 +50,16 @@ pub fn remember_for_smoke(ctx: &egui::Context, c: [u8; 4]) {
 }
 
 /// Arms an eyedropper, for the screenshot scripts (`BIOCARTOON_SCRIPT=dropper`).
+/// Screenshot runs (`pickermode=f|u8|h`) show the picker's fields in that mode.
+pub fn set_mode_for_smoke(ctx: &egui::Context, mode: &str) {
+    let mode = match mode {
+        "f" => Mode::F,
+        "h" => Mode::Hex,
+        _ => Mode::U8,
+    };
+    ctx.data_mut(|d| d.insert_temp(Id::new("color_picker_mode"), mode));
+}
+
 pub fn arm_dropper_for_smoke(ctx: &egui::Context) {
     ctx.data_mut(|d| d.insert_temp(dropper_key(), Dropper::new(Id::new("smoke_dropper"))));
 }
@@ -70,7 +80,7 @@ enum Mode {
     /// 0-255.
     #[default]
     U8,
-    /// `#RRGGBB` or `#RRGGBBAA`.
+    /// `#RRGGBB`, then the alpha as two hex digits.
     Hex,
 }
 
@@ -468,8 +478,20 @@ fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 
     let mode_id = Id::new("color_picker_mode");
     let mut mode = ui.data(|d| d.get_temp::<Mode>(mode_id)).unwrap_or_default();
     let mut out = None;
+    // Every mode takes the same width, so switching modes doesn't resize (and move) the popup: the
+    // mode button as wide as its widest label, and the fields as wide as the 0-1 ones.
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text_w = |ui: &Ui, t: &str| ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE).size().x);
+    let pad = 2.0 * ui.spacing().button_padding.x;
+    let mode_w = [Mode::F, Mode::U8, Mode::Hex].iter().map(|m| text_w(ui, m.label())).fold(0.0, f32::max) + pad;
+    let fields = if alpha { 4 } else { 3 };
+    // A little over the text, so a field never grows past its share.
+    let field_w = text_w(ui, "R 0.000") + pad + 4.0;
+    let gap = ui.spacing().item_spacing.x;
+    let fields_w = fields as f32 * field_w + (fields - 1) as f32 * gap;
+    let h = ui.spacing().interact_size.y;
     ui.horizontal(|ui| {
-        if ui.button(mode.label()).on_hover_text(mode.tooltip()).clicked() {
+        if egui::Button::new(mode.label()).min_size(vec2(mode_w, 0.0)).ui(ui).on_hover_text(mode.tooltip()).clicked() {
             mode = mode.next();
             ui.data_mut(|d| d.insert_temp(mode_id, mode));
         }
@@ -488,62 +510,73 @@ fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 
                 Mode::Hex => to_hex(srgba, alpha),
             });
         }
-        let fields = if alpha { 4 } else { 3 };
-        match mode {
-            Mode::F => {
-                let mut v = linear;
-                let mut edited = false;
-                for (i, p) in ["R ", "G ", "B ", "A "].iter().enumerate().take(fields) {
-                    edited |= DragValue::new(&mut v[i])
-                        .speed(0.003)
-                        .prefix(*p)
-                        .range(0.0..=1.0)
-                        .custom_formatter(|n, _| format!("{n:.03}"))
-                        .ui(ui)
-                        .changed();
+        ui.allocate_ui_with_layout(vec2(fields_w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(fields_w);
+            match mode {
+                Mode::F => {
+                    let mut v = linear;
+                    let mut edited = false;
+                    for (i, p) in ["R ", "G ", "B ", "A "].iter().enumerate().take(fields) {
+                        let field = DragValue::new(&mut v[i]).speed(0.003).prefix(*p).range(0.0..=1.0).custom_formatter(|n, _| format!("{n:.03}"));
+                        edited |= ui.add_sized([field_w, h], field).changed();
+                    }
+                    if edited {
+                        out = Some(Hsva::from_rgba_unmultiplied(v[0], v[1], v[2], v[3]).to_srgba_unmultiplied());
+                    }
                 }
-                if edited {
-                    out = Some(Hsva::from_rgba_unmultiplied(v[0], v[1], v[2], v[3]).to_srgba_unmultiplied());
+                Mode::U8 => {
+                    let mut v = srgba;
+                    let mut edited = false;
+                    for (i, p) in ["R ", "G ", "B ", "A "].iter().enumerate().take(fields) {
+                        edited |= ui.add_sized([field_w, h], DragValue::new(&mut v[i]).speed(0.5).prefix(*p).range(0..=255)).changed();
+                    }
+                    if edited {
+                        out = Some(v);
+                    }
                 }
-            }
-            Mode::U8 => {
-                let mut v = srgba;
-                let mut edited = false;
-                for (i, p) in ["R ", "G ", "B ", "A "].iter().enumerate().take(fields) {
-                    edited |= DragValue::new(&mut v[i]).speed(0.5).prefix(*p).range(0..=255).ui(ui).changed();
-                }
-                if edited {
-                    out = Some(v);
-                }
-            }
-            Mode::Hex => {
-                // Keep what is being typed while the field has focus; show the colour otherwise.
-                let text_id = id.with("hex");
-                let edit_id = text_id.with("edit");
-                let focused = ui.memory(|m| m.has_focus(edit_id));
-                let current = to_hex(srgba, alpha);
-                let mut hex = if focused { ui.data(|d| d.get_temp::<String>(text_id)) } else { None }.unwrap_or(current);
-                let r = TextEdit::singleline(&mut hex)
-                    .id(edit_id)
-                    .desired_width(90.0)
-                    .char_limit(if alpha { 9 } else { 7 })
-                    .ui(ui)
-                    .on_hover_text(if alpha { "#RRGGBB or #RRGGBBAA" } else { "#RRGGBB" });
-                if r.changed() {
-                    if let Some(mut c) = parse_hex(&hex) {
+                Mode::Hex => {
+                    let rgb = [srgba[0], srgba[1], srgba[2], 255];
+                    // The hex code takes what the opacity field leaves.
+                    let alpha_w = if alpha { text_w(ui, "A") + gap + text_w(ui, "DD") + 12.0 + gap } else { 0.0 };
+                    let typed = hex_field(ui, id.with("hex"), &to_hex(rgb, false), fields_w - alpha_w, if alpha { 9 } else { 7 }, "#RRGGBB");
+                    if let Some(mut c) = typed.as_deref().and_then(parse_hex) {
+                        // Six digits keep the alpha; a pasted #RRGGBBAA sets it too.
+                        let digits = typed.as_deref().map_or(0, |t| t.trim().trim_start_matches('#').len());
                         if !alpha {
                             c[3] = 255;
+                        } else if digits == 6 {
+                            c[3] = srgba[3];
                         }
                         if c != srgba {
                             out = Some(c);
                         }
                     }
+                    if alpha {
+                        ui.label("A");
+                        let typed = hex_field(ui, id.with("hex_alpha"), &format!("{:02X}", srgba[3]), text_w(ui, "DD") + 12.0, 2, "Alpha, 00 to FF");
+                        if let Some(a) = typed.filter(|t| t.trim().len() == 2).and_then(|t| u8::from_str_radix(t.trim(), 16).ok()) {
+                            if a != srgba[3] {
+                                out = Some([srgba[0], srgba[1], srgba[2], a]);
+                            }
+                        }
+                    }
                 }
-                ui.data_mut(|d| d.insert_temp(text_id, hex));
             }
-        }
+        });
     });
     out
+}
+
+/// A text field showing `current`, `width` wide, which keeps what is being typed while
+/// it has focus. Returns the text when it was edited this frame.
+fn hex_field(ui: &mut Ui, text_id: Id, current: &str, width: f32, limit: usize, hover: &str) -> Option<String> {
+    let edit_id = text_id.with("edit");
+    let focused = ui.memory(|m| m.has_focus(edit_id));
+    let mut text = if focused { ui.data(|d| d.get_temp::<String>(text_id)) } else { None }.unwrap_or_else(|| current.to_owned());
+    let r = TextEdit::singleline(&mut text).id(edit_id).desired_width((width - 8.0).max(0.0)).char_limit(limit).ui(ui).on_hover_text(hover);
+    let changed = r.changed().then(|| text.clone());
+    ui.data_mut(|d| d.insert_temp(text_id, text));
+    changed
 }
 
 fn to_hex([r, g, b, a]: [u8; 4], alpha: bool) -> String {
@@ -576,34 +609,11 @@ fn swatch_button(ui: &mut Ui, srgba: [u8; 4], open: bool) -> Response {
     response
 }
 
-/// A colour over checkers: the left half as it blends, the right half opaque.
+/// A colour as it looks on a white page: the whole box, with its transparency blended over white.
 fn show_srgba(painter: &Painter, [r, g, b, a]: [u8; 4], rect: Rect) {
-    if a == 255 {
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(r, g, b));
-    } else {
-        checkers(painter, rect);
-        let left = Rect::from_min_max(rect.left_top(), rect.center_bottom());
-        let right = Rect::from_min_max(rect.center_top(), rect.right_bottom());
-        painter.rect_filled(left, 0.0, Color32::from_rgba_unmultiplied(r, g, b, a));
-        painter.rect_filled(right, 0.0, Color32::from_rgb(r, g, b));
-    }
-}
-
-fn checkers(painter: &Painter, rect: Rect) {
-    let rect = rect.shrink(0.5);
-    if !rect.is_positive() {
-        return;
-    }
-    let size = Vec2::splat(rect.height() / 2.0);
-    let n = (rect.width() / size.x).round() as u32;
-    let mut mesh = Mesh::default();
-    mesh.add_colored_rect(rect, Color32::from_gray(32));
-    for i in 0..n {
-        let x = lerp(rect.left()..=rect.right(), i as f32 / n as f32);
-        let y = if i % 2 == 0 { rect.top() } else { rect.center().y };
-        mesh.add_colored_rect(Rect::from_min_size(pos2(x, y), size), Color32::from_gray(128));
-    }
-    painter.add(Shape::mesh(mesh));
+    let t = a as f32 / 255.0;
+    let mix = |c: u8| (255.0 + (c as f32 - 255.0) * t).round() as u8;
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(mix(r), mix(g), mix(b)));
 }
 
 fn contrast(c: Color32) -> Color32 {

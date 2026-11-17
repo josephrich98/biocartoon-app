@@ -20,7 +20,7 @@ const PANEL_MIN_W: f32 = 260.0;
 const PANEL_MAX_W: f32 = 720.0;
 const TILE: f32 = 96.0;
 /// Most layers an SVG offers from its own colours (when the catalog names none), the most used.
-const MAX_COLOR_LAYERS: usize = 8;
+const MAX_COLOR_LAYERS: usize = 20;
 /// Most layers an upload keeps, so the Layers editor stays short for everyone who uses it.
 pub const MAX_LAYERS: usize = 20;
 
@@ -1273,7 +1273,7 @@ impl BioCartoon {
         ui.add_space(12.0);
         let can = !self.suggest.title.trim().is_empty() && !self.suggest.busy;
         let label = format!("{}  Submit idea", ph::PAPER_PLANE_TILT);
-        let b = ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent()).min_size(Vec2::new(w, 38.0)));
+        let b = ui.add_enabled(can, egui::Button::new(egui::RichText::new(label).color(theme::on_accent()).strong()).fill(theme::accent()).min_size(Vec2::new(w, 38.0)));
         if b.on_disabled_hover_text("Give it a title first").clicked() {
             self.actions.push(Action::SubmitSuggestion);
         }
@@ -1292,7 +1292,7 @@ impl BioCartoon {
         let enter = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
         ui.horizontal(|ui| {
             let can = !self.generate.prompt.trim().is_empty() && !self.generate.busy;
-            if ui.add_enabled(can, egui::Button::new(egui::RichText::new(format!("{}  Generate", ph::SPARKLE)).color(Color32::WHITE)).fill(theme::accent())).clicked() || (enter && can) {
+            if ui.add_enabled(can, egui::Button::new(egui::RichText::new(format!("{}  Generate", ph::SPARKLE)).color(theme::on_accent())).fill(theme::accent())).clicked() || (enter && can) {
                 self.actions.push(Action::Generate(self.generate.prompt.clone()));
             }
             ui.label(egui::RichText::new(self.ai_status()).small().color(theme::text_dim()));
@@ -1476,7 +1476,7 @@ impl BioCartoon {
         let full = Vec2::new(ui.available_width(), 32.0);
         ui.label(egui::RichText::new("Icons").strong().size(14.0));
         ui.add_space(2.0);
-        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Upload images", ph::UPLOAD_SIMPLE)).color(Color32::WHITE)).fill(theme::accent()).min_size(full)).clicked() {
+        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Upload images", ph::UPLOAD_SIMPLE)).color(theme::on_accent())).fill(theme::accent()).min_size(full)).clicked() {
             self.actions.push(Action::PickUploads);
         }
         ui.add_space(6.0);
@@ -1542,7 +1542,7 @@ impl BioCartoon {
         ui.add_space(14.0);
         ui.label(egui::RichText::new("Templates").strong().size(14.0));
         ui.add_space(2.0);
-        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Upload templates", ph::UPLOAD_SIMPLE)).color(Color32::WHITE)).fill(theme::accent()).min_size(full))
+        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Upload templates", ph::UPLOAD_SIMPLE)).color(theme::on_accent())).fill(theme::accent()).min_size(full))
             .on_hover_text("Add the slides of .biocartoon files to pick from")
             .clicked()
         {
@@ -1640,7 +1640,7 @@ impl BioCartoon {
         let n = c.icons.len() + c.library.len() + c.slides.len() + c.picked_templates.len() + c.library_templates.len();
         let (icon, what) = if share { (ph::CLOUD_ARROW_UP, "Add to BioCartoon library") } else { (ph::BOOKS, "Add to your library") };
         let label = if n == 0 { format!("{icon}  {what}") } else { format!("{icon}  {what} ({n})") };
-        let b = ui.add_enabled(n > 0, egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 38.0)));
+        let b = ui.add_enabled(n > 0, egui::Button::new(egui::RichText::new(label).color(theme::on_accent()).strong()).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 38.0)));
         if b.on_disabled_hover_text("Pick icons or templates above first").clicked() {
             self.actions.push(Action::ContributeSelected);
         }
@@ -1649,7 +1649,7 @@ impl BioCartoon {
     }
 
     fn uploads_panel(&mut self, ui: &mut egui::Ui) {
-        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Upload images", ph::UPLOAD_SIMPLE)).color(Color32::WHITE)).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
+        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Upload images", ph::UPLOAD_SIMPLE)).color(theme::on_accent())).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
             self.actions.push(Action::PickUploads);
         }
         ui.label(egui::RichText::new("PNG, JPEG, WebP, GIF, BMP. Click a thumbnail to place it on the sheet.").small().color(theme::text_dim()));
@@ -1788,7 +1788,7 @@ impl BioCartoon {
         } else {
             ui.label(egui::RichText::new("Hover to pick a size, or use the fields above.").small().color(theme::text_dim()));
         }
-        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Insert {rows} x {cols} table", ph::TABLE)).color(Color32::WHITE)).fill(theme::accent())).clicked() {
+        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Insert {rows} x {cols} table", ph::TABLE)).color(theme::on_accent())).fill(theme::accent())).clicked() {
             self.actions.push(Action::InsertTable(rows, cols));
         }
     }
@@ -1807,7 +1807,7 @@ impl BioCartoon {
         ui.add_space(4.0);
         code_editor(ui, &mut code, language, theme, &colors, &[], 10);
         ui.add_space(6.0);
-        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Insert code block", ph::CODE)).color(Color32::WHITE)).fill(theme::accent())).clicked() {
+        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Insert code block", ph::CODE)).color(theme::on_accent())).fill(theme::accent())).clicked() {
             self.actions.push(Action::InsertCode { code: code.clone(), language, theme, colors, line_numbers, window, rounded });
         }
         ui.ctx().data_mut(|d| d.insert_temp(id, (code, language, theme, colors, line_numbers, window, rounded)));
@@ -1918,25 +1918,26 @@ impl BioCartoon {
     }
 
     /// The layers an image offers to restyle, each a name and the colours in it: the catalog's
-    /// named ones for a library asset (once its row has come), else the SVG's own colours, the
-    /// [`MAX_COLOR_LAYERS`] most used. None for a picture that is not an SVG or has one colour.
+    /// named ones for a library asset (once its row has come), then the SVG's own colours they
+    /// leave out, most used first, as Layer n, up to [`MAX_COLOR_LAYERS`] in all. None for a
+    /// picture that is not an SVG or has no colour.
     fn image_layers(&self, source: &ImageSource) -> Vec<(String, Vec<[u8; 3]>)> {
         let Some(vector) = self.images.vector(&source.cache_key()) else { return Vec::new() };
-        if let ImageSource::Asset { id, .. } = source {
-            let Some(row) = self.variants.iter().find(|r| &r.id == id) else { return Vec::new() };
-            let named = named_layers(&row.layers);
-            if !named.is_empty() {
-                return named;
+        let named = match source {
+            ImageSource::Asset { id, .. } => {
+                let Some(row) = self.variants.iter().find(|r| &r.id == id) else { return Vec::new() };
+                named_layers(&row.layers)
             }
-        }
-        color_layers(vector.colors())
+            _ => Vec::new(),
+        };
+        offered_layers(named, vector.colors())
     }
 
     /// Layers: a colour and an opacity for each of [`image_layers`](Self::image_layers), kept in
     /// `layers` while they differ from the drawing's own. Whether anything changed.
     fn layers_ui(&self, ui: &mut egui::Ui, source: &ImageSource, layers: &mut Vec<LayerStyle>) -> bool {
         let offered = self.image_layers(source);
-        if offered.len() < 2 {
+        if offered.is_empty() {
             return false;
         }
         let mut changed = false;
@@ -2030,11 +2031,7 @@ impl BioCartoon {
                 changed = true;
             }
             ui.label("Opacity");
-            let mut op = edited.opacity * 100.0;
-            if ui.add(egui::DragValue::new(&mut op).speed(1.0).range(0.0..=100.0).suffix("%")).changed() {
-                edited.opacity = op / 100.0;
-                changed = true;
-            }
+            changed |= opacity_box(ui, &mut edited.opacity).changed();
             ui.end_row();
         });
         ui.horizontal_wrapped(|ui| {
@@ -2047,7 +2044,7 @@ impl BioCartoon {
         ui.separator();
 
         match &mut edited.kind {
-            ItemKind::Image { source, overlay, layers, .. } => {
+            ItemKind::Image { source, overlay, layers, saturation, .. } => {
                 // Presets: other colour variants of the same asset.
                 if let ImageSource::Asset { id: aid, .. } = source {
                     self.request_variants(aid);
@@ -2090,11 +2087,7 @@ impl BioCartoon {
                         if overlay[3] == 0 { overlay[3] = 255; }
                         changed = true;
                     }
-                    let mut strength = overlay[3] as f32 / 255.0 * 100.0;
-                    if ui.add(egui::DragValue::new(&mut strength).speed(1.0).range(0.0..=100.0).max_decimals(0).suffix("%")).on_hover_text("Overlay strength").changed() {
-                        overlay[3] = (strength / 100.0 * 255.0).round() as u8;
-                        changed = true;
-                    }
+                    changed |= alpha_box(ui, &mut overlay[3]).on_hover_text("Overlay strength").changed();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Reset").on_hover_text("Remove the color overlay").clicked() {
                             *overlay = [255, 255, 255, 0];
@@ -2102,10 +2095,28 @@ impl BioCartoon {
                         }
                     });
                 });
+                // Both sliders start at the same x, past the wider label.
+                let body = egui::TextStyle::Body.resolve(ui.style());
+                let label_w = ["Opacity", "Saturation"].map(|t| ui.fonts_mut(|f| f.layout_no_wrap(t.into(), body.clone(), Color32::WHITE).size().x)).into_iter().fold(0.0, f32::max);
+                let mut op = (edited.opacity.clamp(0.0, 1.0) * 100.0).round();
+                if percent_slider_row(ui, "Opacity", label_w, &mut op, 100.0, "How opaque the image is (0% invisible)") {
+                    edited.opacity = op / 100.0;
+                    changed = true;
+                }
+                let mut sat = (saturation.clamp(0.0, 2.0) * 100.0).round();
+                if percent_slider_row(ui, "Saturation", label_w, &mut sat, 200.0, "Color intensity: 0% grey, 100% as drawn, 200% twice as vivid") {
+                    *saturation = sat / 100.0;
+                    changed = true;
+                }
                 ui.add_space(4.0);
                 changed |= self.layers_ui(ui, source, layers);
                 ui.separator();
-                let b = egui::Button::new(egui::RichText::new(format!("{}  Edit with AI", ph::SPARKLE)).color(Color32::WHITE)).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 36.0));
+                // Outlined, not filled: an orange fill marks a button that commits an action, and
+                // this one only opens the dialog (whose own button does). "…" says it opens one.
+                let b = egui::Button::new(egui::RichText::new(format!("{}  Edit with AI…", ph::SPARKLE)).color(theme::accent()))
+                    .fill(theme::panel_raised())
+                    .stroke(Stroke::new(1.0, theme::accent()))
+                    .min_size(Vec2::new(ui.available_width(), 36.0));
                 if ui.add(b).on_hover_text("Restyle, remove the background or text, or describe any other change").clicked() {
                     self.actions.push(Action::OpenAiEdit);
                 }
@@ -2146,14 +2157,19 @@ impl BioCartoon {
                 egui::ComboBox::from_id_salt("shape_kind").selected_text(shape.label()).show_ui(ui, |ui| {
                     for k in ShapeKind::ALL { if ui.selectable_value(shape, k, k.label()).changed() { changed = true; } }
                 });
+                egui::Grid::new("shape_paint").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                    for (label, c) in [("Fill", &mut *fill), ("Stroke", &mut *stroke)] {
+                        ui.label(label);
+                        let mut col = *c;
+                        if crate::color::edit_button(ui, &mut col).changed() { *c = col; changed = true; }
+                        ui.label("Opacity");
+                        changed |= alpha_box(ui, &mut c[3]).on_hover_text(format!("{label} opacity")).changed();
+                        ui.end_row();
+                    }
+                });
                 ui.horizontal(|ui| {
-                    ui.label("Fill");
-                    let mut col = *fill;
-                    if crate::color::edit_button(ui, &mut col).changed() { *fill = col; changed = true; }
-                    ui.label("Stroke");
-                    let mut col = *stroke;
-                    if crate::color::edit_button(ui, &mut col).changed() { *stroke = col; changed = true; }
-                    changed |= ui.add(egui::DragValue::new(stroke_width).range(0.0..=40.0).speed(0.5)).changed();
+                    ui.label("Stroke thickness");
+                    changed |= ui.add(egui::DragValue::new(stroke_width).range(0.0..=40.0).speed(0.5).max_decimals(1).suffix(" px")).on_hover_text("Width of the outline").changed();
                 });
                 egui::Grid::new("shape_presets").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     for (label, c) in [("Fill presets", fill), ("Stroke presets", stroke)] {
@@ -2470,7 +2486,7 @@ impl BioCartoon {
         } else {
             (format!("{}  Add a comment", ph::PLUS), "Then click on the page where it goes")
         };
-        let b = egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 38.0));
+        let b = egui::Button::new(egui::RichText::new(label).color(theme::on_accent()).strong()).fill(theme::accent()).min_size(Vec2::new(ui.available_width(), 38.0));
         if ui.add(b).on_hover_text(tip).clicked() {
             self.actions.push(Action::ArmComment(!self.placing_comment));
         }
@@ -2662,7 +2678,7 @@ fn multi_select<T: Clone + PartialEq>(ui: &mut egui::Ui, id: &str, width: f32, c
 }
 
 fn row_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
-    row_button_with(ui, |ui| { ui.label(egui::RichText::new(icon).size(16.0).color(Color32::WHITE)); }, label)
+    row_button_with(ui, |ui| { ui.label(egui::RichText::new(icon).size(16.0).color(theme::on_accent_dim())); }, label)
 }
 
 /// A [`row_button`] whose icon is drawn by `icon` (for icons the Phosphor font lacks).
@@ -2789,7 +2805,7 @@ fn check_corner(ui: &egui::Ui, rect: Rect, on: bool, enabled: bool) {
     let p = ui.painter();
     if on {
         p.rect_filled(b, 4.0, theme::accent());
-        p.text(b.center(), egui::Align2::CENTER_CENTER, ph::CHECK, FontId::proportional(12.0), Color32::WHITE);
+        p.text(b.center(), egui::Align2::CENTER_CENTER, ph::CHECK, FontId::proportional(12.0), theme::on_accent());
     } else {
         let alpha = if enabled { 230 } else { 90 };
         p.rect(b, 4.0, Color32::from_white_alpha(alpha), Stroke::new(1.5, Color32::from_gray(140).gamma_multiply(alpha as f32 / 255.0)), StrokeKind::Inside);
@@ -3404,6 +3420,114 @@ pub(crate) fn color_presets(ui: &mut egui::Ui, current: [u8; 4], transparent: bo
     picked
 }
 
+/// Width of the tiny up/down arrow strip on a [`percent_box`].
+const PERCENT_ARROWS_W: f32 = 12.0;
+
+/// Width of a [`percent_box`]: wide enough for a three-digit value ("200%") at the current
+/// text size, and never under 64. The same for every box, so stacked slider rows line up.
+fn percent_box_w(ui: &egui::Ui) -> f32 {
+    let font = ui.style().drag_value_text_style.resolve(ui.style());
+    let text = ui.fonts_mut(|f| f.layout_no_wrap("200%".into(), font, Color32::WHITE).size().x);
+    (text + 2.0 * ui.spacing().button_padding.x + PERCENT_ARROWS_W + 4.0).max(64.0).ceil()
+}
+
+/// A whole-number percentage box, 0 to `max`, with a tiny up/down arrow pair at its right edge
+/// that steps it by 1. It can be dragged like any number box; typed text that is not a number
+/// in range is refused (the box keeps its value).
+pub(crate) fn percent_box(ui: &mut egui::Ui, pct: &mut f32, max: f32) -> egui::Response {
+    const ARROWS_W: f32 = PERCENT_ARROWS_W;
+    let box_w = percent_box_w(ui);
+    let mut v = pct.round().clamp(0.0, max);
+    let dv = egui::DragValue::new(&mut v)
+        .speed(1.0)
+        .range(0.0..=max)
+        .max_decimals(0)
+        .suffix("%")
+        .custom_parser(move |t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().filter(|n| (0.0..=max as f64).contains(n)).map(f64::round));
+    // The number, then the arrows in a strip of their own joined to its right side, so the text
+    // is centred clear of them.
+    let h = ui.spacing().interact_size.y;
+    let (mut resp, strip) = ui
+        .scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let resp = ui.add_sized([box_w - ARROWS_W, h], dv);
+            let (strip, _) = ui.allocate_exact_size(Vec2::new(ARROWS_W, h), Sense::hover());
+            (resp, strip)
+        })
+        .inner;
+    let bg = if ui.is_enabled() { ui.visuals().widgets.inactive.weak_bg_fill } else { ui.visuals().widgets.noninteractive.weak_bg_fill };
+    let cr = ui.visuals().widgets.inactive.corner_radius;
+    ui.painter().rect_filled(strip, egui::CornerRadius { nw: 0, sw: 0, ne: cr.ne, se: cr.se }, bg);
+    // Square off the number's right corners where they meet the strip.
+    ui.painter().rect_filled(Rect::from_min_max(egui::pos2(strip.left() - cr.ne as f32, resp.rect.top()), egui::pos2(strip.left(), resp.rect.bottom())), 0.0, bg);
+    let halves = [Rect::from_min_max(strip.min, egui::pos2(strip.right(), strip.center().y)), Rect::from_min_max(egui::pos2(strip.left(), strip.center().y), strip.max)];
+    let mut step = 0.0;
+    for (k, half) in halves.into_iter().enumerate() {
+        let hr = ui.interact(half, resp.id.with(("step", k)), Sense::click());
+        let col = if !ui.is_enabled() { theme::text_dim().gamma_multiply(0.5) } else if hr.hovered() { theme::accent() } else { theme::text_dim() };
+        let c = half.center();
+        let (dx, dy) = (3.0, 2.0);
+        let pts = if k == 0 { vec![egui::pos2(c.x - dx, c.y + dy), egui::pos2(c.x + dx, c.y + dy), egui::pos2(c.x, c.y - dy)] } else { vec![egui::pos2(c.x - dx, c.y - dy), egui::pos2(c.x + dx, c.y - dy), egui::pos2(c.x, c.y + dy)] };
+        ui.painter().add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+        if hr.on_hover_text(if k == 0 { "Up 1%" } else { "Down 1%" }).clicked() {
+            step = if k == 0 { 1.0 } else { -1.0 };
+        }
+    }
+    ui.painter().line_segment([egui::pos2(strip.left(), strip.top() + 4.0), egui::pos2(strip.left(), strip.bottom() - 4.0)], Stroke::new(1.0, theme::border()));
+    if step != 0.0 {
+        v = (v + step).clamp(0.0, max);
+        resp.mark_changed();
+    }
+    if resp.changed() {
+        *pct = v;
+    }
+    resp
+}
+
+/// [`percent_box`] for an opacity kept as 0 to 1.
+pub(crate) fn opacity_box(ui: &mut egui::Ui, opacity: &mut f32) -> egui::Response {
+    let mut pct = opacity.clamp(0.0, 1.0) * 100.0;
+    let r = percent_box(ui, &mut pct, 100.0);
+    if r.changed() {
+        *opacity = pct / 100.0;
+    }
+    r
+}
+
+/// [`percent_box`] for a colour's alpha channel.
+pub(crate) fn alpha_box(ui: &mut egui::Ui, alpha: &mut u8) -> egui::Response {
+    let mut pct = *alpha as f32 / 255.0 * 100.0;
+    let r = percent_box(ui, &mut pct, 100.0);
+    if r.changed() {
+        *alpha = (pct / 100.0 * 255.0).round() as u8;
+    }
+    r
+}
+
+/// A labelled row: a slider filling the width and a [`percent_box`] for the same value, 0 to
+/// `max` percent. Whether it changed.
+fn percent_slider_row(ui: &mut egui::Ui, label: &str, label_w: f32, pct: &mut f32, max: f32, hover: &str) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let h = ui.spacing().interact_size.y;
+        ui.allocate_ui_with_layout(Vec2::new(label_w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(label_w);
+            ui.label(label);
+        })
+        .response
+        .on_hover_text(hover);
+        let gap = ui.spacing().item_spacing.x;
+        ui.spacing_mut().slider_width = (ui.available_width() - percent_box_w(ui) - gap).max(40.0);
+        let mut v = *pct;
+        if ui.add(egui::Slider::new(&mut v, 0.0..=max).show_value(false)).on_hover_text(hover).changed() {
+            *pct = v.round();
+            changed = true;
+        }
+        changed |= percent_box(ui, pct, max).on_hover_text(hover).changed();
+    });
+    changed
+}
+
 /// A bordered row of `n` equal cells, `width` wide, like a segmented control. `add` gets each
 /// cell's size.
 fn segmented(ui: &mut egui::Ui, width: f32, n: usize, add: impl FnOnce(&mut egui::Ui, Vec2)) {
@@ -3740,12 +3864,26 @@ pub fn named_layers(layers: &[crate::catalog::AssetLayer]) -> Vec<(String, Vec<[
 }
 
 /// A drawing's own colours as layers, the [`MAX_COLOR_LAYERS`] most used, named Layer 1, 2...
-/// None when it has fewer than two.
+/// A one-colour drawing (a silhouette) gets the one layer, so it can still be recolored.
 pub fn color_layers(colors: &[[u8; 3]]) -> Vec<(String, Vec<[u8; 3]>)> {
-    if colors.len() < 2 {
-        return Vec::new();
+    offered_layers(Vec::new(), colors)
+}
+
+/// The layers an image offers: `named` (the catalog's), then each colour of the drawing they
+/// leave out, most used first, as a layer of its own named after its place (Layer 9, Layer 10...),
+/// until there are [`MAX_COLOR_LAYERS`]. So a drawing the catalog names only a few parts of still
+/// offers the rest of its colours to restyle.
+pub fn offered_layers(named: Vec<(String, Vec<[u8; 3]>)>, colors: &[[u8; 3]]) -> Vec<(String, Vec<[u8; 3]>)> {
+    let mut layers = named;
+    for c in colors {
+        if layers.len() >= MAX_COLOR_LAYERS {
+            break;
+        }
+        if !layers.iter().any(|(_, l)| l.contains(c)) {
+            layers.push((format!("Layer {}", layers.len() + 1), vec![*c]));
+        }
     }
-    colors.iter().take(MAX_COLOR_LAYERS).enumerate().map(|(i, c)| (format!("Layer {}", i + 1), vec![*c])).collect()
+    layers
 }
 
 /// The layers an upload starts with: `named` (the catalog's, when it names two or more) or none,
@@ -3944,6 +4082,14 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
     // (this frame's width, last frame's): the grid places its columns by last frame's widths.
     let (name_w, laid_w): (f32, f32) = ui.data(|d| d.get_temp(name_key)).unwrap_or((110.0, 110.0));
     let avail = ui.available_width();
+    // Without the editor the names are labels, as wide as they need up to what the other
+    // columns leave (measured last frame: from the colour box to the grid's right edge); a
+    // longer one is cut short, its whole name on hover. A grid wider than the panel would widen
+    // everything below it.
+    let rest_key = ui.id().with((id_salt, "rest_w"));
+    let rest: f32 = ui.data(|d| d.get_temp(rest_key)).unwrap_or(200.0);
+    let label_cap = (avail - rest - 6.0).max(40.0);
+    let mut swatch_left = f32::INFINITY;
     let grid = egui::Grid::new(id_salt).num_columns(if edit { 7 } else { 5 }).spacing([6.0, 4.0]).show(ui, |ui| {
         for (i, row) in rows.iter_mut().enumerate() {
             let style = &mut row.style;
@@ -3968,8 +4114,12 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
                     ui.label(":");
                 });
             } else {
-                ui.label(format!("{}:", row.name));
+                let h = ui.spacing().interact_size.y;
+                ui.allocate_ui_with_layout(egui::vec2(label_cap, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(format!("{}:", row.name)).truncate());
+                });
             }
+            swatch_left = swatch_left.min(ui.cursor().left());
             ui.add_enabled_ui(live, |ui| {
                 // The picker's opacity is the layer's, the same value as the box beside it.
                 let [r, g, b] = style.color.unwrap_or(style.colors[0]);
@@ -4005,10 +4155,7 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
                 }
             });
             ui.add_enabled_ui(live, |ui| {
-                let mut op = style.opacity * 100.0;
-                if ui.add(egui::DragValue::new(&mut op).speed(1.0).range(0.0..=100.0).suffix("%")).on_hover_text("Opacity").changed() {
-                    style.opacity = op / 100.0;
-                }
+                opacity_box(ui, &mut style.opacity).on_hover_text("Opacity");
             });
             ui.add_enabled_ui(live, |ui| {
                 let hidden = style.opacity <= 0.0;
@@ -4039,6 +4186,13 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
             changed |= *style != before;
         }
     });
+    if !edit && swatch_left.is_finite() {
+        let measured = grid.response.rect.right() - swatch_left;
+        if (measured - rest).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(rest_key, measured));
+            ui.ctx().request_repaint();
+        }
+    }
     if edit {
         let fit = (laid_w + avail - grid.response.rect.width()).clamp(60.0, 400.0);
         if (fit - name_w).abs() > 0.5 || (laid_w - name_w).abs() > 0.5 {
@@ -4161,6 +4315,20 @@ mod tests {
         assert_eq!(layers.iter().map(|l| l.0.as_str()).collect::<Vec<_>>(), ["Ink", "Paper", "Layer 3"]);
         // One colour: no layers.
         assert!(upload_layers(Vec::new(), &[[1, 2, 3]]).is_empty());
+    }
+
+    #[test]
+    fn one_color_drawings_get_one_layer() {
+        assert_eq!(color_layers(&[[0x5d, 0x86, 0xa6]]), [("Layer 1".to_string(), vec![[0x5d, 0x86, 0xa6]])]);
+        assert!(color_layers(&[]).is_empty());
+        // Named layers first, then the colours they leave out, numbered by place, capped.
+        let named = vec![("Fur".to_string(), vec![[1, 1, 1], [2, 2, 2]]), ("Tail".to_string(), vec![[3, 3, 3]])];
+        let colors: Vec<[u8; 3]> = (1..=40).map(|i| [i, i, i]).collect();
+        let layers = offered_layers(named, &colors);
+        assert_eq!(layers.len(), MAX_COLOR_LAYERS);
+        assert_eq!((layers[0].0.as_str(), layers[1].0.as_str()), ("Fur", "Tail"));
+        assert_eq!(layers[2], ("Layer 3".to_string(), vec![[4, 4, 4]]));
+        assert_eq!(layers[19].0, "Layer 20");
     }
 
     #[test]
