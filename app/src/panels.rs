@@ -2088,12 +2088,15 @@ impl BioCartoon {
                         changed = true;
                     }
                     changed |= alpha_box(ui, &mut overlay[3]).on_hover_text("Overlay strength").changed();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Reset").on_hover_text("Remove the color overlay").clicked() {
-                            *overlay = [255, 255, 255, 0];
-                            changed = true;
-                        }
-                    });
+                    // Only once there is an overlay to remove, like the Layers Reset.
+                    if overlay[3] != 0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Reset").on_hover_text("Remove the color overlay").clicked() {
+                                *overlay = [255, 255, 255, 0];
+                                changed = true;
+                            }
+                        });
+                    }
                 });
                 // Both sliders start at the same x, past the wider label.
                 let body = egui::TextStyle::Body.resolve(ui.style());

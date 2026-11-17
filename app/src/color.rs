@@ -3,7 +3,7 @@
 //! egui's own picker can show values as F (0-1 linear) or U8 (0-255), but has no hex view, and its
 //! alpha field could not be edited. This one cycles F → U8 → H (hex), and every field edits the same
 //! colour the 2D area, hue bar and opacity box do, so they always agree. Its eyedropper takes a
-//! colour from anywhere in the window. With transparency, the bar at the top is an opacity slider, drawn as the colour looks on white. Under the hue bar are the common colours and the ones
+//! colour from anywhere in the window. With transparency, the bar at the top is an opacity slider; it and the swatches show transparency over a faint checkerboard. Under the hue bar are the common colours and the ones
 //! picked lately.
 
 use egui::ecolor::{Hsva, HsvaGamma};
@@ -15,6 +15,7 @@ use egui::{
 
 /// Vertices per dimension in the sliders; a multiple of 6 so the hue bar hits every peak hue.
 const N: u32 = 6 * 6;
+/// The height of the 2D area, and the narrowest the picker gets; it is as wide as the numeric row.
 const SLIDER_WIDTH: f32 = 275.0;
 
 /// The common colours, shown in every picker and beside the text colour fields.
@@ -362,20 +363,20 @@ fn picker(ui: &mut Ui, id: Id, rgba: &mut [u8; 4], alpha: bool) -> bool {
     let before = *rgba;
 
     ui.vertical(|ui| {
-        if let Some(c) = numeric_row(ui, id, *rgba, alpha) {
+        let (edited, row_w) = numeric_row(ui, id, *rgba, alpha);
+        if let Some(c) = edited {
             *rgba = c;
             hsvag = HsvaGamma::from(Hsva::from_srgba_unmultiplied(c));
         }
+        // Everything below spans the popup, as wide as the row above.
+        ui.spacing_mut().slider_width = row_w.max(SLIDER_WIDTH);
 
         if alpha {
-            // The colour from clear to solid as it looks on a white page: drag for its opacity.
+            // The colour from clear to solid over a checkerboard: drag for its opacity.
             let [r, g, b, a] = *rgba;
             let mut t = a as f32 / 255.0;
-            let on_white = |t: f32| {
-                let mix = |c: u8| (255.0 + (c as f32 - 255.0) * t).round() as u8;
-                Color32::from_rgb(mix(r), mix(g), mix(b))
-            };
-            slider_1d(ui, &mut t, on_white).on_hover_text("Opacity (as it looks on white)");
+            let faded = |t: f32| Color32::from_rgba_unmultiplied(r, g, b, (t * 255.0).round() as u8);
+            slider_1d(ui, &mut t, faded).on_hover_text("Opacity");
             let a2 = (t * 255.0).round() as u8;
             if a2 != a {
                 rgba[3] = a2;
@@ -472,8 +473,9 @@ fn swatch(ui: &mut Ui, size: f32, c: [u8; 4], on: bool) -> Response {
     resp
 }
 
-/// The mode toggle, a copy button and the fields for the current mode. Returns the edited colour.
-fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 4]> {
+/// The mode toggle, a copy button and the fields for the current mode. Returns the edited colour
+/// and the row's width.
+fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> (Option<[u8; 4]>, f32) {
     // One mode for every picker, remembered for the session.
     let mode_id = Id::new("color_picker_mode");
     let mut mode = ui.data(|d| d.get_temp::<Mode>(mode_id)).unwrap_or_default();
@@ -484,13 +486,14 @@ fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 
     let text_w = |ui: &Ui, t: &str| ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE).size().x);
     let pad = 2.0 * ui.spacing().button_padding.x;
     let mode_w = [Mode::F, Mode::U8, Mode::Hex].iter().map(|m| text_w(ui, m.label())).fold(0.0, f32::max) + pad;
-    let fields = if alpha { 4 } else { 3 };
+    // R, G and B only: the opacity bar and box below edit the alpha.
+    let fields = 3;
     // A little over the text, so a field never grows past its share.
     let field_w = text_w(ui, "R 0.000") + pad + 4.0;
     let gap = ui.spacing().item_spacing.x;
     let fields_w = fields as f32 * field_w + (fields - 1) as f32 * gap;
     let h = ui.spacing().interact_size.y;
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         if egui::Button::new(mode.label()).min_size(vec2(mode_w, 0.0)).ui(ui).on_hover_text(mode.tooltip()).clicked() {
             mode = mode.next();
             ui.data_mut(|d| d.insert_temp(mode_id, mode));
@@ -501,11 +504,10 @@ fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 
             Popup::close_id(ui.ctx(), id);
         }
         let linear = Hsva::from_srgba_unmultiplied(srgba).to_rgba_unmultiplied();
+        // What the fields show; hex adds the alpha digits when the colour is see-through.
         if ui.button(egui_phosphor::regular::COPY).on_hover_text("Copy the color values").clicked() {
             ui.copy_text(match mode {
-                Mode::F if alpha => format!("{:.03}, {:.03}, {:.03}, {:.03}", linear[0], linear[1], linear[2], linear[3]),
                 Mode::F => format!("{:.03}, {:.03}, {:.03}", linear[0], linear[1], linear[2]),
-                Mode::U8 if alpha => format!("{}, {}, {}, {}", srgba[0], srgba[1], srgba[2], srgba[3]),
                 Mode::U8 => format!("{}, {}, {}", srgba[0], srgba[1], srgba[2]),
                 Mode::Hex => to_hex(srgba, alpha),
             });
@@ -516,7 +518,7 @@ fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 
                 Mode::F => {
                     let mut v = linear;
                     let mut edited = false;
-                    for (i, p) in ["R ", "G ", "B ", "A "].iter().enumerate().take(fields) {
+                    for (i, p) in ["R ", "G ", "B "].iter().enumerate() {
                         let field = DragValue::new(&mut v[i]).speed(0.003).prefix(*p).range(0.0..=1.0).custom_formatter(|n, _| format!("{n:.03}"));
                         edited |= ui.add_sized([field_w, h], field).changed();
                     }
@@ -527,7 +529,7 @@ fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 
                 Mode::U8 => {
                     let mut v = srgba;
                     let mut edited = false;
-                    for (i, p) in ["R ", "G ", "B ", "A "].iter().enumerate().take(fields) {
+                    for (i, p) in ["R ", "G ", "B "].iter().enumerate() {
                         edited |= ui.add_sized([field_w, h], DragValue::new(&mut v[i]).speed(0.5).prefix(*p).range(0..=255)).changed();
                     }
                     if edited {
@@ -536,9 +538,7 @@ fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 
                 }
                 Mode::Hex => {
                     let rgb = [srgba[0], srgba[1], srgba[2], 255];
-                    // The hex code takes what the opacity field leaves.
-                    let alpha_w = if alpha { text_w(ui, "A") + gap + text_w(ui, "DD") + 12.0 + gap } else { 0.0 };
-                    let typed = hex_field(ui, id.with("hex"), &to_hex(rgb, false), fields_w - alpha_w, if alpha { 9 } else { 7 }, "#RRGGBB");
+                    let typed = hex_field(ui, id.with("hex"), &to_hex(rgb, false), fields_w, if alpha { 9 } else { 7 }, "#RRGGBB");
                     if let Some(mut c) = typed.as_deref().and_then(parse_hex) {
                         // Six digits keep the alpha; a pasted #RRGGBBAA sets it too.
                         let digits = typed.as_deref().map_or(0, |t| t.trim().trim_start_matches('#').len());
@@ -551,20 +551,11 @@ fn numeric_row(ui: &mut Ui, id: Id, srgba: [u8; 4], alpha: bool) -> Option<[u8; 
                             out = Some(c);
                         }
                     }
-                    if alpha {
-                        ui.label("A");
-                        let typed = hex_field(ui, id.with("hex_alpha"), &format!("{:02X}", srgba[3]), text_w(ui, "DD") + 12.0, 2, "Alpha, 00 to FF");
-                        if let Some(a) = typed.filter(|t| t.trim().len() == 2).and_then(|t| u8::from_str_radix(t.trim(), 16).ok()) {
-                            if a != srgba[3] {
-                                out = Some([srgba[0], srgba[1], srgba[2], a]);
-                            }
-                        }
-                    }
                 }
             }
         });
     });
-    out
+    (out, row.response.rect.width())
 }
 
 /// A text field showing `current`, `width` wide, which keeps what is being typed while
@@ -609,11 +600,26 @@ fn swatch_button(ui: &mut Ui, srgba: [u8; 4], open: bool) -> Response {
     response
 }
 
-/// A colour as it looks on a white page: the whole box, with its transparency blended over white.
+/// A colour filling the box; a transparent one over a faint checkerboard, so it reads as see-through.
 fn show_srgba(painter: &Painter, [r, g, b, a]: [u8; 4], rect: Rect) {
-    let t = a as f32 / 255.0;
-    let mix = |c: u8| (255.0 + (c as f32 - 255.0) * t).round() as u8;
-    painter.rect_filled(rect, 0.0, Color32::from_rgb(mix(r), mix(g), mix(b)));
+    if a < 255 {
+        checkerboard(painter, rect);
+    }
+    painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(r, g, b, a));
+}
+
+/// Faint squares behind a transparent colour. Darker in a dark theme so they don't glare.
+fn checkerboard(painter: &Painter, rect: Rect) {
+    let (light, dark) = if crate::theme::is_dark() { (Color32::from_gray(78), Color32::from_gray(62)) } else { (Color32::WHITE, Color32::from_gray(222)) };
+    painter.rect_filled(rect, 0.0, light);
+    let cell = 5.0;
+    let clip = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+    for row in 0..(rect.height() / cell).ceil() as usize {
+        for col in (row % 2..(rect.width() / cell).ceil() as usize).step_by(2) {
+            let c = Rect::from_min_size(rect.min + vec2(col as f32, row as f32) * cell, Vec2::splat(cell));
+            clip.rect_filled(c, 0.0, dark);
+        }
+    }
 }
 
 fn contrast(c: Color32) -> Color32 {
@@ -628,6 +634,9 @@ fn slider_1d(ui: &mut Ui, value: &mut f32, color_at: impl Fn(f32) -> Color32) ->
     }
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact(&response);
+        if color_at(0.0).a() < 255 || color_at(1.0).a() < 255 {
+            checkerboard(ui.painter(), rect);
+        }
         let mut mesh = Mesh::default();
         for i in 0..=N {
             let t = i as f32 / N as f32;
@@ -644,7 +653,8 @@ fn slider_1d(ui: &mut Ui, value: &mut f32, color_at: impl Fn(f32) -> Color32) ->
         ui.painter().rect_stroke(rect, 0.0, visuals.bg_stroke, StrokeKind::Inside);
         let x = lerp(rect.left()..=rect.right(), *value);
         let r = rect.height() / 4.0;
-        let picked = color_at(*value);
+        // Solid, so the marker shows even at the clear end.
+        let picked = color_at(*value).to_opaque();
         ui.painter().add(Shape::convex_polygon(
             vec![pos2(x, rect.center().y), pos2(x + r, rect.bottom()), pos2(x - r, rect.bottom())],
             picked,
@@ -654,9 +664,10 @@ fn slider_1d(ui: &mut Ui, value: &mut f32, color_at: impl Fn(f32) -> Color32) ->
     response
 }
 
-/// Saturation across, value up.
+/// Saturation across, value up. As wide as the picker, but no taller than `SLIDER_WIDTH`.
 fn slider_2d(ui: &mut Ui, x_value: &mut f32, y_value: &mut f32, color_at: impl Fn(f32, f32) -> Color32) -> Response {
-    let (rect, response) = ui.allocate_at_least(Vec2::splat(ui.spacing().slider_width), Sense::click_and_drag());
+    let size = vec2(ui.spacing().slider_width, SLIDER_WIDTH.min(ui.spacing().slider_width));
+    let (rect, response) = ui.allocate_at_least(size, Sense::click_and_drag());
     if let Some(p) = response.interact_pointer_pos() {
         *x_value = remap_clamp(p.x, rect.left()..=rect.right(), 0.0..=1.0);
         *y_value = remap_clamp(p.y, rect.bottom()..=rect.top(), 0.0..=1.0);
