@@ -92,11 +92,15 @@ release() {
   step "bump to $v"
   sed -i '' -E "1,/^version = /s/^version = \"[^\"]*\"/version = \"$v\"/" "$CAT/catalog/Cargo.toml" "$APP/app/Cargo.toml"
   sed -i '' -E "s#(<key>CFBundle(Short)?Version(String)?</key><string>)[^<]*#\1$v#" "$APP/app/bundle_mac.sh"
+  sed -i '' -E "s/^(  \"version\": )\"[^\"]*\"/\1\"$v\"/" "$CAT/.claude-plugin/plugin.json" "$CAT/.codex-plugin/plugin.json"
   # Rewrites Cargo.lock for the new versions without upgrading any dependency.
   (cd "$CAT/catalog" && cargo metadata --format-version 1 >/dev/null)
   (cd "$APP/app" && cargo metadata --format-version 1 >/dev/null)
   grep -m1 '^version' "$CAT/catalog/Cargo.toml" "$APP/app/Cargo.toml"
   grep -c "<string>$v</string>" "$APP/app/bundle_mac.sh" | grep -qx 2 || die "bundle_mac.sh: expected 2 version strings"
+  for f in "$CAT/.claude-plugin/plugin.json" "$CAT/.codex-plugin/plugin.json"; do
+    grep -qx "  \"version\": \"$v\"," "$f" || die "$f: version not bumped"
+  done
 
   # The catalog repo goes first: the app's release build checks out biocartoon's main.
   for repo in "$CAT" "$APP"; do
