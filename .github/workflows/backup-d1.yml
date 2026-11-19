@@ -1,0 +1,44 @@
+# Daily backup of the submissions/accounts database (D1 biocartoon-submissions, used by the Workers
+# in biocartoon/worker) to the private R2 bucket biocartoon-backups, as d1/<name>-<UTC time>.sql.gz.
+# A lifecycle rule on the bucket deletes each export after 30 days.
+#
+# It lives here rather than in biocartoon because this repo holds the Cloudflare secrets
+# (CLOUDFLARE_API_TOKEN needs D1 read and R2 write). The export holds account emails, so it never
+# goes into a workflow artifact or the log: on a public repo those are visible to anyone.
+#
+# Restore:  npx wrangler r2 object get biocartoon-backups/d1/<file> --remote --file b.sql.gz
+#           gunzip b.sql.gz && npx wrangler d1 execute <a new or emptied database> --remote --file b.sql
+name: backup-d1
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-d1
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WRANGLER: npx --yes wrangler@4.165.0
+      DB: biocartoon-submissions
+    steps:
+      - name: Export D1 and upload it to R2
+        run: |
+          set -euo pipefail
+          file="$DB-$(date -u +%Y%m%dT%H%M%SZ).sql"
+          $WRANGLER d1 export "$DB" --remote --output "$RUNNER_TEMP/$file"
+          # An empty or truncated export would quietly replace good backups as old ones expire.
+          rows=$(grep -c '^INSERT INTO' "$RUNNER_TEMP/$file" || true)
+          [ "$rows" -gt 0 ] || { echo "::error::export has no rows"; exit 1; }
+          gzip -9 "$RUNNER_TEMP/$file"
+          $WRANGLER r2 object put "biocartoon-backups/d1/$file.gz" --file "$RUNNER_TEMP/$file.gz" --remote
+          echo "backed up $rows rows to biocartoon-backups/d1/$file.gz ($(stat -c %s "$RUNNER_TEMP/$file.gz") bytes)"
+          rm -f "$RUNNER_TEMP/$file.gz"
