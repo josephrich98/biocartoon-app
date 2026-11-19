@@ -31,6 +31,16 @@ jobs:
       WRANGLER: npx --yes wrangler@4.165.0
       DB: biocartoon-submissions
     steps:
+      # Says which permission a broken token lacks (only success flags and error messages are printed).
+      - name: Check the token
+        run: |
+          set -uo pipefail
+          api=https://api.cloudflare.com/client/v4
+          check() { curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$2" | jq -c --arg c "$1" '{check: $c, success, errors: [.errors[]?.message]}'; }
+          check "token valid" user/tokens/verify
+          check "account-owned token valid" "accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify"
+          check "D1 (D1: Edit)" "accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"
+          check "R2 bucket (Workers R2 Storage: Edit)" "accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/biocartoon-backups"
       - name: Export D1 and upload it to R2
         run: |
           set -euo pipefail
