@@ -38,6 +38,8 @@ jobs:
           api=https://api.cloudflare.com/client/v4
           check() { curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$2" | jq -c --arg c "$1" '{check: $c, success, errors: [.errors[]?.message]}'; }
           check "token valid" user/tokens/verify
+          # The token's id (not secret): compare it with the id in the token's dashboard URL.
+          curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/user/tokens/verify" | jq -c '{token_id: .result.id, status: .result.status}'
           check "account-owned token valid" "accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify"
           check "D1 (D1: Edit)" "accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"
           check "R2 bucket (Workers R2 Storage: Edit)" "accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/biocartoon-backups"
