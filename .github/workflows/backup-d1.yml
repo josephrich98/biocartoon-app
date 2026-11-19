@@ -37,10 +37,13 @@ jobs:
           set -uo pipefail
           api=https://api.cloudflare.com/client/v4
           check() { curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$2" | jq -c --arg c "$1" '{check: $c, success, errors: [.errors[]?.message]}'; }
-          check "token valid" user/tokens/verify
-          # The token's id (not secret): compare it with the id in the token's dashboard URL.
-          curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/user/tokens/verify" | jq -c '{token_id: .result.id, status: .result.status}'
-          check "account-owned token valid" "accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify"
+          # A user token verifies at user/, an account-owned one at accounts/<id>/. The id isn't secret:
+          # compare it with the id in the token's dashboard URL.
+          for v in "accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" user/tokens/verify; do
+            r=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$v")
+            if [ "$(jq -r .success <<<"$r")" = true ]; then jq -c --arg v "$v" '{check: "token valid", via: $v, token_id: .result.id, status: .result.status}' <<<"$r"; break; fi
+            [ "$v" = user/tokens/verify ] && echo '{"check":"token valid","success":false}'
+          done
           check "D1 (D1: Edit)" "accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"
           check "R2 bucket (Workers R2 Storage: Edit)" "accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/biocartoon-backups"
       - name: Export D1 and upload it to R2
