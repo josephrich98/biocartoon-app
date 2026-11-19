@@ -2,9 +2,10 @@
 # in biocartoon/worker) to the private R2 bucket biocartoon-backups, as d1/<name>-<UTC time>.sql.gz.
 # A lifecycle rule on the bucket deletes each export after 30 days.
 #
-# It lives here rather than in biocartoon because this repo holds the Cloudflare secrets
-# (CLOUDFLARE_API_TOKEN needs D1 read and R2 write). The export holds account emails, so it never
-# goes into a workflow artifact or the log: on a public repo those are visible to anyone.
+# Needs its own repository secret, CLOUDFLARE_BACKUP_TOKEN: a Cloudflare API token limited to this
+# account with "D1: Edit" (the export API needs it) and "Workers R2 Storage: Edit", kept separate
+# from the deploy token. It reuses CLOUDFLARE_ACCOUNT_ID. The export holds account emails, so it
+# never goes into a workflow artifact or the log: on a public repo those are visible to anyone.
 #
 # Restore:  npx wrangler r2 object get biocartoon-backups/d1/<file> --remote --file b.sql.gz
 #           gunzip b.sql.gz && npx wrangler d1 execute <a new or emptied database> --remote --file b.sql
@@ -25,7 +26,7 @@ jobs:
   backup:
     runs-on: ubuntu-latest
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_BACKUP_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       WRANGLER: npx --yes wrangler@4.165.0
       DB: biocartoon-submissions
