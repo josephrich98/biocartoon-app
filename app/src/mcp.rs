@@ -5,7 +5,7 @@
 
 use crate::control::Client;
 use crate::query;
-use biocartoon_catalog::mcp::{bool_prop, image_png, int_prop, num_prop, pretty, str_prop, text, tool, CatalogTools, ServerInfo, Tools, CATALOG_INSTRUCTIONS};
+use biocartoon_catalog::mcp::{bool_prop, image_png, int_prop, num_prop, pretty, read_only, str_prop, text, tool, CatalogTools, ServerInfo, Tools, CATALOG_INSTRUCTIONS};
 pub use biocartoon_catalog::mcp::{parse_sort, PROTOCOL_VERSION};
 use serde_json::{json, Map, Value};
 
@@ -125,31 +125,47 @@ fn editor_tools() -> Vec<Value> {
     let mut update = obj(json!({"id": int_prop("The item to change.")}));
     update.extend(style_props());
     vec![
-        tool("list_templates", "Slide templates: the editor's built-in layouts (builtin:N) and saved / shared templates. Optional word filter.", json!({"query": str_prop("Words that must appear in the title, description or category.")}), &[]),
-        tool("template_image", "The thumbnail of a saved or shared template (built-in layouts have none).", json!({"id": str_prop("Template id.")}), &["id"]),
-        tool("canvas_state", "What is open in the editor: page size, current slide and every item on it (ids, type, position, size, asset). Call it before editing and after inserting.", json!({}), &[]),
-        tool("canvas_render", "A picture of a slide as it looks now (PNG), to check the layout visually.", json!({"slide": int_prop("Slide index (default: the current one)."), "max_side": int_prop("Longest side in pixels (default 1024).")}), &[]),
-        tool("canvas_insert_asset", "Place a catalog asset on the current slide (centered unless x/y given; sized to a quarter of the page unless width/height given). Returns the new item, including its id.", with_geometry(insert_asset), &["id"]),
-        tool("canvas_insert_template", "Add a template's slide after the current one, scaled to the page (builtin:N layouts or a saved / shared template id from list_templates).", json!({"id": str_prop("Template id.")}), &["id"]),
-        tool("canvas_insert_text", "Add a text box.", with_geometry(insert_text), &["text"]),
-        tool("canvas_insert_shape", "Add a shape.", with_geometry(insert_shape), &[]),
-        tool("canvas_insert_code", "Add a syntax-highlighted code block, sized to fit the code unless width/height given.", with_geometry(insert_code), &["code"]),
-        tool("canvas_insert_line", "Add a line or arrow (x1/y1 to x2/y2, or centered by default).", with_geometry(insert_line), &[]),
-        tool("canvas_update_item", "Change an item's geometry or appearance (any subset of the fields). Returns the item.", with_geometry(update), &["id"]),
-        tool("canvas_move_items", "Move items: absolute x/y places the group's top-left corner, dx/dy shifts them.", json!({"ids": ids_prop(), "x": num_prop("New left edge."), "y": num_prop("New top edge."), "dx": num_prop("Shift right (negative: left)."), "dy": num_prop("Shift down (negative: up).")}), &["ids"]),
-        tool("canvas_delete_items", "Remove items from the slide.", json!({"ids": ids_prop()}), &["ids"]),
-        tool("canvas_select", "Select items in the editor (an empty list clears the selection).", json!({"ids": ids_prop()}), &["ids"]),
-        tool("canvas_duplicate", "Duplicate items (the copies are returned and selected).", json!({"ids": ids_prop()}), &["ids"]),
-        tool("canvas_align", "Align or distribute items: left, center_h, right, top, middle, bottom, distribute_h, distribute_v. One item aligns to the page.", json!({"kind": str_prop("Alignment."), "ids": ids_prop()}), &["kind"]),
-        tool("canvas_arrange", "Change stacking order: front, forward, backward, back.", json!({"kind": str_prop("Order change."), "ids": ids_prop()}), &["kind", "ids"]),
-        tool("canvas_slides", "List the document's slides.", json!({}), &[]),
-        tool("canvas_go_slide", "Switch to a slide.", json!({"index": int_prop("0-based slide index.")}), &["index"]),
-        tool("canvas_add_slide", "Add an empty slide after the current one and switch to it.", json!({}), &[]),
-        tool("canvas_set_page", "Change the page size or background.", json!({"width": num_prop("Page width in `unit`."), "height": num_prop("Page height in `unit`."), "unit": str_prop("inch, cm or px (default: the document's)."), "background": color_prop("Page color of the current slide")}), &[]),
-        tool("canvas_undo", "Undo the last edit.", json!({}), &[]),
-        tool("canvas_redo", "Redo.", json!({}), &[]),
-        tool("canvas_save", "Save the document as a project in the editor.", json!({}), &[]),
+        tool("list_templates", "List slide templates", "Slide templates: the editor's built-in layouts (builtin:N) and saved / shared templates. Optional word filter.", json!({"query": str_prop("Words that must appear in the title, description or category.")}), &[]),
+        tool("template_image", "Show template thumbnail", "The thumbnail of a saved or shared template (built-in layouts have none).", json!({"id": str_prop("Template id.")}), &["id"]),
+        tool("canvas_state", "Read editor state", "What is open in the editor: page size, current slide and every item on it (ids, type, position, size, asset). Call it before editing and after inserting.", json!({}), &[]),
+        tool("canvas_render", "Render slide", "A picture of a slide as it looks now (PNG), to check the layout visually.", json!({"slide": int_prop("Slide index (default: the current one)."), "max_side": int_prop("Longest side in pixels (default 1024).")}), &[]),
+        tool("canvas_insert_asset", "Insert illustration", "Place a catalog asset on the current slide (centered unless x/y given; sized to a quarter of the page unless width/height given). Returns the new item, including its id.", with_geometry(insert_asset), &["id"]),
+        tool("canvas_insert_template", "Insert template slide", "Add a template's slide after the current one, scaled to the page (builtin:N layouts or a saved / shared template id from list_templates).", json!({"id": str_prop("Template id.")}), &["id"]),
+        tool("canvas_insert_text", "Insert text", "Add a text box.", with_geometry(insert_text), &["text"]),
+        tool("canvas_insert_shape", "Insert shape", "Add a shape.", with_geometry(insert_shape), &[]),
+        tool("canvas_insert_code", "Insert code block", "Add a syntax-highlighted code block, sized to fit the code unless width/height given.", with_geometry(insert_code), &["code"]),
+        tool("canvas_insert_line", "Insert line or arrow", "Add a line or arrow (x1/y1 to x2/y2, or centered by default).", with_geometry(insert_line), &[]),
+        tool("canvas_update_item", "Update item", "Change an item's geometry or appearance (any subset of the fields). Returns the item.", with_geometry(update), &["id"]),
+        tool("canvas_move_items", "Move items", "Move items: absolute x/y places the group's top-left corner, dx/dy shifts them.", json!({"ids": ids_prop(), "x": num_prop("New left edge."), "y": num_prop("New top edge."), "dx": num_prop("Shift right (negative: left)."), "dy": num_prop("Shift down (negative: up).")}), &["ids"]),
+        tool("canvas_delete_items", "Delete items", "Remove items from the slide.", json!({"ids": ids_prop()}), &["ids"]),
+        tool("canvas_select", "Select items", "Select items in the editor (an empty list clears the selection).", json!({"ids": ids_prop()}), &["ids"]),
+        tool("canvas_duplicate", "Duplicate items", "Duplicate items (the copies are returned and selected).", json!({"ids": ids_prop()}), &["ids"]),
+        tool("canvas_align", "Align items", "Align or distribute items: left, center_h, right, top, middle, bottom, distribute_h, distribute_v. One item aligns to the page.", json!({"kind": str_prop("Alignment."), "ids": ids_prop()}), &["kind"]),
+        tool("canvas_arrange", "Arrange stacking order", "Change stacking order: front, forward, backward, back.", json!({"kind": str_prop("Order change."), "ids": ids_prop()}), &["kind", "ids"]),
+        tool("canvas_slides", "List slides", "List the document's slides.", json!({}), &[]),
+        tool("canvas_go_slide", "Go to slide", "Switch to a slide.", json!({"index": int_prop("0-based slide index.")}), &["index"]),
+        tool("canvas_add_slide", "Add slide", "Add an empty slide after the current one and switch to it.", json!({}), &[]),
+        tool("canvas_set_page", "Set page size or background", "Change the page size or background.", json!({"width": num_prop("Page width in `unit`."), "height": num_prop("Page height in `unit`."), "unit": str_prop("inch, cm or px (default: the document's)."), "background": color_prop("Page color of the current slide")}), &[]),
+        tool("canvas_undo", "Undo", "Undo the last edit.", json!({}), &[]),
+        tool("canvas_redo", "Redo", "Redo.", json!({}), &[]),
+        tool("canvas_save", "Save project", "Save the document as a project in the editor.", json!({}), &[]),
     ]
+    .into_iter()
+    .map(annotate)
+    .collect()
+}
+
+/// The hints clients show for an editor tool: a few only read, the rest edit the open document
+/// locally (undoable with canvas_undo), and only deleting items is flagged destructive.
+fn annotate(t: Value) -> Value {
+    const READ_ONLY: &[&str] = &["list_templates", "template_image", "canvas_state", "canvas_render", "canvas_slides"];
+    let name = t["name"].as_str().unwrap_or_default().to_string();
+    if READ_ONLY.contains(&name.as_str()) {
+        return read_only(t);
+    }
+    let mut t = t;
+    t["annotations"] = json!({"title": t["title"], "readOnlyHint": false, "destructiveHint": name == "canvas_delete_items", "openWorldHint": false});
+    t
 }
 
 /// The catalog's tools plus the editor's. The editor's template tools replace the catalog's
