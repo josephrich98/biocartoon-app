@@ -6162,9 +6162,9 @@ impl BioCartoon {
                                             });
                                         }
                                     });
-                                    if dark != showing_dark {
+                                    if dark != showing_dark && d.theme == theme::ThemeMode::System {
                                         let mode = if dark { "dark" } else { "light" };
-                                        let hint = if d.theme == theme::ThemeMode::System { format!("Shown when the system is {mode}") } else { format!("Picking one switches to {mode}") };
+                                        let hint = format!("Shown when the system is {mode}");
                                         ui.label(egui::RichText::new(hint).small().color(theme::text_dim()));
                                     }
                                 });

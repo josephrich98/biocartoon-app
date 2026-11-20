@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="70 112 600 600" fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" role="img" aria-labelledby="title">
+  <title id="title">BioCartoon — the cell palette, single-colour line art</title>
+  <!-- One-colour version of the BioCartoon logo (biocartoon-app/app/assets/logo.svg) for toolbars and small sizes:
+       black on transparent with uniform strokes, so it can be used as a template image tinted by the host. -->
+
+  <!-- Palette with its thumb hole -->
+  <path stroke-width="26" d="M540 400C540 379 592 367 615 338C673 266 620 209 531 170C415 115 236 136 145 214C100 263 82 441 114 544C151 644 306 705 437 665C540 637 613 594 610 531C608 481 568 455 547 426C541 417 540 408 540 400ZM525 438C508 427 487 438 477 459C466 482 469 505 485 514C501 523 521 511 531 489C541 466 540 448 525 438Z"/>
+
+  <!-- Neutrophil: cell with three nuclear lobes -->
+  <circle cx="213" cy="272" r="54" stroke-width="15"/>
+  <g fill="#000" stroke="none"><circle cx="193" cy="256" r="15"/><circle cx="232" cy="268" r="14"/><circle cx="212" cy="297" r="14"/></g>
+  <path stroke-width="9" d="M193 256L232 268L212 297"/>
+
+  <!-- Striated muscle fiber -->
+  <g transform="rotate(-9 367 211)">
+    <rect x="284" y="187" width="174" height="48" rx="24" stroke-width="15"/>
+    <path stroke-width="8" d="M318 199V223M342 199V223M366 199V223M390 199V223M414 199V223"/>
+  </g>
+
+  <!-- Neuron -->
+  <g transform="translate(-154 77)">
+    <path stroke-width="13" d="M484 278L469 259L461 235M471 260L447 253M500 274L507 250L523 236M518 288L544 277L559 257M543 278L568 284M519 310L543 323L559 343M488 317L472 336L449 342M477 294L453 290L439 276M502 321C500 345 512 350 508 370C505 388 488 389 488 405M489 400L478 409M489 400L498 409"/>
+    <circle cx="498" cy="298" r="27" fill="#000" stroke="none"/>
+  </g>
+
+  <!-- Adipocyte: lipid droplet with the nucleus at the rim -->
+  <circle cx="170" cy="424" r="56" stroke-width="15"/>
+  <circle cx="164" cy="420" r="34" stroke-width="8"/>
+  <path fill="#000" stroke="none" d="M205 449C208 440 214 434 222 431C222 446 216 459 205 467C201 462 202 456 205 449Z"/>
+
+  <!-- Osteocyte: stellate bone cell -->
+  <g transform="translate(126 -117)">
+    <path stroke-width="13" d="M360 348L368 379Q373 387 382 380L407 359L394 389Q391 397 402 398L437 392L410 410Q403 415 410 423L435 445L403 435Q394 432 392 442L393 475L375 450Q370 443 362 451L341 473L348 441Q350 433 339 432L307 440L331 419Q338 413 329 405L303 386L338 394Q347 396 348 385Z"/>
+    <ellipse cx="372" cy="416" rx="13" ry="15" transform="rotate(-17 372 416)" fill="#000" stroke="none"/>
+  </g>
+
+  <!-- Hepatocyte: hexagonal liver cell -->
+  <path stroke-width="15" d="M249 502Q255 499 261 503L303 528Q309 531 309 538L308 583Q308 590 302 594L261 618Q255 622 249 618L209 594Q203 590 203 583L204 538Q204 532 210 528Z"/>
+  <circle cx="256" cy="560" r="20" fill="#000" stroke="none"/>
+
+  <!-- Red blood cells: biconcave discs -->
+  <g stroke-width="13">
+    <g transform="translate(391 560) rotate(-23)"><ellipse rx="33" ry="25"/><ellipse rx="13" ry="7" stroke-width="7"/></g>
+    <g transform="translate(442 604) rotate(-35)"><ellipse rx="30" ry="23"/><ellipse rx="12" ry="6" stroke-width="7"/></g>
+    <g transform="translate(362 620) rotate(21)"><ellipse rx="24" ry="16"/></g>
+  </g>
+</svg>

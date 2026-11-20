@@ -50,14 +50,14 @@
     </header>
 
     <h1>Privacy</h1>
-    <p class="updated">Last updated November 6, 2026</p>
+    <p class="updated">Last updated November 18, 2026</p>
 
     <div class="summary">
-      <p><strong>In short:</strong> you can use BioCartoon without an account, and then your projects never leave your device unless you share one. If you share a project with a link, we keep an encrypted copy that we can't read, because the key is only in the link. If you choose to sign in, we keep your name, email address and an online copy of your projects and Your library so they can't be lost, and nothing more. There are no ads and no tracking, and we never sell or share your data. We count visits to the website and web app with GoatCounter, which sets no cookies and keeps no personal data. You can delete your account and everything in it at any time.</p>
+      <p>You can use BioCartoon without an account. Projects created locally in the editor stay on your device unless you choose an online feature, such as sharing, signing in or contributing artwork. ChatGPT and other MCP clients send tool inputs to our hosted server, including searches and figure instructions. Contributions and encrypted editor links are stored online as described below. We do not sell your data. Cloudflare hosts our services, and GoatCounter counts website and web-app visits without cookies. You can delete your account and request help with other data using the contact details below.</p>
     </div>
 
     <h2>Without an account</h2>
-    <p>The web app at <a href="https://app.biocartoon.com">app.biocartoon.com</a> keeps your projects, Your library (your own icons, saved templates and favorites), uploads and settings (including any words you add to the spelling dictionary) in your browser's own storage, and the desktop app keeps them in files on your computer. They are not sent to us unless you share a project (see <a href="#share-links">Share links</a>). Because the browser holds the only copy, clearing your browser's site data deletes them; the app reminds you to download a backup.</p>
+    <p>The web app at <a href="https://app.biocartoon.com">app.biocartoon.com</a> keeps your projects, Your library (your own icons, saved templates and favorites), uploads and settings (including any words you add to the spelling dictionary) in your browser's own storage, and the desktop app keeps them in files on your computer. These locally created projects are not sent to us unless you choose an online feature, such as sharing, account storage or a contribution (see below). MCP tools have a separate server data flow described in the next section. Because the browser holds the only copy, clearing your browser's site data deletes them; the app reminds you to download a backup.</p>
     <p>Using the app still involves our servers in a few ways:</p>
     <ul>
       <li><strong>Loading the icon library.</strong> Icons and the catalog are downloaded from assets.biocartoon.com. Like any website, our host sees your IP address when it serves them.</li>
@@ -65,8 +65,15 @@
       <li><strong>Contributions.</strong> If you submit an icon or template to the shared library, we keep what you submitted, the name you chose to be credited under, the contact email you gave if any (seen only by our reviewers, never published), and a salted hash of your IP address for rate limiting. Approved contributions are published openly under the license you picked.</li>
       <li><strong>Suggestions and removal requests.</strong> If you suggest an icon or template, or ask for an icon to be taken out of the library, we keep what you wrote, the name and contact email you gave if any (seen only by our reviewers), and a salted hash of your IP address for rate limiting.</li>
       <li><strong>Visit counts.</strong> The website and the web app count page visits with GoatCounter. It sets no cookies and doesn't follow you to other sites. It records the page, the site you came from, your browser, screen size and country, and tells repeat visits apart with a short-lived hash of your IP address and browser, never the address itself. The desktop app doesn't count visits.</li>
-      <li><strong>AI features.</strong> If you add an API key for an AI provider, the key stays on your device, and your prompts go to that provider under its own terms. They don't pass through us.</li>
+      <li><strong>Editor AI features using your own key.</strong> If you add an API key in the editor, the key stays on your device, and your prompts go to that provider under its own terms. Hosted MCP figure tools process their inputs on our server as described below.</li>
     </ul>
+
+    <h2 id="mcp">ChatGPT and other MCP clients</h2>
+    <p>When you use BioCartoon through ChatGPT or another MCP client, the client sends inputs needed for the requested tool call to our Cloudflare-hosted MCP server. These can include search words, collection or tag filters, illustration or template IDs, read-only catalog queries, figure prompts, labels, connections and layout specifications. The client controls what it sends; BioCartoon tools do not request your entire conversation. The host applies its own terms and privacy policy.</p>
+    <p>Public catalog responses can be cached for up to five minutes. A cached response can include search words and public illustration metadata. The application does not intentionally log tool arguments and does not put contributions, contact details, submission-status requests or figure tool results in that catalog cache. Cloudflare also processes request and security information to operate and protect the service; this policy does not promise that all provider logs are disabled or that queries are never retained.</p>
+    <p>Figure tools process the supplied prompt or structured figure on the server, select catalog artwork, and return a composed layout or SVG. If a Workers AI binding is configured, a plain-language figure prompt can also be sent to Cloudflare Workers AI for layout planning. Structured figure inputs do not use that planning step. This differs from the editor's direct-to-provider AI features.</p>
+    <p>Choosing to open an illustration or template in the editor, or composing a figure with the default editor-link option, creates an encrypted online project. For these MCP-created links, the MCP server sees the unencrypted project while building it and encrypts it before storage. Its encryption key is returned in the link fragment; anyone with that complete link can open a copy. The stored share includes encrypted project bytes, sizes, dates, secret fingerprints and an abuse-prevention identifier. Links expire after 90 days without use. Creating an editor link does not submit artwork to the public library.</p>
+    <p>If you ask to contribute artwork and confirm submission, the client sends the image or a public HTTPS URL from which it can be fetched, plus its title, description, tags, category, credit name, license and AI-use disclosure. An optional email is for reviewers and is not public attribution. Contributions enter human review; approved artwork and public metadata are published under the selected license. Abuse prevention uses a salted request-IP hash or a shared MCP service identifier, depending on the request path. BioCartoon sign-in is not required for these public catalog and contribution tools.</p>
 
     <h2>With an account</h2>
     <p>Accounts are optional and exist only to keep an online copy of your projects and Your library. You sign in with Google or GitHub, so we never see or store a password. When you sign in we store:</p>
@@ -90,12 +97,14 @@
     </ul>
     <p>Anyone who has the link can open the project, and anyone with the edit link can change it, so send links only to people you trust. Opening a link puts a copy of the project in that person's BioCartoon, which stays with them even if you stop sharing.</p>
 
+    <p>The statement above about the key staying on your device describes links created in the editor. For MCP-created editor links, the server builds and encrypts the project first, as explained in <a href="#mcp">ChatGPT and other MCP clients</a>.</p>
+
     <h2>Cookies</h2>
     <p>BioCartoon sets one cookie, only while you sign in: a short-lived one on api.biocartoon.com that proves the sign-in was started from BioCartoon. It expires after 10 minutes. The app stays signed in with a token in your browser's storage, not with a cookie.</p>
 
     <h2>Who handles your data</h2>
     <ul>
-      <li><strong>Cloudflare</strong> hosts the website, the app and our server, and stores account data, online projects, online libraries and encrypted share links (<a href="https://www.cloudflare.com/privacypolicy/">Cloudflare's privacy policy</a>).</li>
+      <li><strong>Cloudflare</strong> hosts the website, app and MCP server, processes tool requests, and stores catalog data, contributions, account data, online projects, online libraries and encrypted share links (<a href="https://www.cloudflare.com/privacypolicy/">Cloudflare's privacy policy</a>).</li>
       <li><strong>GoatCounter</strong> counts visits to the website and web app (<a href="https://www.goatcounter.com/help/privacy">GoatCounter's privacy policy</a>).</li>
       <li><strong>Google</strong> or <strong>GitHub</strong> confirms who you are when you sign in with them (<a href="https://policies.google.com/privacy">Google</a>, <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub</a>). We ask only for your basic profile and email address.</li>
     </ul>
@@ -106,8 +115,10 @@
       <li>A sign-in ends after 180 days without use. Your projects and library stay online, and signing in again brings them back.</li>
       <li>Deleting a project, or removing something from Your library, in the app while signed in also deletes its online copy.</li>
       <li>A share link is deleted, with every version of it, when you choose "Stop sharing", or once nobody has opened, checked or saved to it for 90 days.</li>
-      <li>Deleting your account removes your projects, library, name, email, sign-ins and the share links you made while signed in right away. Copies may remain in our hosting provider's automatic database backups for up to 30 days before they are overwritten.</li>
+      <li>Deleting your account removes your projects, library, name, email, sign-ins and the share links you made while signed in right away. Copies of database records may remain in Cloudflare D1's recovery history. The current submissions database has a seven-day recovery window; deleting a live record does not immediately erase that history. We also make a private daily backup of that database (account details and email, sign-in records, contribution and suggestion records with any contact email, share link records, and the names and sizes of online projects and library items, but not the files themselves), and each backup is deleted after 30 days, so a deleted record can remain in backups for up to 30 days.</li>
     </ul>
+
+    <p>Pending contributions remain until reviewed or manually removed. Rejected contribution files are eligible for the daily cleanup after 30 days from rejection; this cleanup removes the files, not the submission record. Submission metadata, credit names, optional reviewer emails and abuse-prevention identifiers have no automatic expiry in the current service. Approved public artwork and attribution remain published until removed. Contact us with the submission ID to request access, correction or deletion of a contribution or its private contact details. Removing our copy cannot recall copies others have already downloaded under an open license.</p>
 
     <h2>Your choices</h2>
     <ul>
@@ -127,7 +138,7 @@
     <h2>Contact</h2>
     <p>Joseph Rich, who runs BioCartoon. Open an issue on <a href="https://github.com/josephrich98/biocartoon-app/issues">GitHub</a>, or email <a href="mailto:josephrich98@gmail.com">josephrich98@gmail.com</a>.</p>
 
-    <footer>© 2026 <a href="https://joseph-rich.com">Joseph Rich</a> · <a href="/">Home</a></footer>
+    <footer>© 2026 <a href="https://joseph-rich.com">Joseph Rich</a> · <a href="/">Home</a> · <a href="/terms">Terms</a></footer>
   </div>
 </body>
 </html>

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<!-- biocartoon.com/privacy. Same look as index.html. Keep it in step with what the app and the
+     Worker actually store: app/src/account.rs, app/src/stars.rs, app/src/submit.rs, and the
+     biocartoon repo's worker/src/ (accounts.ts, stars.ts, submit.ts, migrations/). -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Service terms · BioCartoon</title>
+  <meta name="description" content="Terms for BioCartoon and its hosted MCP tools." />
+  <link rel="icon" href="logo.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <meta property="og:image" content="https://biocartoon.com/logo.png" />
+  <meta property="og:image:width" content="1024" />
+  <meta property="og:image:height" content="1024" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:image" content="https://biocartoon.com/logo.png" />
+  <style>
+    :root { --bg: #f6f7f9; --panel: #ffffff; --border: #dfe2e7; --text: #1c1d21; --dim: #5d6370; --accent: #2f80ed; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #1b1b1b; --panel: #252527; --border: #3a3a3e; --text: #e8e8ea; --dim: #a0a0a8; } }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body {
+      background: var(--bg); color: var(--text);
+      font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 0 16px; }
+    header { display: flex; align-items: center; gap: 10px; padding: 16px 0; }
+    header img { width: 32px; height: 32px; display: block; }
+    header .name { font-weight: 650; font-size: 17px; color: var(--text); }
+    header .name:hover { text-decoration: none; }
+    h1 { font-size: clamp(30px, 6vw, 40px); line-height: 1.15; letter-spacing: -0.02em; margin: 28px 0 6px; }
+    .updated { color: var(--dim); margin: 0 0 24px; }
+    .summary { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 4px 20px; margin-bottom: 8px; }
+    h2 { font-size: 21px; letter-spacing: -0.01em; margin: 36px 0 10px; }
+    ul { padding-left: 22px; }
+    li { margin: 4px 0; }
+    footer { color: var(--dim); font-size: 14px; padding: 28px 0 40px; margin-top: 40px; border-top: 1px solid var(--border); }
+  </style>
+  <!-- Visit counts (GoatCounter: no cookies, no personal data); see privacy.html. -->
+  <script data-goatcounter="https://biocartoon.goatcounter.com/count" async src="https://gc.zgo.at/count.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a href="/"><img src="logo.svg" alt="BioCartoon logo" /></a>
+      <a class="name" href="/">BioCartoon</a>
+    </header>
+
+<h1>Service terms</h1>
+<p class="updated">Effective November 18, 2026</p>
+<h2>Operator and service</h2>
+<p>BioCartoon is operated by Joseph Rich. The plugin helps users search a public library of scientific illustrations, inspect previews and attribution, obtain available download links, discover shared slide templates, compose figures from catalog artwork, create encrypted editor links, export SVGs, and prepare artwork contributions for human review. BioCartoon is free to use. Some host features, such as image generation, may have separate availability or account requirements set by that host.</p>
+<p>For help, use <a href="https://github.com/josephrich98/biocartoon-app/issues">https://github.com/josephrich98/biocartoon-app/issues</a>. For private requests, rights complaints or requests to correct or remove a contribution, email <a href="mailto:josephrich98@gmail.com">josephrich98@gmail.com</a> and include the relevant asset or submission ID. Do not put private information in a public issue.</p>
+<h2>Illustration licenses</h2>
+<p>Each illustration and template keeps its own stated license. Check the individual record and original source before using an item, and satisfy any attribution, ShareAlike or other conditions that apply. BioCartoon&#x27;s software license does not replace these individual asset licenses. A search result is not a claim that every catalog item is CC0 or public domain.</p>
+<p>Review artwork for scientific accuracy and suitability before using it in a publication, presentation, teaching resource or other work. Generated or adapted artwork also needs this review.</p>
+<h2>Contributions</h2>
+<p>Submit artwork only when you may share it under the selected license. Provide accurate attribution and disclose whether generative AI was used. The supported contribution licenses are CC0-1.0 and CC-BY-4.0; generative-AI contributions are accepted only under CC0-1.0. An adaptation must also satisfy the original work&#x27;s license and the contribution flow&#x27;s compatibility checks.</p>
+<p>Before a contribution is sent, review the artwork, metadata and license and explicitly approve the submission. Uploads enter a human review queue. A submission ID acknowledges receipt; it does not guarantee approval, publication or designation as official BioCartoon artwork. If accepted and published, the artwork is shared under its selected license and public attribution.</p>
+<p>Do not include confidential information or personal data in artwork or public metadata. Any optional contributor email is intended for the reviewers and is handled as described in the privacy policy.</p>
+<h2>Hosted limits and permitted use</h2>
+<p>The hosted plugin currently accepts PNG or SVG submissions up to 2 MB. Other formats or resizing require preparation outside the hosted endpoint, such as through the local BioCartoon CLI. The hosted service applies request and contribution limits; an error or quota response is not confirmation of a successful submission.</p>
+<p>Do not use the service to submit material you lack permission to share, insert executable or malicious content, bypass moderation or access controls, or disrupt other users&#x27; access. The public plugin does not provide tools to approve its own contributions, bypass another provider&#x27;s licenses, or delete a user&#x27;s cloud projects.</p>
+<h2>Privacy and third-party services</h2>
+<p>The BioCartoon privacy policy is available at <a href="https://www.biocartoon.com/privacy">https://www.biocartoon.com/privacy</a> including the hosted MCP data flow and contribution retention. Editor links can be opened by anyone who has the complete link; share them accordingly. Accounts are not intended for children under 13, as described in that policy. ChatGPT and any other host, AI provider or linked third-party service applies its own terms and policies.</p>
+<h2>Service availability and updates</h2>
+<p>The service and its catalog may change, and free-service quotas can make a feature temporarily unavailable. Check the result of a tool call before relying on it. Updated terms will be posted here with an effective date. Questions about these terms can be sent to Joseph Rich at <a href="mailto:josephrich98@gmail.com">josephrich98@gmail.com</a>.</p>
+<footer>© 2026 Joseph Rich · <a href="/">Home</a> · <a href="/privacy">Privacy</a></footer>
+</div></body></html>

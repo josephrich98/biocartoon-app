@@ -470,6 +470,7 @@ pub fn source_badge(source: &str) -> (&'static str, Color32, &'static str) {
         "healthicons" => Color32::from_rgb(0x16, 0xa0, 0x85),
         "reactome" => Color32::from_rgb(0xc0, 0x39, 0x2b),
         "openmoji" => Color32::from_rgb(0xf1, 0xc4, 0x0f),
+        "noto" => Color32::from_rgb(0xe9, 0x1e, 0x63),
         "user" => Color32::from_rgb(0x9e, 0x9e, 0x9e),
         _ => Color32::GRAY,
     };

@@ -3709,12 +3709,16 @@ fn search_help(ui: &mut egui::Ui) {
 }
 
 /// Whether a record passes the search box's `q` (as typed): a plain query as a part of its
-/// `text` or `tags`, an advanced one (see [`syntax`]) term by term, `field` matching a field term.
+/// `text` or `tags` (or a bare asset id as `id:`), an advanced one (see [`syntax`]) term by term,
+/// `field` matching a field term.
 fn query_match(q: &str, text: &[&str], tags: &[String], field: impl Fn(Field, &str) -> bool) -> bool {
     match syntax::parse(q) {
         None => {
-            let q = q.to_lowercase();
-            q.is_empty() || text.iter().any(|t| t.to_lowercase().contains(&q)) || tags.iter().any(|t| t.to_lowercase().contains(&q))
+            let q = q.trim().to_lowercase();
+            q.is_empty()
+                || text.iter().any(|t| t.to_lowercase().contains(&q))
+                || tags.iter().any(|t| t.to_lowercase().contains(&q))
+                || (syntax::looks_like_id(&q) && field(Field::Id, &q))
         }
         Some(e) => {
             let all = text.iter().copied().chain(tags.iter().map(String::as_str)).collect::<Vec<_>>().join(" ");
