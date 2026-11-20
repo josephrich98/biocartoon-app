@@ -442,7 +442,28 @@ pub fn encode_png(mut img: image::RgbaImage) -> Result<(Vec<u8>, u32, u32), Stri
 }
 
 /// Runs on a worker thread: writes the local copy, then submits it if asked to.
-pub fn save(job: SaveJob) -> SaveResult {
+/// Save the template here, then (with `submit`) send it for review in the background; `done`
+/// gets the outcome once both are over.
+pub fn save(job: SaveJob, done: impl FnOnce(SaveResult) + Send + 'static) {
+    match save_local(job) {
+        Err(e) => done(Err(e)),
+        Ok((row, None)) => done(Ok((row, None))),
+        Ok((mut row, Some((url, smeta, file, thumb_png)))) => submit_template(&url, &smeta, file, thumb_png, move |submitted| {
+            let submitted = submitted.map(|id| {
+                row.json_key = format!("templates/{id}/template.json");
+                row.meta.thumb_key = format!("templates/{id}/thumb.png");
+                row.meta.id = id;
+            });
+            done(Ok((row, Some(submitted))))
+        }),
+    }
+}
+
+/// What is left to send once a template is saved here: the Worker URL, the public metadata, the
+/// template and its thumbnail (PNG).
+type ToSubmit = (String, SubmitMeta, TemplateFile, Vec<u8>);
+
+fn save_local(job: SaveJob) -> Result<(TemplateRow, Option<ToSubmit>), String> {
     let SaveJob { meta, file, dir, thumb, submit } = job;
     validate(&file)?;
     let thumb = thumb.map_err(|e| format!("thumbnail: {e}"))?;
@@ -452,23 +473,46 @@ pub fn save(job: SaveJob) -> SaveResult {
     let local_json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
     let json_path = dir.join("template.json");
     crate::storage::write(&json_path, &local_json).map_err(|e| e.to_string())?;
-    let mut row = TemplateRow {
+    let row = TemplateRow {
         meta: meta.clone(),
         json_key: format!("templates/{}/template.json", meta.id),
         json_local: Some(json_path.display().to_string()),
         thumb_local: Some(thumb_path.display().to_string()),
     };
-    let Some((url, smeta)) = submit else { return Ok((row, None)) };
-    let submitted = submit_template(&url, &smeta, file, thumb_png).map(|id| {
-        row.json_key = format!("templates/{id}/template.json");
-        row.meta.thumb_key = format!("templates/{id}/thumb.png");
-        row.meta.id = id;
-    });
-    Ok((row, Some(submitted)))
+    Ok((row, submit.map(|(url, smeta)| (url, smeta, file, thumb_png))))
+}
+
+/// Send a template for review; `done` gets its submission id.
+fn submit_template(url: &str, meta: &SubmitMeta, file: TemplateFile, thumb_png: Vec<u8>, done: impl FnOnce(Result<String, String>) + Send + 'static) {
+    match template_parts(meta, file, thumb_png) {
+        Ok((parts, names)) => {
+            // The images' part names are owned here; the form borrows them.
+            let parts: Vec<Part> = parts.into_iter().map(|p| p.form(&names)).collect();
+            submit::submit(url, &parts, done)
+        }
+        Err(e) => done(Err(e)),
+    }
+}
+
+/// A part of a template's form, before its name is borrowed: a fixed name, or the n-th image's.
+enum TemplatePart {
+    Text(&'static str, String),
+    File(&'static str, Vec<u8>, &'static str),
+    Image(usize, Vec<u8>),
+}
+
+impl TemplatePart {
+    fn form<'a>(self, names: &'a [String]) -> Part<'a> {
+        match self {
+            TemplatePart::Text(n, t) => Part::Text(n, t),
+            TemplatePart::File(n, b, mime) => Part::File(n, b, mime),
+            TemplatePart::Image(i, b) => Part::File(&names[i], b, "image/png"),
+        }
+    }
 }
 
 /// Local images go along as `img-<n>.png`; the Worker re-keys them under `templates/<id>/`.
-fn submit_template(url: &str, meta: &SubmitMeta, mut file: TemplateFile, thumb_png: Vec<u8>) -> Result<String, String> {
+fn template_parts(meta: &SubmitMeta, mut file: TemplateFile, thumb_png: Vec<u8>) -> Result<(Vec<TemplatePart>, Vec<String>), String> {
     let mut images: Vec<(String, Vec<u8>)> = Vec::new();
     for it in &mut file.slide.items {
         if let ItemKind::Image { source, .. } = &mut it.kind {
@@ -486,15 +530,17 @@ fn submit_template(url: &str, meta: &SubmitMeta, mut file: TemplateFile, thumb_p
         return Err(format!("Template is too large ({} KB)", json.len() / 1024));
     }
     let mut parts = vec![
-        Part::Text("kind", "template".into()),
-        Part::Text("meta", serde_json::to_string(meta).map_err(|e| e.to_string())?),
-        Part::File("template", json, "application/json"),
-        Part::File("thumb", thumb_png, "image/png"),
+        TemplatePart::Text("kind", "template".into()),
+        TemplatePart::Text("meta", serde_json::to_string(meta).map_err(|e| e.to_string())?),
+        TemplatePart::File("template", json, "application/json"),
+        TemplatePart::File("thumb", thumb_png, "image/png"),
     ];
-    for (name, png) in &images {
-        parts.push(Part::File(name, png.clone(), "image/png"));
+    let mut names = Vec::new();
+    for (name, png) in images {
+        parts.push(TemplatePart::Image(names.len(), png));
+        names.push(name);
     }
-    let total: usize = parts.iter().map(|p| match p { Part::Text(_, t) => t.len(), Part::File(_, b, _) => b.len() }).sum();
+    let total: usize = parts.iter().map(|p| match p { TemplatePart::Text(_, t) => t.len(), TemplatePart::File(_, b, _) | TemplatePart::Image(_, b) => b.len() }).sum();
     if total > submit::MAX_REQUEST_BYTES {
         return Err(format!(
             "it is {} with its images; templates can be up to {}. Use smaller images on the slide",
@@ -502,7 +548,7 @@ fn submit_template(url: &str, meta: &SubmitMeta, mut file: TemplateFile, thumb_p
             crate::offline::human_bytes(submit::MAX_REQUEST_BYTES as u64)
         ));
     }
-    submit::submit(url, &parts)
+    Ok((parts, names))
 }
 
 /// Fetch and parse a template (from its local copy when there is one).
@@ -540,6 +586,13 @@ pub fn parse(bytes: &[u8]) -> Result<TemplateFile, String> {
 mod tests {
     use super::*;
 
+    /// [`save`], waiting for its outcome.
+    fn save_now(job: SaveJob) -> SaveResult {
+        let (tx, rx) = std::sync::mpsc::channel();
+        save(job, move |r| tx.send(r).unwrap());
+        rx.recv().unwrap()
+    }
+
     #[test]
     fn local_save_round_trips() {
         use crate::doc::{Item, ShapeKind};
@@ -550,7 +603,7 @@ mod tests {
         let slide = Slide { name: "T".into(), items: vec![Item::new(1, "s", kind, egui::Pos2::ZERO, egui::Vec2::splat(10.0))], comments: Vec::new(), background: None };
         let file = TemplateFile { meta: meta.clone(), width: 100.0, height: 50.0, background: [255; 4], slide };
         let job = SaveJob { meta, file, dir: dir.clone(), thumb: Ok(image::RgbaImage::new(4, 2)), submit: None };
-        let (row, submitted) = save(job).unwrap();
+        let (row, submitted) = save_now(job).unwrap();
         assert!(submitted.is_none());
         assert!(Path::new(row.thumb_local.as_deref().unwrap()).exists());
         let back = load(&row, "", None).unwrap();
@@ -577,7 +630,7 @@ mod tests {
         let tmeta = TemplateMeta { id: "local-id".into(), title: meta.title.clone(), thumb_key: "templates/local-id/thumb.png".into(), ..Default::default() };
         let file = TemplateFile { meta: tmeta.clone(), width: 960.0, height: 672.0, background: [255; 4], slide };
         let job = SaveJob { meta: tmeta, file, dir: dir.join("t"), thumb: Ok(image::RgbaImage::new(48, 32)), submit: Some((url.clone(), meta.clone())) };
-        let (row, submitted) = save(job).unwrap();
+        let (row, submitted) = save_now(job).unwrap();
         submitted.unwrap().unwrap();
         assert!(row.meta.id.starts_with("rust-test-template-"), "{}", row.meta.id);
         assert_eq!(row.json_key, format!("templates/{}/template.json", row.meta.id));
@@ -585,7 +638,9 @@ mod tests {
         let png = std::fs::read(&pic).unwrap();
         let asset = |title: &str| {
             let m = serde_json::to_string(&SubmitMeta { title: title.into(), ..meta.clone() }).unwrap();
-            submit::submit(&url, &[Part::Text("kind", "asset".into()), Part::Text("meta", m), Part::File("image", png.clone(), "image/png")])
+            let (tx, rx) = std::sync::mpsc::channel();
+            submit::submit(&url, &[Part::Text("kind", "asset".into()), Part::Text("meta", m), Part::File("image", png.clone(), "image/png")], move |r| tx.send(r).unwrap());
+            rx.recv().unwrap()
         };
         assert!(asset("Rust test cell").unwrap().starts_with("rust-test-cell-"));
         assert!(asset("shit cell").unwrap_err().contains("language"));

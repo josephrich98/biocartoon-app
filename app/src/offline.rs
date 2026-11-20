@@ -7,7 +7,7 @@
 //! next to it. Templates go there too: their JSON, thumbnail and every image they use.
 //!
 //! An icon is downloaded once all its files are there, a template once it and its images are;
-//! that is what Settings > Offline counts and the Downloads filter lists.
+//! that is what Settings > Bulk download counts and the Downloads filter lists.
 //!
 //! Web: the browser can't keep a folder, so the same pack is downloaded as a .zip with the
 //! same layout under `biocartoon-offline/`. The zip is assembled in a Blob a few files at a
@@ -27,7 +27,7 @@ const ZIP_ROOT: &str = "biocartoon-offline";
 /// Attempts per image before it counts as failed (connections drop on long downloads).
 const TRIES: u32 = 4;
 
-/// The Templates row of Settings > Offline, which is not a collection of the catalog.
+/// The Templates row of Settings > Bulk download, which is not a collection of the catalog.
 pub const TEMPLATES: &str = "templates";
 
 /// One collection of the catalog (or [`TEMPLATES`]), and how much of it is downloaded.
@@ -219,11 +219,14 @@ fn items(conn: &Connection, sources: &[String]) -> Result<Vec<Item>, String> {
 /// The images a template's slide draws from the bucket: each one's PNG key, and SVG key when it has one.
 fn template_images(t: &crate::templates::TemplateFile) -> Vec<(String, Option<String>)> {
     use crate::doc::{ImageSource, ItemKind};
+    // The user's own library uploads (`user/…`, with an SVG by path on this device) are already
+    // here and were never in the bucket, so there is nothing to download for them.
+    let in_bucket = |k: &String| !k.is_empty() && !k.starts_with("user/") && !crate::assets::is_local_path(k);
     t.slide
         .items
         .iter()
         .filter_map(|it| match &it.kind {
-            ItemKind::Image { source: ImageSource::Asset { key, svg, .. }, .. } if !key.is_empty() => Some((key.clone(), svg.clone().filter(|s| !s.is_empty()))),
+            ItemKind::Image { source: ImageSource::Asset { key, svg, .. }, .. } if in_bucket(key) => Some((key.clone(), svg.clone().filter(in_bucket))),
             _ => None,
         })
         .collect()
@@ -347,15 +350,17 @@ fn scope_label(sources: &[String], all: &[Collection]) -> String {
     names.join(", ")
 }
 
-/// The pack's README. `included` lists each collection with the images actually in the pack.
-fn readme(included: &[Collection], version: &str, base_url: &str, zip: bool) -> String {
+/// The pack's README. `included` lists each collection with the images actually in the pack (and
+/// the [`TEMPLATES`] row), `templates` the title and credit of each template in it, and `catalog`
+/// whether it holds a copy of the icon catalog.
+fn readme(included: &[Collection], templates: &[(String, String)], version: &str, base_url: &str, zip: bool, catalog: bool) -> String {
     let mut s = String::new();
     s.push_str("# BioCartoon offline pack\n\n");
     s.push_str(&format!(
         "Made {} from {base_url} (catalog version {version}).\n\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M")
     ));
-    s.push_str("## Contents\n\n| Collection | Icons | Size | Licenses |\n|---|---|---|---|\n");
+    s.push_str("## Contents\n\n| Collection | Items | Size | Licenses |\n|---|---|---|---|\n");
     let (mut n, mut b) = (0, 0);
     for c in included.iter().filter(|c| c.have > 0) {
         let partial = if c.have < c.count { format!(" (of {})", c.count) } else { String::new() };
@@ -364,31 +369,53 @@ fn readme(included: &[Collection], version: &str, base_url: &str, zip: bool) -> 
         b += c.have_bytes;
     }
     s.push_str(&format!("| **Total** | **{n}** | **{}** | |\n\n", human_bytes(b)));
+    s.push_str("## Layout\n\n- `README.md`: this file.\n");
+    if catalog {
+        s.push_str(
+            "- `assets.sqlite`: the icon catalog (SQLite), one row per image in the `assets` table, with its \
+             `title`, `tags`, `category`, `license`, `credit`, `source_url` and `png_key`. It lists every \
+             collection in the catalog, including any whose images are not in this pack.\n",
+        );
+    }
     s.push_str(
-        "## Layout\n\n\
-         - `README.md`: this file.\n\
-         - `assets.sqlite`: the icon catalog (SQLite), one row per image in the `assets` table, with its \
-         `title`, `tags`, `category`, `license`, `credit`, `source_url` and `png_key`. It lists every \
-         collection in the catalog, including any whose images are not in this pack.\n\
-         - `assets/<png_key>`: the PNG of each row, for example `assets/bioart/2_626557.png`, and \
-         `assets/<svg_key>` its SVG when it has one.\n\n\
-         ## Licenses and credit\n\n\
-         Every image keeps the license of the collection it came from (the `license` and `license_url` \
-         columns). Where `attribution_required` is 1, credit the author with the ready-made `credit` line \
-         when you publish a figure; where `share_alike` is 1, work that adapts the image must use the \
-         same license.\n\n\
-         ```sh\nsqlite3 assets.sqlite \"SELECT title, png_key, license, credit FROM assets WHERE title LIKE '%neuron%' LIMIT 20\"\n```\n\n\
-         ## Using it\n\n",
+        "- `assets/<png_key>`: the PNG of each icon, for example `assets/bioart/2_626557.png`, and \
+         `assets/<svg_key>` its SVG when it has one.\n",
     );
+    if !templates.is_empty() {
+        s.push_str(
+            "- `assets/templates/<id>/template.json`: each template's slide, with its thumbnail beside it. \
+             The images it uses are under `assets/` too, by the keys its JSON names.\n",
+        );
+    }
+    s.push_str("\n## Licenses and credit\n\n");
+    if catalog {
+        s.push_str(
+            "Every image keeps the license of the collection it came from (the `license` and `license_url` \
+             columns). Where `attribution_required` is 1, credit the author with the ready-made `credit` line \
+             when you publish a figure; where `share_alike` is 1, work that adapts the image must use the \
+             same license.\n\n\
+             ```sh\nsqlite3 assets.sqlite \"SELECT title, png_key, license, credit FROM assets WHERE title LIKE '%neuron%' LIMIT 20\"\n```\n\n",
+        );
+    } else {
+        s.push_str("Each image keeps the license of the collection it came from. In the BioCartoon app, Show credits gives the credit lines for a figure that uses them.\n\n");
+    }
+    if !templates.is_empty() {
+        s.push_str("Templates:\n\n");
+        for (title, credit) in templates {
+            s.push_str(&format!("- {title}: {credit}\n"));
+        }
+        s.push('\n');
+    }
+    s.push_str("## Using it\n\n");
     if zip {
         s.push_str(
             "This pack was downloaded from the BioCartoon web app. The desktop app can make the same pack \
-             and use it without internet (Settings > Offline): https://biocartoon.com/download\n",
+             and use it without internet (Settings > Bulk download): https://biocartoon.com/download\n",
         );
     } else {
         s.push_str(
             "The BioCartoon desktop app reads this folder automatically: images found here load without \
-             internet, and every image the app downloads is added here too. Manage it in Settings > Offline.\n",
+             internet, and every image the app downloads is added here too. Manage it in Settings > Bulk download.\n",
         );
     }
     s
@@ -575,7 +602,7 @@ fn write_extras(db: &Path, base_url: &str, offline_dir: &Path) -> Result<(), Str
         .map_err(|e| format!("copy catalog: {e}"))?;
     std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
     let cols = scan_now(db, Some(&offline_dir.join("assets")))?;
-    let text = readme(&cols, &catalog_version(db), base_url, false);
+    let text = readme(&cols, &[], &catalog_version(db), base_url, false, true);
     crate::storage::write(&offline_dir.join("README.md"), text.as_bytes()).map_err(|e| e.to_string())
 }
 
@@ -723,13 +750,33 @@ impl ZipWriter {
     }
 }
 
-/// Web: download `sources` (all when empty) as one .zip.
+/// Web: download `sources` (all when empty) as one .zip, with the templates when `sources` is
+/// empty or names [`TEMPLATES`].
 #[cfg(target_arch = "wasm32")]
-pub fn start(ctx: egui::Context, db: PathBuf, base_url: String, _offline_dir: PathBuf, sources: Vec<String>, all: &[Collection], _templates: Vec<TemplateRow>) -> Job {
+pub fn start(ctx: egui::Context, db: PathBuf, base_url: String, _offline_dir: PathBuf, sources: Vec<String>, all: &[Collection], templates: Vec<TemplateRow>) -> Job {
     let label = scope_label(&sources, all);
+    let templates = if sources.is_empty() || sources.iter().any(|s| s == TEMPLATES) { templates } else { Vec::new() };
+    let scope = if sources.len() == 1 { sources[0].clone() } else if sources.is_empty() { "all".into() } else { "collections".into() };
+    let file = format!("biocartoon-offline-{scope}-{}.zip", chrono::Local::now().format("%Y%m%d"));
+    let zip = web::Zip { icons: Some(sources), templates, cols: all.to_vec(), file, catalog: true };
+    web_job(ctx, &db, base_url, label, zip)
+}
+
+/// Web: download one template as a .zip: its slide (JSON), its thumbnail and the images it uses.
+#[cfg(target_arch = "wasm32")]
+pub fn start_template(ctx: egui::Context, db: PathBuf, base_url: String, row: TemplateRow) -> Job {
+    let label = row.meta.title.clone();
+    let slug = crate::app::BioCartoon::slugify(&row.meta.title);
+    let file = format!("biocartoon-template-{}.zip", if slug.is_empty() { row.meta.id.clone() } else { slug });
+    let zip = web::Zip { icons: None, templates: vec![row], cols: Vec::new(), file, catalog: false };
+    web_job(ctx, &db, base_url, label, zip)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_job(ctx: egui::Context, db: &Path, base_url: String, label: String, zip: web::Zip) -> Job {
     let progress = Arc::new(Progress::default());
     let (tx, rx) = channel();
-    if let Err(e) = web::start(ctx, &db, base_url, sources, all.to_vec(), progress.clone(), tx.clone()) {
+    if let Err(e) = web::start(ctx, db, base_url, zip, progress.clone(), tx.clone()) {
         let _ = tx.send(Err(e));
     }
     Job { label, progress, rx }
@@ -739,6 +786,7 @@ pub fn start(ctx: egui::Context, db: PathBuf, base_url: String, _offline_dir: Pa
 mod web {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::sync::mpsc::Sender;
     use std::sync::Mutex;
 
@@ -747,6 +795,19 @@ mod web {
     /// Bytes gathered in JS arrays before they are folded into the Blob (which the browser may
     /// keep on disk).
     const FLUSH_BYTES: usize = 32 << 20;
+
+    /// What goes in a zip.
+    pub struct Zip {
+        /// The collections whose icons it holds (all when empty); `None` for no icons.
+        pub icons: Option<Vec<String>>,
+        pub templates: Vec<TemplateRow>,
+        /// The catalog's collections, for the README.
+        pub cols: Vec<Collection>,
+        /// The zip's file name.
+        pub file: String,
+        /// With a copy of the icon catalog (assets.sqlite).
+        pub catalog: bool,
+    }
 
     /// The zip being assembled. JS values aren't `Send`, so they stay on the (only) thread here
     /// while the `Send` fetch callbacks hold the rest.
@@ -785,15 +846,29 @@ mod web {
         p.pending_bytes = 0;
     }
 
-    /// One file of the zip: an icon's PNG (`png`, which is what counts it), or its SVG.
+    /// What a file of the zip is.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        /// An icon's PNG (which is what counts it), or its SVG.
+        Png,
+        Svg,
+        /// A template's slide; its images are queued once it is in.
+        Json,
+        /// A template's thumbnail, or an image one of them uses.
+        TemplatePng,
+        TemplateSvg,
+    }
+
     struct File {
         source: String,
         key: String,
-        png: bool,
+        kind: Kind,
     }
 
     struct State {
         items: Vec<File>,
+        /// Every key queued, so an icon a template uses (or two templates share) goes in once.
+        keys: HashSet<String>,
         next: usize,
         in_flight: usize,
         /// Failed fetches waiting out their back-off, and those ready to try again.
@@ -804,6 +879,10 @@ mod web {
         base: String,
         db: PathBuf,
         cols: Vec<Collection>,
+        /// Title and credit of each template in the zip, for the README.
+        credits: Vec<(String, String)>,
+        templates: Vec<TemplateRow>,
+        catalog: bool,
         file: String,
         progress: Arc<Progress>,
         tx: Sender<Result<String, String>>,
@@ -812,48 +891,150 @@ mod web {
         finished: bool,
     }
 
-    pub fn start(ctx: egui::Context, db: &Path, base_url: String, sources: Vec<String>, all: Vec<Collection>, progress: Arc<Progress>, tx: Sender<Result<String, String>>) -> Result<(), String> {
+    impl State {
+        fn queue(&mut self, source: &str, key: String, kind: Kind) {
+            // A key on this device (an upload in a template of the user's own) isn't in the bucket.
+            // Nor is a key that would leave the zip's folder (`..`, an absolute path).
+            if key.is_empty() || crate::assets::is_local_path(&key) || cache_path(Path::new(""), &key).is_none() || !self.keys.insert(key.clone()) {
+                return;
+            }
+            self.items.push(File { source: source.to_string(), key, kind });
+            self.tries.push(0);
+            self.progress.total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Put a file in the zip and count it.
+        fn add(&mut self, source: &str, key: &str, kind: Kind, b: &[u8]) {
+            let header = match self.zip.entry(&format!("{ZIP_ROOT}/assets/{key}"), b) {
+                Ok(h) => h,
+                Err(e) => return self.error = Some(e),
+            };
+            push(&header);
+            push(b);
+            self.progress.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
+            let source = if matches!(kind, Kind::Png | Kind::Svg) { source } else { TEMPLATES };
+            if let Some(c) = self.cols.iter_mut().find(|c| c.source == source) {
+                c.have += usize::from(matches!(kind, Kind::Png | Kind::Json));
+                c.have_bytes += b.len() as u64;
+            }
+            if kind == Kind::Json {
+                self.template_in(key, b);
+            }
+        }
+
+        /// A template's slide is in: note its credit and queue the images it uses.
+        fn template_in(&mut self, key: &str, b: &[u8]) {
+            if let Some(row) = self.templates.iter().find(|r| r.json_key == key) {
+                let credit = (row.meta.title.clone(), crate::credits::template_row_credit(&row.meta));
+                self.credits.push(credit);
+            }
+            if let Ok(t) = crate::templates::parse(b) {
+                for (png, svg) in template_images(&t) {
+                    self.queue(TEMPLATES, png, Kind::TemplatePng);
+                    if let Some(svg) = svg {
+                        self.queue(TEMPLATES, svg, Kind::TemplateSvg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `b` is what a file of `kind` should hold.
+    fn valid(kind: Kind, b: &[u8]) -> bool {
+        match kind {
+            Kind::Png | Kind::TemplatePng => image::guess_format(b).is_ok(),
+            Kind::Svg | Kind::TemplateSvg => crate::assets::is_svg(b),
+            Kind::Json => crate::templates::parse(b).is_ok(),
+        }
+    }
+
+    pub fn start(ctx: egui::Context, db: &Path, base_url: String, z: Zip, progress: Arc<Progress>, tx: Sender<Result<String, String>>) -> Result<(), String> {
         if base_url.is_empty() {
             return Err("No asset URL configured.".into());
         }
         if PARTS.with(|p| p.borrow().is_some()) {
             return Err("A download is already running".into());
         }
-        let items: Vec<File> = items(&open_catalog(db)?, &sources)?
-            .into_iter()
-            .flat_map(|it| {
-                let svg = it.svg.map(|key| File { source: it.source.clone(), key, png: false });
-                std::iter::once(File { source: it.source, key: it.key, png: true }).chain(svg)
-            })
-            .collect();
-        progress.total.store(items.len(), Ordering::Relaxed);
-        let mut cols: Vec<Collection> = all.into_iter().filter(|c| sources.is_empty() || sources.contains(&c.source)).collect();
+        let icons = match &z.icons {
+            Some(sources) => items(&open_catalog(db)?, sources)?,
+            None => Vec::new(),
+        };
+        let mut cols: Vec<Collection> = match &z.icons {
+            Some(sources) => z.cols.into_iter().filter(|c| sources.is_empty() || sources.contains(&c.source)).collect(),
+            None => Vec::new(),
+        };
+        if !z.templates.is_empty() {
+            cols.push(Collection { source: TEMPLATES.into(), name: "Templates".into(), count: z.templates.len(), licenses: "each template's own (see below)".into(), ..Default::default() });
+        }
         for c in &mut cols {
             c.have = 0;
             c.have_bytes = 0;
         }
-        let scope = if sources.len() == 1 { sources[0].clone() } else if sources.is_empty() { "all".into() } else { "collections".into() };
-        let file = format!("biocartoon-offline-{scope}-{}.zip", chrono::Local::now().format("%Y%m%d"));
         PARTS.with(|p| *p.borrow_mut() = Some(Parts { blob: None, pending: js_sys::Array::new(), pending_bytes: 0 }));
-        let tries = vec![0; items.len()];
-        let state = Arc::new(Mutex::new(State {
-            items,
+        let mut s = State {
+            items: Vec::new(),
+            keys: HashSet::new(),
             next: 0,
             in_flight: 0,
             waiting: 0,
             retry: Vec::new(),
-            tries,
+            tries: Vec::new(),
             zip: ZipWriter::default(),
             base: base_url.trim_end_matches('/').to_string(),
             db: db.to_path_buf(),
             cols,
-            file,
+            credits: Vec::new(),
+            templates: Vec::new(),
+            catalog: z.catalog,
+            file: z.file,
             progress,
             tx,
             ctx,
             error: None,
             finished: false,
-        }));
+        };
+        for it in icons {
+            let svg = it.svg.clone();
+            s.queue(&it.source, it.key, Kind::Png);
+            if let Some(svg) = svg {
+                s.queue(&it.source, svg, Kind::Svg);
+            }
+        }
+        // A template of the user's own is read from this browser's storage; the rest are fetched.
+        let mut local = Vec::new();
+        for row in &z.templates {
+            match &row.json_local {
+                Some(p) => match crate::storage::read(Path::new(p)) {
+                    Ok(b) => local.push((row.json_key.clone(), b)),
+                    Err(e) => {
+                        // Nothing was started, so free the slot for the next download.
+                        PARTS.with(|p| *p.borrow_mut() = None);
+                        return Err(format!("{}: {e}", row.meta.title));
+                    }
+                },
+                None => s.queue(TEMPLATES, row.json_key.clone(), Kind::Json),
+            }
+            let thumb_key = if row.meta.thumb_key.is_empty() { format!("templates/{}/thumb.png", row.meta.id) } else { row.meta.thumb_key.clone() };
+            match &row.thumb_local {
+                Some(p) => {
+                    if let Ok(b) = crate::storage::read(Path::new(p)) {
+                        local.push((thumb_key, b));
+                    }
+                }
+                None if !row.meta.thumb_key.is_empty() => s.queue(TEMPLATES, thumb_key, Kind::TemplatePng),
+                None => {}
+            }
+        }
+        s.templates = z.templates;
+        for (key, b) in local {
+            let kind = if key.ends_with(".json") { Kind::Json } else { Kind::TemplatePng };
+            if s.keys.insert(key.clone()) {
+                s.progress.total.fetch_add(1, Ordering::Relaxed);
+                s.progress.done.fetch_add(1, Ordering::Relaxed);
+                s.add(TEMPLATES, &key, kind, &b);
+            }
+        }
+        let state = Arc::new(Mutex::new(s));
         pump(&state);
         Ok(())
     }
@@ -872,10 +1053,10 @@ mod web {
             };
             s.tries[i] += 1;
             s.in_flight += 1;
-            let (url, png) = (format!("{}/{}", s.base, s.items[i].key), s.items[i].png);
+            let (url, kind) = (format!("{}/{}", s.base, s.items[i].key), s.items[i].kind);
             let st = state.clone();
             ehttp::fetch(ehttp::Request::get(&url), move |res| {
-                let bytes = res.ok().filter(|r| r.ok).map(|r| r.bytes).filter(|b| if png { image::guess_format(b).is_ok() } else { crate::assets::is_svg(b) });
+                let bytes = res.ok().filter(|r| r.ok).map(|r| r.bytes).filter(|b| valid(kind, b));
                 {
                     let mut s = st.lock().unwrap();
                     s.in_flight -= 1;
@@ -899,18 +1080,7 @@ mod web {
                     match bytes {
                         Some(b) => {
                             let (key, source) = (s.items[i].key.clone(), s.items[i].source.clone());
-                            match s.zip.entry(&format!("{ZIP_ROOT}/assets/{key}"), &b) {
-                                Ok(header) => {
-                                    push(&header);
-                                    push(&b);
-                                    s.progress.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-                                    if let Some(c) = s.cols.iter_mut().find(|c| c.source == source) {
-                                        c.have += usize::from(png);
-                                        c.have_bytes += b.len() as u64;
-                                    }
-                                }
-                                Err(e) => s.error = Some(e),
-                            }
+                            s.add(&source, &key, kind, &b);
                         }
                         None => {
                             s.progress.failed.fetch_add(1, Ordering::Relaxed);
@@ -946,25 +1116,35 @@ mod web {
         if s.progress.cancel.load(Ordering::Relaxed) {
             return Ok("Download cancelled".into());
         }
-        let got: usize = s.cols.iter().map(|c| c.have).sum();
+        let count = |templates: bool| s.cols.iter().filter(|c| (c.source == TEMPLATES) == templates).map(|c| c.have).sum::<usize>();
+        let (icons, templates) = (count(false), count(true));
         let failed = s.progress.failed.load(Ordering::Relaxed);
-        if got == 0 {
+        if icons + templates == 0 {
             return Err(format!("couldn't download any of the {failed} files"));
         }
         let mut parts = parts.ok_or("download state lost")?;
-        let catalog = crate::storage::read(&s.db).map_err(|e| format!("catalog: {e}"))?;
-        let text = readme(&s.cols, &catalog_version(&s.db), &s.base, true);
+        let mut extras = Vec::new();
+        if s.catalog {
+            extras.push(("assets.sqlite", crate::storage::read(&s.db).map_err(|e| format!("catalog: {e}"))?));
+        }
+        extras.push(("README.md", readme(&s.cols, &s.credits, &catalog_version(&s.db), &s.base, true, s.catalog).into_bytes()));
         let mut zip = std::mem::take(&mut s.zip);
-        for (name, data) in [("assets.sqlite", &catalog[..]), ("README.md", text.as_bytes())] {
+        for (name, data) in &extras {
             let header = zip.entry(&format!("{ZIP_ROOT}/{name}"), data)?;
             parts.pending.push(&js_sys::Uint8Array::from(&header[..]));
-            parts.pending.push(&js_sys::Uint8Array::from(data));
+            parts.pending.push(&js_sys::Uint8Array::from(&data[..]));
         }
         parts.pending.push(&js_sys::Uint8Array::from(&zip.finish()[..]));
         fold(&mut parts);
         let blob = parts.blob.ok_or("couldn't assemble the zip")?;
         crate::platform::download_blob(&s.file, &blob)?;
-        let mut msg = format!("Downloaded {} ({got} icons)", s.file);
+        let what = match (icons, templates) {
+            (_, 0) => format!("{icons} icons"),
+            (0, 1) => "the template and its images".into(),
+            (0, t) => format!("{t} templates"),
+            (i, t) => format!("{i} icons, {t} templates"),
+        };
+        let mut msg = format!("Downloaded {} ({what})", s.file);
         if failed > 0 {
             msg.push_str(&format!("; {failed} couldn't be fetched"));
         }
@@ -995,7 +1175,7 @@ fn show_folder(dir: &Path) {
     let _ = std::process::Command::new(opener).arg(dir).spawn();
 }
 
-// ---------- the Settings > Offline (web: Bulk download) tab ----------
+// ---------- the Settings > Bulk download tab ----------
 
 #[derive(Default)]
 pub struct OfflineState {
@@ -1019,8 +1199,8 @@ pub struct OfflineState {
     pub(crate) syncing: bool,
 }
 
-/// The tab's name: the browser can't work offline, it only downloads zips.
-pub const TAB_LABEL: &str = if cfg!(target_arch = "wasm32") { "Bulk download" } else { "Offline" };
+/// The tab's name (on the desktop it also makes offline packs; the browser only downloads zips).
+pub const TAB_LABEL: &str = "Bulk download";
 
 impl crate::app::BioCartoon {
     fn offline_dir(&self) -> PathBuf {
@@ -1078,7 +1258,7 @@ impl crate::app::BioCartoon {
                 Err(e) => return self.toast_err(format!("Couldn't delete {}: {e}", p.display())),
             }
         }
-        // Recount Settings > Offline and the Downloads filter.
+        // Recount Settings > Bulk download and the Downloads filter.
         self.offline_rescan();
         self.toast(format!("Deleted the download of {title}"));
     }
@@ -1164,7 +1344,7 @@ impl crate::app::BioCartoon {
         }
         let dim = |t: &str| egui::RichText::new(t).small().color(theme::text_dim());
         ui.label(if web {
-            "Download collections as a .zip: every icon as a PNG, and as an SVG when it has one, the icon catalog (assets.sqlite) and a README with license and credit details."
+            "Download collections as a .zip: every icon as a PNG, and as an SVG when it has one, templates with the icons they use, the icon catalog (assets.sqlite) and a README with license and credit details."
         } else {
             "Download collections to use BioCartoon without internet. Images you have used are kept automatically; a pack downloads whole collections ahead of time (each icon's PNG and SVG, and templates with the icons they use), with a copy of the icon catalog (assets.sqlite) and a README."
         });
@@ -1192,15 +1372,20 @@ impl crate::app::BioCartoon {
                 ui.label("");
             }
             ui.end_row();
-            // Templates after the icons' collections (not in the browser, whose zips are of icons).
-            let templates = (!web && self.offline.templates.count > 0).then_some(&self.offline.templates);
+            // Templates after the icons' collections.
+            let templates = (self.offline.templates.count > 0).then_some(&self.offline.templates);
             for c in self.offline.collections.iter().chain(templates) {
                 let tip = if c.source == TEMPLATES { "Each template, its thumbnail and the icons it uses".to_string() } else { format!("{} · {}", c.source, c.licenses) };
                 ui.label(&c.name).on_hover_text(tip);
                 ui.label(if web { c.count.to_string() } else { format!("{} / {}", c.have, c.count) });
-                let size = ui.label(format!("{}{}", human_bytes(c.bytes), if c.more { "+" } else { "" }));
-                if c.more {
-                    size.on_hover_text("A template's size is known once it is downloaded");
+                // In the browser no template is on this device, so their size isn't known at all.
+                if c.more && c.bytes == 0 {
+                    ui.label("?").on_hover_text("A template's size is known once it is downloaded");
+                } else {
+                    let size = ui.label(format!("{}{}", human_bytes(c.bytes), if c.more { "+" } else { "" }));
+                    if c.more {
+                        size.on_hover_text("A template's size is known once it is downloaded");
+                    }
                 }
                 let download = if web {
                     egui::Button::new(format!("{}  .zip", ph::DOWNLOAD_SIMPLE))
@@ -1448,6 +1633,18 @@ mod tests {
         assert!(matches!(&req, Request::Either(s, _) if matches!(**s, Request::Path(ref p) if *p == svg)));
         assert_eq!(fetch(&req).unwrap(), b"svg");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readme_lists_templates_and_leaves_out_a_missing_catalog() {
+        let cols = [Collection { source: TEMPLATES.into(), name: "Templates".into(), count: 1, have: 1, have_bytes: 2048, ..Default::default() }];
+        let credits = [("Cell cycle".to_string(), "Cell cycle by Ada, CC BY 4.0".to_string())];
+        let one = readme(&cols, &credits, "v1", "https://assets.example", true, false);
+        assert!(!one.contains("assets.sqlite"), "a single template's zip has no catalog");
+        assert!(one.contains("- Cell cycle: Cell cycle by Ada, CC BY 4.0"));
+        assert!(one.contains("template.json"));
+        let pack = readme(&cols, &[], "v1", "https://assets.example", false, true);
+        assert!(pack.contains("assets.sqlite") && !pack.contains("template.json"));
     }
 
     #[test]

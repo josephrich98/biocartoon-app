@@ -16,7 +16,7 @@ cp target/release/biocartoon-app "$APP/Contents/MacOS/biocartoon-app"
 # The command line / MCP server ships inside the bundle: $APP/Contents/MacOS/biocartoon
 cp target/release/biocartoon "$APP/Contents/MacOS/biocartoon"
 
-# icon.icns is generated from icon.svg by `cargo run --bin make_icon`.
+# icon.icns is generated from logo.svg by `cargo run --bin make_icon`.
 cp assets/icon.icns "$APP/Contents/Resources/BioCartoon.icns"
 # Shown in the standard About panel (see `resources` in Cargo.toml).
 cp assets/Credits.html "$APP/Contents/Resources/Credits.html"

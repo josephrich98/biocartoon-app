@@ -704,6 +704,9 @@ fn paint(attr: &str, c: [u8; 4], op: f32) -> String {
 }
 
 fn esc(s: &str) -> String {
+    // XML 1.0 forbids control characters other than tab and newlines (a form feed pasted with
+    // code, say); one of them makes the whole SVG unparseable.
+    let s: String = s.chars().filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r') || (*c as u32) >= 0x7f).collect();
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
@@ -1395,7 +1398,11 @@ fn alias_core_fonts(db: &mut fontdb::Database) {
 
 fn svg_options() -> usvg::Options<'static> {
     let f = fonts();
-    usvg::Options { fontdb: f.db.clone(), font_family: f.family.clone(), ..Default::default() }
+    // SVGs come from AI replies, shared projects and templates, so an `<image href>` naming a
+    // file (or URL) is never followed: only embedded data: images are drawn. usvg's default
+    // would read any path on this computer into the picture.
+    let image_href_resolver = usvg::ImageHrefResolver { resolve_data: usvg::ImageHrefResolver::default_data_resolver(), resolve_string: Box::new(|_, _| None) };
+    usvg::Options { fontdb: f.db.clone(), font_family: f.family.clone(), image_href_resolver, ..Default::default() }
 }
 
 fn parse(svg: &str) -> Result<usvg::Tree, String> {

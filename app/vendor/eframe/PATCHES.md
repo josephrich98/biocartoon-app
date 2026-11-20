@@ -1,8 +1,8 @@
 # Patched eframe 0.36.2
 
 eframe 0.36.2 from crates.io, used through `[patch.crates-io]` in `app/Cargo.toml`. Every change is
-marked `PATCHED (biocartoon)` and only affects the web build's typing on phones. eframe 0.37.0 has
-neither fix, so check a newer release for them before you drop this copy.
+marked `PATCHED (biocartoon)` and only affects the web build. eframe 0.37.0 has
+none of these fixes, so check a newer release for them before you drop this copy.
 
 - `src/web/events.rs`, `touchend`: runs the app's frame while the tap is still being handled, plus the
   next frame if the tap gave a widget keyboard focus. This lets the text agent take focus inside the
@@ -12,3 +12,6 @@ neither fix, so check a newer release for them before you drop this copy.
   `preventDefault`ed while that input has focus. Backspace then always deletes something, so a held
   Backspace keeps repeating on iOS instead of stopping after one character, and Android keyboards
   send their delete.
+- `src/web/events.rs`, `paste`: a paste with no text on the clipboard still becomes an
+  `egui::Event::Paste` (with empty text). Copying from the canvas puts an image on the clipboard, and
+  without the event ⌘V pasted nothing in Mac browsers, which never send V's key-up while ⌘ is held.

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="70 112 600 600" fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" role="img" aria-labelledby="title">
   <title id="title">BioCartoon — the cell palette, single-colour line art</title>
-  <!-- One-colour version of the BioCartoon logo (biocartoon-app/app/assets/logo.svg) for toolbars and small sizes:
+  <!-- One-colour version of the BioCartoon logo (biocartoon-app/app/assets/logo.svg; this file is edited there and mirrored by `./deploy.sh brand`) for toolbars and small sizes:
        black on transparent with uniform strokes, so it can be used as a template image tinted by the host. -->
 
   <!-- Palette with its thumb hole -->

@@ -457,7 +457,13 @@ impl BioCartoon {
                 }
                 a.save();
             }
-            Msg::Me(Err(e)) => a.failed(e),
+            Msg::Me(Err(e)) => {
+                // Ask again once the retry comes round (the profile isn't otherwise re-fetched).
+                if e.status != 401 {
+                    a.need_me = true;
+                }
+                a.failed(e);
+            }
             Msg::LibList(Err(e)) | Msg::LibUploaded(_, _, Err(e)) | Msg::LibDownloaded(_, Err(e)) | Msg::LibDeleted(_, Err(e)) => {
                 a.busy = false;
                 a.failed(e);

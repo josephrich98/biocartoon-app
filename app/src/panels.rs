@@ -158,8 +158,6 @@ impl BioCartoon {
                 if self.icons.mode == IconsMode::Search {
                     self.search_box(ui);
                     ui.add_space(4.0);
-                    self.filter_sort_row(ui, false);
-                    ui.add_space(2.0);
                     let top = ui.cursor().top();
                     let open = self.icons.show_filters;
                     self.search_filters(ui);
@@ -167,8 +165,6 @@ impl BioCartoon {
                 } else if let Some(hint) = mine {
                     self.mine_search_box(ui, hint);
                     ui.add_space(4.0);
-                    self.filter_sort_row(ui, true);
-                    ui.add_space(2.0);
                     let top = ui.cursor().top();
                     let open = self.icons.mine_show_filters;
                     self.mine_filters(ui);
@@ -647,7 +643,7 @@ impl BioCartoon {
                     let buttons = |ui: &mut egui::Ui| {
                         toggle(ui, &mut f.favorites, fav, "Only icons and templates you starred");
                         if !web {
-                            toggle(ui, &mut f.downloads, dl, "Only icons and templates downloaded for offline use (Settings > Offline, or right-click > Download)");
+                            toggle(ui, &mut f.downloads, dl, "Only icons and templates downloaded for offline use (Settings > Bulk download, or right-click > Download)");
                         }
                     };
                     if both <= w {
@@ -752,8 +748,8 @@ impl BioCartoon {
         height
     }
 
-    /// Under the search box (or Favorites' and Your library's): the Filters button, whose filters
-    /// open beneath it so it stays put, and Sort at the right.
+    /// At the top of the results, under the search box (or Favorites' and Your library's): the
+    /// Filters button, and Sort at the right. It scrolls away with the results.
     fn filter_sort_row(&mut self, ui: &mut egui::Ui, mine: bool) {
         control_row(ui, if mine { "mine_filter_sort" } else { "filter_sort" }, |ui| {
             let (n, open) = if mine { (self.icons.mine_filter.active(), self.icons.mine_show_filters) } else { (self.icons.filter.active(), self.icons.show_filters) };
@@ -1119,13 +1115,17 @@ impl BioCartoon {
             self.icons.results.clone()
         };
         let shown_total = if mine { Some(shown.len() as i64) } else { self.icons.total };
+        // Filters and Sort head the results and scroll away with them; the funnel in the search box
+        // (and the summary of the set filters) stays in view above.
+        self.filter_sort_row(ui, self.icons.mode != IconsMode::Search);
+        ui.add_space(2.0);
         if let Some(e) = &self.icons.error {
             ui.label(egui::RichText::new(e).color(Color32::from_rgb(230, 120, 120)));
         }
         if self.icons.loading && self.icons.results.is_empty() {
             ui.label(egui::RichText::new("Searching...").color(theme::text_dim()));
         }
-        // The suggestions scroll away with the results (Filters and Sort are above them, in `left_panel`).
+        // The suggestions scroll away with the results, under Filters and Sort.
         if self.icons.mode == IconsMode::Search {
             self.search_suggestions(ui);
         }
@@ -1425,7 +1425,11 @@ impl BioCartoon {
                     self.actions.push(Action::DeleteTemplateDownload(Box::new(row.clone())));
                     ui.close();
                 }
-            } else if !cfg!(target_arch = "wasm32") && ui.button(format!("{}  Download", ph::DOWNLOAD_SIMPLE)).on_hover_text("Keep it, and the icons it uses, for offline use").clicked() {
+            } else if ui
+                .button(format!("{}  Download", ph::DOWNLOAD_SIMPLE))
+                .on_hover_text(if cfg!(target_arch = "wasm32") { "Save it, its thumbnail and the icons it uses as a .zip" } else { "Keep it, and the icons it uses, for offline use" })
+                .clicked()
+            {
                 self.actions.push(Action::DownloadTemplate(Box::new(row.clone())));
                 ui.close();
             }
@@ -2027,13 +2031,16 @@ impl BioCartoon {
             changed |= ui.add(egui::DragValue::new(&mut edited.pos[1]).speed(1.0).max_decimals(1)).changed();
             ui.end_row();
             ui.label("W");
-            changed |= ui.add(egui::DragValue::new(&mut edited.size[0]).speed(1.0).max_decimals(1)).changed();
+            // A line's size is its end relative to its start, so it can be negative; anything
+            // else needs a positive size or it can no longer be clicked.
+            let min = if edited.is_line() { -crate::doc::MAX_COORD } else { 1.0 };
+            changed |= ui.add(egui::DragValue::new(&mut edited.size[0]).speed(1.0).max_decimals(1).range(min..=crate::doc::MAX_COORD)).changed();
             ui.label("H");
-            changed |= ui.add(egui::DragValue::new(&mut edited.size[1]).speed(1.0).max_decimals(1)).changed();
+            changed |= ui.add(egui::DragValue::new(&mut edited.size[1]).speed(1.0).max_decimals(1).range(min..=crate::doc::MAX_COORD)).changed();
             ui.end_row();
             ui.label("Rotate");
             let mut deg = edited.rotation.to_degrees();
-            if ui.add(egui::DragValue::new(&mut deg).speed(1.0).suffix("°").max_decimals(1)).changed() {
+            if ui.add_enabled(edited.rotatable(), egui::DragValue::new(&mut deg).speed(1.0).suffix("°").max_decimals(1)).changed() {
                 edited.rotation = deg.to_radians();
                 changed = true;
             }
@@ -2238,7 +2245,7 @@ impl BioCartoon {
                         let mut nc = vec![String::new(); *rows * *cols];
                         for r in 0..r0.min(*rows) {
                             for c in 0..c0.min(*cols) {
-                                nc[r * *cols + c] = cells[r * c0 + c].clone();
+                                nc[r * *cols + c] = cells.get(r * c0 + c).cloned().unwrap_or_default();
                             }
                         }
                         *cells = nc;
@@ -3179,7 +3186,7 @@ fn text_style_ui(ui: &mut egui::Ui, kind: &mut ItemKind, sel: Option<std::ops::R
     const FLAGS: [TextFlag; 6] = [TextFlag::Bold, TextFlag::Italic, TextFlag::Underline, TextFlag::Strike, TextFlag::Superscript, TextFlag::Subscript];
     let flags = FLAGS.map(|f| crate::doc::flag_all(kind, sel.clone(), f));
     let (mut new_color, mut new_highlight, mut toggled, mut from_latex) = (None, None, None, false);
-    let ItemKind::Text { text, size, align, font, line_spacing, valign, fill, .. } = kind else { return false };
+    let ItemKind::Text { text, size, align, font, line_spacing, valign, fill, runs, .. } = kind else { return false };
     let color = &mut color;
     let mut changed = false;
     ui.label(egui::RichText::new("Text").strong());
@@ -3297,17 +3304,23 @@ fn text_style_ui(ui: &mut egui::Ui, kind: &mut ItemKind, sel: Option<std::ops::R
             let list = list_style(text);
             for (numbered, icon, tip) in [(false, ph::LIST_BULLETS, "Bulleted list"), (true, ph::LIST_NUMBERS, "Numbered list")] {
                 if seg_toggle(ui, cell, icon, list == Some(numbered), tip).clicked() {
+                    let old = text.clone();
                     set_list(text, if list == Some(numbered) { None } else { Some(numbered) });
+                    *runs = crate::doc::remap_runs_by_line(runs, &old, text);
                     changed = true;
                 }
             }
             let indented = text.split('\n').any(|l| l.starts_with(' '));
             if ui.add_enabled_ui(indented, |ui| seg_toggle(ui, cell, ph::TEXT_OUTDENT, false, "Decrease indent")).inner.clicked() {
+                let old = text.clone();
                 indent(text, false);
+                *runs = crate::doc::remap_runs_by_line(runs, &old, text);
                 changed = true;
             }
             if seg_toggle(ui, cell, ph::TEXT_INDENT, false, "Increase indent").clicked() {
+                let old = text.clone();
                 indent(text, true);
+                *runs = crate::doc::remap_runs_by_line(runs, &old, text);
                 changed = true;
             }
         });

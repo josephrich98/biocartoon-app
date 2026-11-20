@@ -20,9 +20,25 @@ mod imp {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = p.with_extension("tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, p)
+        // The temp name keeps the whole file name (so `a.png` and `a.svg` don't share `a.tmp`)
+        // plus the process and a counter, so two threads writing at once never share one.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = p.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{}-{seq}.tmp", std::process::id()));
+        let tmp = p.with_file_name(name);
+        let res = (|| {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(bytes)?;
+            // On disk before the rename, so a power cut can't leave an empty file in its place.
+            f.sync_all()?;
+            std::fs::rename(&tmp, p)
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
     }
 
     pub fn exists(p: &Path) -> bool {

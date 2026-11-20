@@ -375,7 +375,7 @@ impl Include {
     }
 }
 
-/// The filters under the search box's funnel (and the Filters button below it). Each one keeps what matches any of its entries
+/// The filters under the search box's funnel (and the Filters button atop the results). Each one keeps what matches any of its entries
 /// (none keeps everything), and a result has to pass all of them.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SearchFilter {
@@ -645,6 +645,36 @@ pub(crate) fn dialog_body<R>(ui: &mut egui::Ui, id: egui::Id, body: impl FnOnce(
     };
     ui.data_mut(|d| d.insert_temp(id, size));
     r
+}
+
+/// Widgets laid out in as few rows as fit the width left, for a grid cell (which can't measure a
+/// wrapped layout). `texts` are the widgets' labels; `checkbox` says they are checkboxes rather than buttons.
+pub(crate) fn packed_rows(ui: &mut egui::Ui, texts: &[&str], checkbox: bool, add: impl FnMut(&mut egui::Ui, usize)) {
+    let widths: Vec<f32> = texts.iter().map(|t| packed_width(ui, t, checkbox)).collect();
+    packed_rows_by_width(ui, &widths, add);
+}
+
+/// The room a button (or checkbox) labelled `text` takes in `packed_rows`, spacing included.
+fn packed_width(ui: &egui::Ui, text: &str, checkbox: bool) -> f32 {
+    let st = &ui.style().spacing;
+    let extra = if checkbox { st.icon_width + st.icon_spacing } else { 2.0 * st.button_padding.x } + st.item_spacing.x;
+    egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button).size().x + extra
+}
+
+/// `packed_rows` for widgets of the given widths (spacing included), for rows that mix in other widgets.
+fn packed_rows_by_width(ui: &mut egui::Ui, widths: &[f32], mut add: impl FnMut(&mut egui::Ui, usize)) {
+    let avail = ui.available_width();
+    ui.vertical(|ui| {
+        let mut i = 0;
+        while i < widths.len() {
+            let (start, mut w) = (i, 0.0);
+            while i < widths.len() && (i == start || w + widths[i] <= avail) {
+                w += widths[i];
+                i += 1;
+            }
+            ui.horizontal(|ui| (start..i).for_each(|j| add(ui, j)));
+        }
+    });
 }
 
 /// The widest a dialog's content can be and still fit the screen with a margin, up to `want`.
@@ -989,7 +1019,7 @@ pub enum Action {
     /// Download an asset's image files into the offline folder (in the browser, which has none,
     /// save its original file instead).
     DownloadAsset(Box<AssetRow>),
-    /// Desktop: download a template, and the icons it uses, into the offline folder.
+    /// Download a template and the icons it uses: desktop into the offline folder, web as a .zip.
     DownloadTemplate(Box<TemplateRow>),
     /// Desktop: delete an icon's files (or a template's JSON and thumbnail) from the offline folder.
     DeleteDownload(Box<AssetRow>),
@@ -1279,6 +1309,9 @@ pub struct BioCartoon {
     pub store: Store,
     /// The open project's id; `None` for a new document not saved yet.
     pub project: Option<String>,
+    /// Goes up whenever a different document is opened, so a late AI result for the previous
+    /// one (whose item ids may repeat in this one) is recognized and dropped.
+    pub doc_epoch: u64,
     /// The document as last written to the project (autosave compares against it).
     pub saved_doc: Option<Document>,
     pub last_autosave: f64,
@@ -1309,9 +1342,9 @@ pub struct BioCartoon {
     pub export_job: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// The running export's progress, and when it started (for the time left).
     export_progress: Option<(std::sync::Arc<crate::export::Progress>, f64)>,
-    /// The export dialog's last file size, with the options it was worked out for.
-    export_size: Option<(ExportOptions, Result<crate::export::SizeEstimate, String>)>,
-    export_size_rx: Option<std::sync::mpsc::Receiver<(ExportOptions, Result<crate::export::SizeEstimate, String>)>>,
+    /// The file sizes the export and "Save as picture" dialogs show.
+    export_size: SizeEstimates,
+    picture_size: SizeEstimates,
     pub variants: Vec<AssetRow>,
     pub variants_for: Option<String>,
     pub variants_req: u64,
@@ -1513,6 +1546,7 @@ impl BioCartoon {
             ctx: cc.egui_ctx.clone(),
             store: Store::new(projects_dir),
             project: None,
+            doc_epoch: 0,
             saved_doc: None,
             last_autosave: 0.0,
             home: HomeState::default(),
@@ -1532,8 +1566,8 @@ impl BioCartoon {
             show_save_picture: false,
             export_job: None,
             export_progress: None,
-            export_size: None,
-            export_size_rx: None,
+            export_size: SizeEstimates::default(),
+            picture_size: SizeEstimates::default(),
             variants: Vec::new(),
             variants_for: None,
             variants_req: 0,
@@ -2277,6 +2311,9 @@ impl BioCartoon {
     }
 
     pub fn ungroup_selection(&mut self) {
+        if !self.is_grouped() {
+            return;
+        }
         self.commit();
         let sel = self.selection.clone();
         for it in self.slide_mut().items.iter_mut() {
@@ -2304,6 +2341,11 @@ impl BioCartoon {
         let Some(sel_rect) = self.selection_rect() else { return };
         let page = self.doc.page_rect();
         let target = if self.selection.len() > 1 { sel_rect } else { page };
+        let distribute = matches!(kind, AlignKind::DistributeH | AlignKind::DistributeV);
+        // Distributing needs three items; fewer would only leave an empty undo step.
+        if distribute && self.selected_items().len() < 3 {
+            return;
+        }
         self.commit();
         let sel = self.selection.clone();
         let g = self.settings.grid_steps;
@@ -2311,7 +2353,8 @@ impl BioCartoon {
         let snap = |v: f32| if g { (v / gs).round() * gs } else { v };
         match kind {
             AlignKind::DistributeH | AlignKind::DistributeV => {
-                let mut ids: Vec<ItemId> = sel.clone();
+                // Only ids on this slide, so the lookups below can't miss.
+                let mut ids: Vec<ItemId> = self.selected_items().iter().map(|i| i.id).collect();
                 let horizontal = kind == AlignKind::DistributeH;
                 ids.sort_by(|a, b| {
                     let ra = self.item(*a).unwrap().rect();
@@ -2396,12 +2439,11 @@ impl BioCartoon {
     }
 
     pub fn flip(&mut self, horizontal: bool) {
-        if self.selection.is_empty() {
+        let Some(center) = self.selection_rect().map(|r| r.center()) else {
             return;
-        }
+        };
         self.commit();
         let sel = self.selection.clone();
-        let center = self.selection_rect().unwrap().center();
         let multi = sel.len() > 1;
         for it in self.slide_mut().items.iter_mut() {
             if !sel.contains(&it.id) {
@@ -2435,6 +2477,9 @@ impl BioCartoon {
     }
 
     pub fn toggle_lock(&mut self) {
+        if self.selected_items().is_empty() {
+            return;
+        }
         self.commit();
         let sel = self.selection.clone();
         let any_unlocked = self.selected_items().iter().any(|i| !i.locked);
@@ -2461,7 +2506,7 @@ impl BioCartoon {
             return;
         };
         self.toast(format!("{} ({})", op.label(), self.ai.backend.name()));
-        self.ai.submit(AiJob::Edit { item: it.id, image, svg, op });
+        self.ai.submit(AiJob::Edit { item: it.id, doc: self.doc_epoch, image, svg, op });
     }
 
     /// What an AI edit of an image starts from: the picture as the canvas shows it, its restyled
@@ -2499,7 +2544,13 @@ impl BioCartoon {
                         }
                     }
                 }
-                AiResult::Edited { item, op, result } => match result {
+                AiResult::Edited { item, doc, op, result } => match result {
+                    Ok(_) if doc != self.doc_epoch || self.screen != Screen::Editor => {
+                        self.toast_err(format!("{} finished after its document was closed, so it wasn't applied", op.label()));
+                    }
+                    Ok(_) if !self.doc.slides.iter().any(|s| s.items.iter().any(|i| i.id == item)) => {
+                        self.toast_err(format!("{}: the image was deleted, so the edit wasn't applied", op.label()));
+                    }
                     Ok(made) => {
                         let stem = format!("{}-{}", item, chrono::Utc::now().format("%Y%m%d%H%M%S"));
                         let p = match self.save_ai_image(ctx, &stem, made) {
@@ -2510,7 +2561,9 @@ impl BioCartoon {
                             }
                         };
                         self.commit();
-                        if let Some(it) = self.item_mut(item) {
+                        // Ids are unique across the document, so find the item on whichever
+                        // slide it is now (the user may have moved on to another slide).
+                        if let Some(it) = self.doc.slides.iter_mut().flat_map(|s| s.items.iter_mut()).find(|i| i.id == item) {
                             if let ItemKind::Image { source, layers, .. } = &mut it.kind {
                                 // The edit still owes the original's credit.
                                 *source = source.derived(p);
@@ -2691,7 +2744,7 @@ impl BioCartoon {
     fn reload_templates(&mut self) {
         self.template_rows = self.templates.list();
         self.fetch_template_stars();
-        // Which are downloaded (Settings > Offline, the Downloads filter).
+        // Which are downloaded (Settings > Bulk download, the Downloads filter).
         if !cfg!(target_arch = "wasm32") && !self.catalog.db_path.as_os_str().is_empty() {
             self.offline_rescan();
         }
@@ -2776,14 +2829,14 @@ impl BioCartoon {
     }
 
     /// Desktop: download `row`'s PNG, and its SVG when it has one, into the offline folder in the
-    /// background, as a pack does (Settings > Offline): they are drawn from there from then on,
+    /// background, as a pack does (Settings > Bulk download): they are drawn from there from then on,
     /// and it is listed under the Downloads filter. [`Action::AssetDownloaded`] says when.
     #[cfg(not(target_arch = "wasm32"))]
     fn download_asset(&mut self, row: &AssetRow) {
         if row.png_local.is_some() {
             return self.toast(format!("{} is already on this computer", row.title));
         }
-        let Some(dir) = self.images.cache_dir() else { return self.toast_err("No offline folder (Settings > Offline)") };
+        let Some(dir) = self.images.cache_dir() else { return self.toast_err("No offline folder (Settings > Bulk download)") };
         let base = self.images.base_url.trim_end_matches('/').to_string();
         let keys: Vec<String> = std::iter::once(row.png_key.clone()).chain(row.svg_key.clone()).filter(|k| !k.is_empty()).collect();
         let (tx, title) = (self.action_tx.clone(), row.title.clone());
@@ -2801,7 +2854,7 @@ impl BioCartoon {
     /// and thumbnail, and every icon it uses (PNG and SVG). It opens from there from then on.
     #[cfg(not(target_arch = "wasm32"))]
     fn download_template(&mut self, row: TemplateRow) {
-        let Some(dir) = self.images.cache_dir() else { return self.toast_err("No offline folder (Settings > Offline)") };
+        let Some(dir) = self.images.cache_dir() else { return self.toast_err("No offline folder (Settings > Bulk download)") };
         let (tx, base) = (self.action_tx.clone(), self.images.base_url.clone());
         crate::platform::spawn("download template", move || {
             let title = row.meta.title.clone();
@@ -3638,8 +3691,8 @@ impl BioCartoon {
         self.suggest.busy = true;
         let (tx, ctx) = (self.library_tx.clone(), self.ctx.clone());
         self.library_busy += 1;
-        crate::platform::spawn("suggest", move || {
-            let _ = tx.send(LibraryMsg::SuggestionSent(title, crate::submit::suggest(&url, &s)));
+        crate::submit::suggest(&url, &s, move |r| {
+            let _ = tx.send(LibraryMsg::SuggestionSent(title, r));
             ctx.request_repaint();
         });
     }
@@ -3675,8 +3728,8 @@ impl BioCartoon {
         }
         let (tx, ctx, title) = (self.library_tx.clone(), self.ctx.clone(), r.title.clone());
         self.library_busy += 1;
-        crate::platform::spawn("removal", move || {
-            let _ = tx.send(LibraryMsg::RemovalSent(title, crate::submit::request_removal(&url, &r)));
+        crate::submit::request_removal(&url, &r, move |res| {
+            let _ = tx.send(LibraryMsg::RemovalSent(title, res));
             ctx.request_repaint();
         });
     }
@@ -3711,25 +3764,31 @@ impl BioCartoon {
         let svg = svg.filter(|s| s.len() <= crate::submit::MAX_SVG_BYTES);
         let (tx, ctx) = (self.library_tx.clone(), self.ctx.clone());
         self.library_busy += 1;
-        crate::platform::spawn("submit", move || {
-            use crate::submit::Part;
-            let send = |image: Part| {
-                serde_json::to_string(&meta).map_err(|e| e.to_string()).and_then(|m| crate::submit::submit(&url, &[Part::Text("kind", "asset".into()), Part::Text("meta", m), image]))
-            };
-            let mut as_png = None;
-            let result = match svg {
-                // The Worker refuses SVGs with scripts or links to other files; their PNG is fine.
-                Some(svg) => send(Part::File("svg", svg.into_bytes(), "image/svg+xml")).or_else(|e| {
-                    as_png = Some(e);
-                    send(Part::File("image", png, "image/png"))
-                }),
-                None => send(Part::File("image", png, "image/png")),
-            };
+        use crate::submit::Part;
+        let done = move |result: Result<String, String>, as_png: Option<String>| {
             // A PNG refused too: report why, not the SVG's reason.
             let as_png = as_png.filter(|_| result.is_ok());
             let _ = tx.send(LibraryMsg::AssetSubmitted { row, result, replaces, as_png, fingerprint });
             ctx.request_repaint();
-        });
+        };
+        let meta = match serde_json::to_string(&meta) {
+            Ok(m) => m,
+            Err(e) => return done(Err(e.to_string()), None),
+        };
+        let form = |image: Part<'static>| [Part::Text("kind", "asset".into()), Part::Text("meta", meta.clone()), image];
+        let as_png = form(Part::File("image", png, "image/png"));
+        match svg {
+            // The Worker refuses SVGs with scripts or links to other files; their PNG is fine.
+            Some(svg) => {
+                let url2 = url.clone();
+                crate::submit::submit(&url, &form(Part::File("svg", svg.into_bytes(), "image/svg+xml")), move |r| match r {
+                    Ok(id) => done(Ok(id), None),
+                    Err(e) if crate::submit::is_svg_refusal(&e) => crate::submit::submit(&url2, &as_png, move |r| done(r, Some(e))),
+                    Err(e) => done(Err(e), None),
+                });
+            }
+            None => crate::submit::submit(&url, &as_png, move |r| done(r, None)),
+        }
     }
 
     /// Web, without an account: say where Your library is kept (each time something is added to it).
@@ -3850,9 +3909,11 @@ impl BioCartoon {
         self.library_busy += 1;
         crate::platform::spawn("template-save", move || {
             let thumb = crate::export::thumbnail(&ctx, &file.slide, page, bg, &requests, &cached, 480);
-            let res = crate::templates::save(crate::templates::SaveJob { meta, file, dir, thumb, submit });
-            let _ = tx.send(LibraryMsg::TemplateSaved(res, replaces));
-            ctx.request_repaint();
+            let ctx2 = ctx.clone();
+            crate::templates::save(crate::templates::SaveJob { meta, file, dir, thumb, submit }, move |res| {
+                let _ = tx.send(LibraryMsg::TemplateSaved(res, replaces));
+                ctx2.request_repaint();
+            });
         });
     }
 
@@ -3985,6 +4046,8 @@ impl BioCartoon {
                     Err(e) => self.toast_err(format!("Template not saved: {e}")),
                 },
                 LibraryMsg::TemplateLoaded(res, own) => match res {
+                    // Left the editor while it loaded: there's no slide deck to add it to.
+                    Ok(_) if self.screen != Screen::Editor => {}
                     Ok(t) => self.insert_template(t, own),
                     Err(e) => self.toast_err(e),
                 },
@@ -4019,6 +4082,7 @@ impl BioCartoon {
 
     /// Reset the editor to `doc` (no undo history, nothing selected).
     pub(crate) fn load_into_editor(&mut self, doc: Document, project: Option<String>) {
+        self.doc_epoch += 1;
         self.saved_doc = Some(doc.clone());
         self.doc = doc;
         self.project = project;
@@ -4239,6 +4303,8 @@ impl BioCartoon {
         self.project = None;
         self.saved_doc = None;
         self.doc = Document::default();
+        self.doc_epoch += 1;
+        self.cur_slide = 0;
         self.snake = None;
         self.snake_best = 0;
         self.history.clear();
@@ -4593,6 +4659,8 @@ impl BioCartoon {
         let mut go = false;
         let mut cancel = false;
         let region = self.selected_items().into_iter().map(crate::export::item_bounds).reduce(|a, b| a.union(b));
+        let picture_opts = self.picture_options();
+        let size = &self.picture_size;
         let format = &mut self.settings.picture_format;
         let dpi = &mut self.settings.picture_dpi;
         let modal = egui::Modal::new(egui::Id::new("save_picture_modal")).show(ctx, |ui| {
@@ -4618,11 +4686,21 @@ impl BioCartoon {
                     ui.label("Resolution (dpi)");
                     dpi_picker(ui, dpi, egui::Id::new("picture_custom_dpi"), false);
                 });
-                if let Some(r) = region {
-                    let [w, h] = crate::export::pixel_size(r, *dpi);
-                    ui.label(egui::RichText::new(format!("{w} × {h} px")).color(theme::text_dim()));
-                }
             });
+            if let Some(r) = region {
+                ui.horizontal(|ui| {
+                    ui.label("Size");
+                    if format.is_raster() {
+                        pixel_size_fields(ui, r, dpi, egui::Id::new("picture_custom_dpi"), egui::Id::new("picture_px"));
+                        ui.label("px");
+                        ui.label(egui::RichText::new(format!("· {}", size.note(&picture_opts).unwrap_or_else(|| "...".into()))).color(theme::text_dim()));
+                    } else {
+                        // Vector files have no pixels of their own: their size at the slide's 96 px per inch.
+                        let dims = format!("{} × {} px", r.width().round() as u32, r.height().round() as u32);
+                        ui.label(egui::RichText::new(size.line(&dims, &picture_opts)).color(theme::text_dim()));
+                    }
+                });
+            }
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (clicked, entered) = theme::press_on_enter(ui, true, |ui| ui.add(egui::Button::new(egui::RichText::new("Save...").color(theme::on_accent())).fill(theme::accent())).clicked());
@@ -4631,6 +4709,11 @@ impl BioCartoon {
             });
         });
         self.show_save_picture = !(go || cancel || modal.should_close());
+        if self.show_save_picture {
+            self.update_picture_size(ctx);
+        } else {
+            self.picture_size.clear();
+        }
         if go {
             self.save_selection_image(ctx);
         }
@@ -4643,19 +4726,46 @@ impl BioCartoon {
             self.toast("An export is already running");
             return;
         }
-        let items: Vec<Item> = self.selected_items().into_iter().cloned().collect();
-        let Some(region) = items.iter().map(crate::export::item_bounds).reduce(|a, b| a.union(b)) else { return };
+        let items = self.selected_items();
+        if items.is_empty() {
+            return;
+        }
         let name = match &items[..] {
             [it] if !it.name.is_empty() => Self::slugify(&it.name),
             _ => format!("{}-selection", Self::slugify(&self.doc.title)),
         };
         let format = self.settings.picture_format;
         let Some(path) = crate::platform::save_path(format.label(), format.ext(), &format!("{name}.{}", format.ext())) else { return };
+        if let Some(job) = self.selection_job(path, self.picture_options()) {
+            self.launch_export(ctx, job);
+        }
+    }
+
+    /// What "Save as picture" saves with.
+    fn picture_options(&self) -> ExportOptions {
+        ExportOptions { format: self.settings.picture_format, dpi: self.settings.picture_dpi, transparent: true, jpg_quality: self.settings.export.jpg_quality, ..Default::default() }
+    }
+
+    /// The selection on its own, cropped to it; None with nothing selected.
+    fn selection_job(&self, path: PathBuf, opts: ExportOptions) -> Option<crate::export::ExportJob> {
+        let items: Vec<Item> = self.selected_items().into_iter().cloned().collect();
+        let region = items.iter().map(crate::export::item_bounds).reduce(|a, b| a.union(b))?;
         let doc = Document { slides: vec![Slide { items, ..self.slide().clone() }], ..self.doc.clone() };
-        let opts = ExportOptions { format, dpi: self.settings.picture_dpi, transparent: true, jpg_quality: self.settings.export.jpg_quality, ..Default::default() };
         let mut job = self.export_job_for(&doc, &[0], path, opts);
         job.page = region;
-        self.launch_export(ctx, job);
+        Some(job)
+    }
+
+    /// Keep the "Save as picture" dialog's file size up to date.
+    fn update_picture_size(&mut self, ctx: &egui::Context) {
+        let opts = self.picture_options();
+        if !self.picture_size.needs(ctx, &opts) {
+            return;
+        }
+        // Never written: only its name matters.
+        let Some(job) = self.selection_job(PathBuf::from(format!("picture.{}", opts.format.ext())), opts.clone()) else { return };
+        let ctx2 = ctx.clone();
+        self.picture_size.start(ctx, opts, move || crate::export::estimate(&ctx2, &job));
     }
 
     /// `slides` are 0-based indices into `doc.slides`.
@@ -4748,19 +4858,8 @@ impl BioCartoon {
             (None, false) => "Export slide".into(),
         };
         // While the options change, the last size stays up, marked as updating.
-        let size_note = match &self.export_size {
-            Some((o, res)) => {
-                let updating = if *o == self.settings.export { "" } else { " ..." };
-                match res {
-                    Ok(est) => {
-                        let files = if est.files > 1 { format!(" in {} files", est.files) } else { String::new() };
-                        format!("{}{}{files}{updating}", if est.approx { "about " } else { "" }, Self::file_size(est.bytes))
-                    }
-                    Err(_) => format!("unknown{updating}"),
-                }
-            }
-            None => "working it out...".into(),
-        };
+        let size = &self.export_size;
+        let size_note = size.note(&self.settings.export).unwrap_or_else(|| "working it out...".into());
         let size_row = |ui: &mut egui::Ui| {
             ui.label("File size");
             ui.label(egui::RichText::new(&size_note).color(theme::text_dim()));
@@ -4772,9 +4871,8 @@ impl BioCartoon {
         // zoom, which zooms the whole app until the dialog closes.
         let zoom_id = egui::Id::new("export_base_zoom");
         dialog_zoom(ctx, zoom_id);
-        let width = dialog_width(ctx, 440.0);
-        let units_id = egui::Id::new("export_dims_unit");
-        let mut dims_unit: Unit = ctx.data(|d| d.get_temp(units_id)).unwrap_or(Unit::Px);
+        // Wide enough for all the formats in one row at the default text size.
+        let width = dialog_width(ctx, 600.0);
         let modal = egui::Modal::new(egui::Id::new("export_modal")).show(ctx, |ui| {
             let body = |ui: &mut egui::Ui| {
                 // Reuse the measured content width so the header and body share the same bounds.
@@ -4794,16 +4892,10 @@ impl BioCartoon {
                 ui.add_space(8.0);
                 egui::Grid::new("export_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                     ui.label("Format");
-                    // Phones: two rows, to fit the screen. (Rows of their own, as a grid cell
-                    // can't measure a wrapped layout.)
-                    ui.vertical(|ui| {
-                        for row in ExportFormat::ALL.chunks(if phone { 4 } else { ExportFormat::ALL.len() }) {
-                            ui.horizontal(|ui| {
-                                for &f in row {
-                                    ui.selectable_value(&mut opts.format, f, f.label());
-                                }
-                            });
-                        }
+                    // In as many rows as the dialog's width needs (on a phone, or with large text).
+                    let formats = ExportFormat::ALL;
+                    packed_rows(ui, &formats.map(|f| f.label()), false, |ui, i| {
+                        ui.selectable_value(&mut opts.format, formats[i], formats[i].label());
                     });
                     ui.end_row();
 
@@ -4832,32 +4924,46 @@ impl BioCartoon {
                     });
                     ui.end_row();
 
-                    ui.label("File dimensions");
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("export_dims_unit").width(52.0).selected_text(dims_unit.label()).show_ui(ui, |ui| {
-                            for u in [Unit::Px, Unit::Inch, Unit::Cm] {
-                                ui.selectable_value(&mut dims_unit, u, u.label());
+                    // The size in pixels and bytes, under the resolution. One raster image (or every
+                    // slide at the page's size): the pixels can be typed, to set the dpi that fits them.
+                    let region = if opts.crop && !deck { image_bounds.unwrap_or(page) } else { page };
+                    let each = if all { " each" } else { "" };
+                    let fixed = if opts.individual && !deck {
+                        Some("a size per image".to_string())
+                    } else if all && opts.crop && !deck {
+                        Some("a size per slide".to_string())
+                    } else if !opts.format.is_raster() {
+                        // Vector files have no pixels of their own: their size at the slide's 96 px per inch.
+                        Some(format!("{} × {} px{each}", region.width().round() as u32, region.height().round() as u32))
+                    } else {
+                        None
+                    };
+                    ui.label("Size");
+                    match fixed {
+                        Some(dims) => {
+                            ui.label(egui::RichText::new(size.line(&dims, opts)).color(theme::text_dim()));
+                        }
+                        None => {
+                            let note = size.note(opts).unwrap_or_else(|| "...".into());
+                            let fields = |ui: &mut egui::Ui, opts: &mut ExportOptions| {
+                                pixel_size_fields(ui, region, &mut opts.dpi, egui::Id::new("export_custom_dpi"), egui::Id::new("export_px"));
+                                ui.label(format!("px{each}"));
+                            };
+                            // Phones: the file size goes under the pixels, as the dpi field goes
+                            // under its presets, so the row never runs off the screen.
+                            if phone {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| fields(ui, opts));
+                                    ui.label(egui::RichText::new(note).color(theme::text_dim()));
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    fields(ui, opts);
+                                    ui.label(egui::RichText::new(format!("· {note}")).color(theme::text_dim()));
+                                });
                             }
-                        });
-                        let dims = if opts.individual && !deck {
-                            "a size per image".to_string()
-                        } else if all && opts.crop && !deck {
-                            "a size per slide".to_string()
-                        } else {
-                            let region = if opts.crop && !deck { image_bounds.unwrap_or(page) } else { page };
-                            let each = if all { " each" } else { "" };
-                            match dims_unit {
-                                // Vector files have no pixels of their own: their size at the slide's 96 px per inch.
-                                Unit::Px if !opts.format.is_raster() => format!("{} x {} px{each}", region.width().round(), region.height().round()),
-                                Unit::Px => {
-                                    let [w, h] = crate::export::pixel_size(region, opts.dpi);
-                                    format!("{w} x {h} px{each}")
-                                }
-                                u => format!("{:.2} x {:.2} {}{each}", u.from_px(region.width()), u.from_px(region.height()), u.label()),
-                            }
-                        };
-                        ui.label(egui::RichText::new(dims).color(theme::text_dim()));
-                    });
+                        }
+                    }
                     ui.end_row();
 
                     if !opts.format.is_raster() && !deck {
@@ -4880,8 +4986,6 @@ impl BioCartoon {
                         });
                         ui.end_row();
                     }
-
-                    size_row(ui);
                 });
                 ui.add_space(6.0);
                 if opts.format.can_be_transparent() {
@@ -4943,7 +5047,6 @@ impl BioCartoon {
             };
             dialog_body(ui, egui::Id::new("export_body"), body);
         });
-        ctx.data_mut(|d| d.insert_temp(units_id, dims_unit));
         if modal.should_close() {
             open = false;
         }
@@ -4955,8 +5058,7 @@ impl BioCartoon {
         if self.show_export {
             self.update_export_size(ctx);
         } else {
-            self.export_size = None;
-            self.export_size_rx = None;
+            self.export_size.clear();
         }
         if !self.show_export && !go {
             self.export_doc = None;
@@ -4972,18 +5074,8 @@ impl BioCartoon {
     /// Keep the export dialog's file size up to date: once the last estimate is in, start another
     /// if the options have changed since.
     fn update_export_size(&mut self, ctx: &egui::Context) {
-        if let Some(rx) = &self.export_size_rx {
-            match rx.try_recv() {
-                Ok(done) => {
-                    self.export_size = Some(done);
-                    self.export_size_rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return ctx.request_repaint_after(std::time::Duration::from_millis(100)),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.export_size_rx = None,
-            }
-        }
         let opts = self.settings.export.clone();
-        if self.export_size.as_ref().is_some_and(|(o, _)| *o == opts) {
+        if !self.export_size.needs(ctx, &opts) {
             return;
         }
         let (doc, slide) = self.export_source();
@@ -4991,18 +5083,11 @@ impl BioCartoon {
         let slides: Vec<usize> = if opts.all_slides { (0..doc.slides.len()).collect() } else { vec![slide] };
         // Never written: only its name matters.
         let job = (opts.format != ExportFormat::Biocartoon).then(|| self.export_job_for(&doc, &slides, PathBuf::from(format!("export.{}", opts.format.ext())), opts.clone()));
-        let (tx, rx) = std::sync::mpsc::channel();
         let ctx2 = ctx.clone();
-        self.export_size_rx = Some(rx);
-        crate::platform::spawn("export size", move || {
-            let res = match job {
-                Some(job) => crate::export::estimate(&ctx2, &job),
-                None => crate::projects::to_file(&doc).map(|b| crate::export::SizeEstimate { bytes: b.len() as u64, files: 1, approx: false }),
-            };
-            let _ = tx.send((opts, res));
-            ctx2.request_repaint();
+        self.export_size.start(ctx, opts, move || match job {
+            Some(job) => crate::export::estimate(&ctx2, &job),
+            None => crate::projects::to_file(&doc).map(|b| crate::export::SizeEstimate { bytes: b.len() as u64, files: 1, approx: false }),
         });
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     /// `bytes` as KB / MB / GB, with a decimal below 10.
@@ -5139,9 +5224,17 @@ impl BioCartoon {
             #[cfg(not(target_arch = "wasm32"))]
             Action::DownloadTemplate(row) => self.download_template(*row),
             #[cfg(target_arch = "wasm32")]
-            Action::DownloadTemplate(_) => {}
+            Action::DownloadTemplate(row) => {
+                if self.offline.job.is_some() {
+                    self.toast("A download is already running");
+                } else {
+                    self.toast(format!("Downloading {}...", row.meta.title));
+                    let job = crate::offline::start_template(self.ui_ctx(), self.catalog.db_path.clone(), self.settings.asset_base_url.clone(), *row);
+                    self.offline.job = Some(job);
+                }
+            }
             Action::Downloaded { title } => {
-                // Recount Settings > Offline and the Downloads filter.
+                // Recount Settings > Bulk download and the Downloads filter.
                 self.offline_rescan();
                 self.toast(format!("Downloaded {title} for offline use"));
             }
@@ -5389,7 +5482,7 @@ impl BioCartoon {
                     if let Some(it) = self.item(item).cloned() {
                         if let ItemKind::Image { source, layers, .. } = &it.kind {
                             if let Some((image, svg)) = self.ai_input(source, layers) {
-                                self.ai.submit(AiJob::Edit { item, image, svg, op: AiOp::Custom(msg) });
+                                self.ai.submit(AiJob::Edit { item, doc: self.doc_epoch, image, svg, op: AiOp::Custom(msg) });
                             }
                         }
                     }
@@ -5463,6 +5556,9 @@ impl BioCartoon {
                 if self.doc.slides.len() > 1 {
                     self.commit();
                     self.doc.slides.remove(i);
+                    if i < self.cur_slide {
+                        self.cur_slide -= 1;
+                    }
                     self.cur_slide = self.cur_slide.min(self.doc.slides.len() - 1);
                     self.selection.clear();
                 }
@@ -5470,9 +5566,16 @@ impl BioCartoon {
             Action::MoveSlide(i, d) => {
                 let j = i as isize + d;
                 if j >= 0 && (j as usize) < self.doc.slides.len() {
+                    let j = j as usize;
                     self.commit();
-                    self.doc.slides.swap(i, j as usize);
-                    self.cur_slide = j as usize;
+                    self.doc.slides.swap(i, j);
+                    // Stay on the slide that was on screen, wherever it went.
+                    if self.cur_slide == i {
+                        self.cur_slide = j;
+                    } else if self.cur_slide == j {
+                        self.cur_slide = i;
+                    }
+                    self.prune_selection();
                 }
             }
             Action::GoSlide(i) => {
@@ -5692,10 +5795,10 @@ impl BioCartoon {
             if i.key_pressed(Key::ArrowRight) { d.x += nudge; }
             if i.key_pressed(Key::ArrowUp) { d.y -= nudge; }
             if i.key_pressed(Key::ArrowDown) { d.y += nudge; }
-            if d != Vec2::ZERO && !self.selection.is_empty() {
+            let movable = self.selected_items().iter().any(|it| !it.locked);
+            if d != Vec2::ZERO && movable {
                 let sel = self.selection.clone();
-                self.history.push((self.doc.clone(), self.cur_slide));
-                self.dirty = true;
+                self.commit();
                 for it in self.slide_mut().items.iter_mut() {
                     if sel.contains(&it.id) && !it.locked {
                         it.pos[0] += d.x;
@@ -5883,54 +5986,83 @@ impl BioCartoon {
         }
     }
 
+    /// The editor menu's spelling items: a submenu on a computer, folded out in place on a phone.
+    fn spelling_menu_items(&mut self, ui: &mut egui::Ui) {
+        // A button rather than ui.checkbox so the box sits on the right.
+        let view = self.settings.show_spelling;
+        let check = if view { ph::CHECK_SQUARE } else { ph::SQUARE };
+        if ui.add(egui::Button::new("View spelling and grammar").right_text(check)).on_hover_text("Underline mistakes in red (spelling) and blue (grammar) while you edit").clicked() {
+            self.settings.show_spelling = !view;
+        }
+        if ui.button("Check spelling and grammar...").clicked() { self.show_spell_window = true; ui.close(); }
+        if ui.button("Add to dictionary...").on_hover_text("Words the spelling check should accept: type them in or upload a list").clicked() { self.show_dict_window = true; ui.close(); }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::symmetric(10, 6));
         egui::Panel::top("topbar").exact_size(46.0).frame(frame).show_separator_line(false).show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 egui::Frame::new().fill(theme::panel()).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
-                    ui.menu_button(egui::RichText::new(ph::LIST).size(18.0), |ui| {
-                        if ui.button("All projects").clicked() { self.actions.push(Action::GoHome); ui.close(); }
-                        if ui.add_enabled(!self.settings.show_icons, egui::Button::new(format!("{}  Show artwork menu", ph::DNA)))
-                            .on_hover_text("Open the Artwork panel on the left")
-                            .on_disabled_hover_text("Artwork menu is already up")
-                            .clicked()
-                        {
-                            self.settings.show_icons = true;
-                            ui.close();
-                        }
-                        if ui.add_enabled(!self.settings.show_rail, egui::Button::new(format!("{}  Show options menu", ph::WRENCH)))
-                            .on_hover_text("Show the tools on the right (Edit, Text, Lines...)")
-                            .on_disabled_hover_text("Options menu is already up")
-                            .clicked()
-                        {
-                            self.settings.show_rail = true;
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("New").clicked() { self.actions.push(Action::NewDoc); ui.close(); }
-                        if ui.button("Open file...").clicked() { self.actions.push(Action::Open); ui.close(); }
-                        if ui.button("Save").clicked() { self.actions.push(Action::Save); ui.close(); }
-                        if ui.button("Save as .biocartoon file...").on_hover_text("A copy of the whole project, still editable: anyone can open it with Open file").clicked() { self.actions.push(Action::SaveAs); ui.close(); }
-                        if ui.button("Version history...").clicked() { self.actions.push(Action::VersionHistory); ui.close(); }
-                        ui.separator();
-                        // A button rather than ui.checkbox so the box sits on the right.
-                        let view = self.settings.show_spelling;
-                        let check = if view { ph::CHECK_SQUARE } else { ph::SQUARE };
-                        if ui.add(egui::Button::new("View spelling and grammar").right_text(check)).on_hover_text("Underline mistakes in red (spelling) and blue (grammar) while you edit").clicked() {
-                            self.settings.show_spelling = !view;
-                        }
-                        if ui.button("Check spelling and grammar...").clicked() { self.show_spell_window = true; ui.close(); }
-                        if ui.button("Add to dictionary...").on_hover_text("Words the spelling check should accept: type them in or upload a list").clicked() { self.show_dict_window = true; ui.close(); }
-                        ui.separator();
-                        if ui.button("Export...").clicked() { self.actions.push(Action::OpenExport); ui.close(); }
-                        if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = Some(self.cur_slide); self.attributions_all_slides = false; self.attributions_export = None; ui.close(); }
-                        ui.separator();
-                        if ui.button("Settings...").clicked() { self.open_settings(SettingsTab::General); ui.close(); }
-                        if ui.button(if cfg!(target_arch = "wasm32") { "Bulk download..." } else { "Download..." }).clicked() { self.open_settings(SettingsTab::Offline); ui.close(); }
-                        if ui.button("I'm feeling lucky").on_hover_text("Insert a random icon from the library").clicked() { self.actions.push(Action::InsertRandom); ui.close(); }
-                        if ui.button("About BioCartoon").clicked() { self.show_about = true; ui.close(); }
-                        // A browser tab is closed by the browser.
-                        if !cfg!(target_arch = "wasm32") && ui.button("Quit").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
+                    // Closes only on a click outside: each item closes it itself, so the phone's
+                    // Spelling and grammar toggle (and View spelling's checkbox) can leave it open.
+                    let config = egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+                    egui::containers::menu::MenuButton::new(egui::RichText::new(ph::LIST).size(18.0)).config(config).ui(ui, |ui| {
+                        // Scrolls rather than running off a short (phone) screen. The popup offers less height than
+                        // the screen has, so the minimum keeps the scroll area from stopping halfway down.
+                        let max_h = ui.ctx().content_rect().height() - 60.0;
+                        egui::ScrollArea::vertical().max_height(max_h.max(120.0)).min_scrolled_height(max_h.max(120.0)).show(ui, |ui| {
+                            if ui.add_enabled(!self.settings.show_icons, egui::Button::new(format!("{}  Show artwork menu", ph::DNA)))
+                                .on_hover_text("Open the Artwork panel on the left")
+                                .on_disabled_hover_text("Artwork menu is already up")
+                                .clicked()
+                            {
+                                self.settings.show_icons = true;
+                                ui.close();
+                            }
+                            if ui.add_enabled(!self.settings.show_rail, egui::Button::new(format!("{}  Show options menu", ph::WRENCH)))
+                                .on_hover_text("Show the tools on the right (Edit, Text, Lines...)")
+                                .on_disabled_hover_text("Options menu is already up")
+                                .clicked()
+                            {
+                                self.settings.show_rail = true;
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("All projects").clicked() { self.actions.push(Action::GoHome); ui.close(); }
+                            if ui.button("New").clicked() { self.actions.push(Action::NewDoc); ui.close(); }
+                            if ui.button("Open file...").clicked() { self.actions.push(Action::Open); ui.close(); }
+                            if ui.button("Save").clicked() { self.actions.push(Action::Save); ui.close(); }
+                            if ui.button(if cfg!(target_arch = "wasm32") { "Download .biocartoon" } else { "Save .biocartoon..." }).on_hover_text("A copy of the whole project, still editable: anyone can open it with Open file").clicked() { self.actions.push(Action::SaveAs); ui.close(); }
+                            if ui.button("Version history...").clicked() { self.actions.push(Action::VersionHistory); ui.close(); }
+                            ui.separator();
+                            // A phone opens a submenu when a scroll passes over it and has no way to close
+                            // it again, so there the items fold out below a button that toggles them.
+                            if phone_width(ui.ctx()) {
+                                let id = egui::Id::new("menu_spelling_open");
+                                let open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+                                let caret = if open { ph::CARET_DOWN } else { ph::CARET_RIGHT };
+                                if ui.add(egui::Button::new("Spelling and grammar").right_text(caret)).clicked() {
+                                    ui.data_mut(|d| d.insert_temp(id, !open));
+                                }
+                                if open {
+                                    ui.indent(id, |ui| self.spelling_menu_items(ui));
+                                }
+                            } else {
+                                ui.menu_button("Spelling and grammar", |ui| self.spelling_menu_items(ui));
+                            }
+                            ui.separator();
+                            if ui.button("Share...").on_hover_text("Get a link to this project for a collaborator").clicked() { self.share.show = true; ui.close(); }
+                            if ui.button("Export...").clicked() { self.actions.push(Action::OpenExport); ui.close(); }
+                            if ui.button("Show credits...").on_hover_text("Credits for the library artwork in this document, ready for a figure legend").clicked() { self.show_attributions = true; self.attributions_slide = Some(self.cur_slide); self.attributions_all_slides = false; self.attributions_export = None; ui.close(); }
+                            ui.separator();
+                            if ui.button("Settings...").clicked() { self.open_settings(SettingsTab::General); ui.close(); }
+                            if ui.button("Bulk download...").clicked() { self.open_settings(SettingsTab::Offline); ui.close(); }
+                            if ui.button("I'm feeling lucky").on_hover_text("Insert a random icon from the library").clicked() { self.actions.push(Action::InsertRandom); ui.close(); }
+                            if ui.button("Snake").on_hover_text("Play Snake on the page: arrow keys steer, Esc stops").clicked() { self.start_snake(ui.ctx()); ui.close(); }
+                            if ui.button("About BioCartoon").clicked() { self.show_about = true; ui.close(); }
+                            // A browser tab is closed by the browser.
+                            if !cfg!(target_arch = "wasm32") && ui.button("Quit").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
+                        });
                     });
                     if ui.add(crate::logo(ui.ctx(), 22.0).sense(egui::Sense::click()))
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -6123,112 +6255,116 @@ impl BioCartoon {
         // Settings
         if self.show_settings {
             let mut open = true;
-            egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).default_width(620.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.settings_tab, SettingsTab::General, "General");
-                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Ai, "AI");
-                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Offline, crate::offline::TAB_LABEL);
-                });
-                ui.separator();
-                // Edits apply (and are saved) right away, so there's no Save button.
-                let mut restore = None;
-                let d = &mut self.settings;
-                let ai_before = (d.ai_provider, d.ai_model.clone(), d.api_key.clone(), d.ai_base_url.clone(), d.ai_prompts.clone());
-                match self.settings_tab {
-                    SettingsTab::General => {
-                        egui::Grid::new("general_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
-                            ui.label("Appearance");
-                            ui.horizontal(|ui| {
-                                for m in theme::ThemeMode::ALL {
-                                    ui.selectable_value(&mut d.theme, m, m.label());
-                                }
-                            });
-                            ui.end_row();
-                            // Like VS Code's preferred dark and light themes: Appearance picks which
-                            // one shows. Picking one that isn't showing switches to it, unless
-                            // Appearance follows the system.
-                            let showing_dark = d.theme.is_dark(ctx);
-                            for dark in [true, false] {
-                                ui.label(if dark { "Dark theme" } else { "Light theme" });
-                                let slot = if dark { &mut d.dark_theme } else { &mut d.light_theme };
-                                let before = *slot;
-                                ui.horizontal(|ui| {
-                                    theme::swatch(ui, *slot);
-                                    egui::ComboBox::from_id_salt(if dark { "dark_theme" } else { "light_theme" }).selected_text(slot.label()).width(220.0).show_ui(ui, |ui| {
-                                        for t in theme::ColorTheme::of(dark) {
-                                            ui.horizontal(|ui| {
-                                                theme::swatch(ui, t);
-                                                ui.selectable_value(slot, t, t.label());
-                                            });
-                                        }
+            // Phones: no wider than the screen (the theme pickers narrow to fit), and scrolling once it is too tall.
+            let width = dialog_width(ctx, 620.0);
+            egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).default_width(width).max_width(width).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                // The window's inner width (its width less the margins), which its title bar spans.
+                let inner = ui.available_width();
+                dialog_body(ui, egui::Id::new("settings_body"), |ui| {
+                    // No wider than the title bar, even in dialog_body's scroll area, which has no width limit.
+                    ui.set_max_width(inner);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::General, "General");
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::Ai, "AI");
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::Offline, crate::offline::TAB_LABEL);
+                    });
+                    ui.separator();
+                    // Edits apply (and are saved) right away, so there's no Save button.
+                    let mut restore = None;
+                    let d = &mut self.settings;
+                    let ai_before = (d.ai_provider, d.ai_model.clone(), d.api_key.clone(), d.ai_base_url.clone(), d.ai_prompts.clone());
+                    match self.settings_tab {
+                        SettingsTab::General => {
+                            egui::Grid::new("general_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                                ui.label("Appearance");
+                                let modes = theme::ThemeMode::ALL;
+                                packed_rows(ui, &modes.map(|m| m.label()), false, |ui, i| {
+                                    ui.selectable_value(&mut d.theme, modes[i], modes[i].label());
+                                });
+                                ui.end_row();
+                                // Like VS Code's preferred dark and light themes: Appearance picks which
+                                // one shows. Picking one that isn't showing switches to it, unless
+                                // Appearance follows the system.
+                                let showing_dark = d.theme.is_dark(ctx);
+                                for dark in [true, false] {
+                                    ui.label(if dark { "Dark theme" } else { "Light theme" });
+                                    let slot = if dark { &mut d.dark_theme } else { &mut d.light_theme };
+                                    let before = *slot;
+                                    ui.horizontal(|ui| {
+                                        theme::swatch(ui, *slot);
+                                        egui::ComboBox::from_id_salt(if dark { "dark_theme" } else { "light_theme" }).selected_text(slot.label()).width(ui.available_width().min(220.0)).truncate().show_ui(ui, |ui| {
+                                            for t in theme::ColorTheme::of(dark) {
+                                                ui.horizontal(|ui| {
+                                                    theme::swatch(ui, t);
+                                                    ui.selectable_value(slot, t, t.label());
+                                                });
+                                            }
+                                        });
                                     });
-                                    if dark != showing_dark && d.theme == theme::ThemeMode::System {
-                                        let mode = if dark { "dark" } else { "light" };
-                                        let hint = format!("Shown when the system is {mode}");
-                                        ui.label(egui::RichText::new(hint).small().color(theme::text_dim()));
+                                    if *slot != before && dark != showing_dark && d.theme != theme::ThemeMode::System {
+                                        d.theme = if dark { theme::ThemeMode::Dark } else { theme::ThemeMode::Light };
+                                    }
+                                    ui.end_row();
+                                }
+                                ui.label("Text size");
+                                egui::ComboBox::from_id_salt("text_size").selected_text(d.text_size.label()).width(160.0).show_ui(ui, |ui| {
+                                    for t in theme::TextSize::ALL {
+                                        ui.selectable_value(&mut d.text_size, t, t.label());
                                     }
                                 });
-                                if *slot != before && dark != showing_dark && d.theme != theme::ThemeMode::System {
-                                    d.theme = if dark { theme::ThemeMode::Dark } else { theme::ThemeMode::Light };
-                                }
                                 ui.end_row();
-                            }
-                            ui.label("Text size");
-                            egui::ComboBox::from_id_salt("text_size").selected_text(d.text_size.label()).width(160.0).show_ui(ui, |ui| {
-                                for t in theme::TextSize::ALL {
-                                    ui.selectable_value(&mut d.text_size, t, t.label());
-                                }
+                                ui.label("Icon columns");
+                                ui.horizontal(|ui| {
+                                    for n in 1..=5 {
+                                        ui.selectable_value(&mut d.icon_columns, n, n.to_string());
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label("On icons");
+                                packed_rows(ui, &["Database", "Multicolor", "Stars"], true, |ui, i| {
+                                    match i {
+                                        0 => ui.checkbox(&mut d.tile_database, "Database").on_hover_text("The database's badge, lower left"),
+                                        1 => ui.checkbox(&mut d.tile_colors, "Multicolor").on_hover_text("A color wheel on icons that come in several colors"),
+                                        _ => ui.checkbox(&mut d.tile_stars, "Stars").on_hover_text("The star and how many people starred the icon, upper right. Without it, your favorites still show a gold star."),
+                                    };
+                                });
+                                ui.end_row();
+                                ui.label("Saving");
+                                ui.checkbox(&mut d.autosave, "Save changes automatically").on_hover_text("Off: changes are saved only with Cmd+S, and BioCartoon asks before you leave a project or quit with unsaved changes");
+                                ui.end_row();
                             });
-                            ui.end_row();
-                            ui.label("Icon columns");
+                            ui.add_space(10.0);
+                            ui.separator();
                             ui.horizontal(|ui| {
-                                for n in 1..=5 {
-                                    ui.selectable_value(&mut d.icon_columns, n, n.to_string());
+                                if ui.button("Restore default settings").on_hover_text("Appearance, icons, grid and snapping, export options and AI prompts go back to their defaults").clicked() {
+                                    self.confirm_restore_settings = true;
+                                }
+                                if ui.add_enabled(self.settings_before_restore.is_some(), egui::Button::new(format!("{}  Undo", ph::ARROW_COUNTER_CLOCKWISE))).on_hover_text("Bring back the settings you had before restoring the defaults").clicked() {
+                                    if let Some(before) = self.settings_before_restore.take() {
+                                        restore = Some(before);
+                                    }
                                 }
                             });
-                            ui.end_row();
-                            ui.label("On icons");
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut d.tile_database, "Database").on_hover_text("The database's badge, lower left");
-                                ui.checkbox(&mut d.tile_colors, "Multicolor").on_hover_text("A color wheel on icons that come in several colors");
-                                ui.checkbox(&mut d.tile_stars, "Stars").on_hover_text("The star and how many people starred the icon, upper right. Without it, your favorites still show a gold star.");
-                            });
-                            ui.end_row();
-                            ui.label("Saving");
-                            ui.checkbox(&mut d.autosave, "Save changes automatically").on_hover_text("Off: changes are saved only with Cmd+S, and BioCartoon asks before you leave a project or quit with unsaved changes");
-                            ui.end_row();
-                        });
-                        ui.add_space(10.0);
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui.button("Restore default settings").on_hover_text("Appearance, icons, grid and snapping, export options and AI prompts go back to their defaults").clicked() {
-                                self.confirm_restore_settings = true;
-                            }
-                            if ui.add_enabled(self.settings_before_restore.is_some(), egui::Button::new(format!("{}  Undo", ph::ARROW_COUNTER_CLOCKWISE))).on_hover_text("Bring back the settings you had before restoring the defaults").clicked() {
-                                if let Some(before) = self.settings_before_restore.take() {
-                                    restore = Some(before);
-                                }
-                            }
-                        });
+                        }
+                        SettingsTab::Ai => {
+                            ai_fields(ui, &mut d.ai_provider, &mut d.ai_model, &mut d.api_key, &mut d.ai_base_url);
+                            ui.add_space(10.0);
+                            ui.checkbox(&mut d.auto_library_generated, "Automatically add images to your library").on_hover_text("Every image generated with AI goes into Your library as soon as it arrives");
+                            ui.add_space(10.0);
+                            ui.separator();
+                            let svg = d.ai_provider.draws_svg(&d.ai_model);
+                            ai_prompt_fields(ui, &mut d.ai_prompts, svg);
+                        }
+                        SettingsTab::Offline => self.offline_tab(ui),
                     }
-                    SettingsTab::Ai => {
-                        ai_fields(ui, &mut d.ai_provider, &mut d.ai_model, &mut d.api_key, &mut d.ai_base_url);
-                        ui.add_space(10.0);
-                        ui.checkbox(&mut d.auto_library_generated, "Automatically add images to your library").on_hover_text("Every image generated with AI goes into Your library as soon as it arrives");
-                        ui.add_space(10.0);
-                        ui.separator();
-                        let svg = d.ai_provider.draws_svg(&d.ai_model);
-                        ai_prompt_fields(ui, &mut d.ai_prompts, svg);
+                    let d = &self.settings;
+                    if (d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts) != (ai_before.0, &ai_before.1, &ai_before.2, &ai_before.3, &ai_before.4) {
+                        self.ai.set_backend(d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts);
                     }
-                    SettingsTab::Offline => self.offline_tab(ui),
-                }
-                let d = &self.settings;
-                if (d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts) != (ai_before.0, &ai_before.1, &ai_before.2, &ai_before.3, &ai_before.4) {
-                    self.ai.set_backend(d.ai_provider, &d.ai_model, &d.api_key, &d.ai_base_url, &d.ai_prompts);
-                }
-                if let Some(before) = restore {
-                    self.replace_settings(before);
-                }
+                    if let Some(before) = restore {
+                        self.replace_settings(before);
+                    }
+                })
             });
             if !open {
                 self.show_settings = false;
@@ -6330,7 +6466,7 @@ impl BioCartoon {
         }
 
         // How projects, and Your library, are saved without an account (web)
-        if self.show_storage_notice && !storage_notice(ctx, "Saving your projects", "your projects", "download a backup from the home screen or save a project as a .biocartoon file, or sign in to keep a copy online", &mut self.settings.hide_project_notice) {
+        if self.show_storage_notice && !storage_notice(ctx, "Saving your projects", "your projects", "download a backup from the home screen or download a project as a .biocartoon file, or sign in to keep a copy online", &mut self.settings.hide_project_notice) {
             self.show_storage_notice = false;
         }
         if self.show_library_notice && !storage_notice(ctx, "Saving your library", "the icons and templates in Your library, and your favorites,", "sign in from the home screen to keep a copy online", &mut self.settings.hide_library_notice) {
@@ -7270,7 +7406,11 @@ impl BioCartoon {
 /// The AI settings tab's editors for the prompt text sent with each request. The system
 /// prompts are left out when the selected model is an image model, which never sees them.
 /// One `.biocartoon` file opens in the editor; several, or a .zip backup, are imported as projects.
-fn open_paths(tx: &std::sync::mpsc::Sender<Action>, mut paths: Vec<PathBuf>) {
+/// The same file given twice counts once: Finder can hand over a double-clicked file twice, which
+/// would otherwise import it twice instead of opening it.
+fn open_paths(tx: &std::sync::mpsc::Sender<Action>, paths: Vec<PathBuf>) {
+    let mut seen = HashSet::new();
+    let mut paths: Vec<PathBuf> = paths.into_iter().filter(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))).collect();
     if paths.is_empty() {
         return;
     }
@@ -7464,56 +7604,208 @@ impl eframe::App for BioCartoon {
     }
 }
 
-/// Open a new mail message with `files` attached (Mail on macOS). Falls back to a mailto: link
-/// and showing the files, since mailto: can't carry attachments.
+type SizeResult = Result<crate::export::SizeEstimate, String>;
+
+/// A dialog's file size: the last estimate, with the options it was worked out for, and the one
+/// being worked out.
+#[derive(Default)]
+struct SizeEstimates {
+    done: Option<(ExportOptions, SizeResult)>,
+    rx: Option<std::sync::mpsc::Receiver<(ExportOptions, SizeResult)>>,
+    /// Options not estimated yet, and since when they've been asked for (see [`Self::settled`]).
+    waiting: Option<(ExportOptions, f64)>,
+}
+
+impl SizeEstimates {
+    /// Collect a finished estimate. True when none is running and the last one isn't for `opts`.
+    fn needs(&mut self, ctx: &egui::Context, opts: &ExportOptions) -> bool {
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(done) => {
+                    self.done = Some(done);
+                    self.rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return false;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.rx = None,
+            }
+        }
+        !self.done.as_ref().is_some_and(|(o, _)| o == opts) && self.settled(ctx, opts)
+    }
+
+    /// In the browser an estimate runs on the UI thread (there are no threads), and a big one
+    /// takes long enough to freeze the page, so it waits until the options have stayed the same
+    /// for a moment: typing "4000" into a pixel box runs one estimate, not four. The desktop
+    /// works them out on a thread and starts straight away.
+    fn settled(&mut self, ctx: &egui::Context, opts: &ExportOptions) -> bool {
+        if !cfg!(target_arch = "wasm32") {
+            return true;
+        }
+        const QUIET: f64 = 0.4;
+        let now = ctx.input(|i| i.time);
+        let since = match &self.waiting {
+            Some((o, t)) if o == opts => *t,
+            _ => {
+                self.waiting = Some((opts.clone(), now));
+                now
+            }
+        };
+        let left = since + QUIET - now;
+        if left > 0.0 {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+            return false;
+        }
+        self.waiting = None;
+        true
+    }
+
+    fn start(&mut self, ctx: &egui::Context, opts: ExportOptions, work: impl FnOnce() -> SizeResult + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx2 = ctx.clone();
+        self.rx = Some(rx);
+        crate::platform::spawn("export size", move || {
+            let _ = tx.send((opts, work()));
+            ctx2.request_repaint();
+        });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The last size, e.g. "~1.2 MB in 3 files", marked " ..." while the options it is for
+    /// have changed since; None before the first one is in.
+    fn note(&self, opts: &ExportOptions) -> Option<String> {
+        let (o, res) = self.done.as_ref()?;
+        let updating = if o == opts { "" } else { " ..." };
+        Some(match res {
+            Ok(est) => {
+                let files = if est.files > 1 { format!(" in {} files", est.files) } else { String::new() };
+                format!("{}{}{files}{updating}", if est.approx { "~" } else { "" }, BioCartoon::file_size(est.bytes))
+            }
+            Err(_) => format!("unknown{updating}"),
+        })
+    }
+
+    /// "720 × 850 px · 1.2 MB", for under the resolution.
+    fn line(&self, dims: &str, opts: &ExportOptions) -> String {
+        format!("{dims} · {}", self.note(opts).unwrap_or_else(|| "...".into()))
+    }
+}
+
+const DPI_PRESETS: [u32; 4] = [72, 150, 300, 600];
+
+/// "[W] × [H]" pixel fields for `region` rendered at `dpi`. Typing either one sets the dpi that
+/// fits it (the other side follows, keeping the shape), shown in `dpi_picker`'s "other" box
+/// (`dpi_id`) unless it is a preset. The dpi is whole, so the size can land a pixel or two off
+/// what was typed; the fields show what will be saved once they lose focus.
+fn pixel_size_fields(ui: &mut egui::Ui, region: Rect, dpi: &mut u32, dpi_id: egui::Id, id: egui::Id) {
+    let range = crate::export::MIN_DPI..=crate::export::MAX_DPI;
+    let [w, h] = crate::export::pixel_size(region, *dpi);
+    for (axis, px, len) in [(0, w, region.width()), (1, h, region.height())] {
+        if axis == 1 {
+            ui.label("×");
+        }
+        let fid = id.with(axis);
+        let mut text: String = ui.data_mut(|d| d.get_temp(fid)).unwrap_or_else(|| px.to_string());
+        // Room for five digits (the largest size, 2400 dpi across the page).
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let digit = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
+        let r = ui
+            .add(egui::TextEdit::singleline(&mut text).desired_width(digit * 5.0 + 2.0).char_limit(5))
+            .on_hover_text(if axis == 0 { "Width in pixels: type one to set the resolution that fits it" } else { "Height in pixels: type one to set the resolution that fits it" });
+        let fit = |t: &str| t.parse::<f32>().ok().filter(|v| *v > 0.0).map(|v| (v * DPI / len).round() as u32);
+        let mut set = |ui: &mut egui::Ui, d: u32| {
+            *dpi = d;
+            ui.data_mut(|m| m.insert_temp(dpi_id, if DPI_PRESETS.contains(&d) { String::new() } else { d.to_string() }));
+            ui.ctx().request_repaint();
+        };
+        if r.changed() {
+            text.retain(|c| c.is_ascii_digit());
+            if let Some(d) = fit(&text).filter(|d| range.contains(d)) {
+                set(ui, d);
+            }
+        }
+        if r.has_focus() {
+            ui.data_mut(|d| d.insert_temp(fid, text));
+        } else {
+            if r.lost_focus() {
+                if let Some(d) = fit(&text) {
+                    set(ui, d.clamp(*range.start(), *range.end()));
+                }
+            }
+            ui.data_mut(|d| d.remove::<String>(fid));
+        }
+    }
+}
+
 /// The resolution choices of the export and "Save as picture" dialogs: the presets, and an
 /// "other" box that is selected only while a number typed into it is the resolution. A partly
 /// typed number ("1" on the way to "1200") only takes effect once it is in range. Leaving the
 /// box with a number below the minimum (or nothing) empties it, and the resolution goes back to
 /// the default unless a preset is chosen; one above the maximum becomes the maximum.
 fn dpi_picker(ui: &mut egui::Ui, dpi: &mut u32, id: egui::Id, presets_row: bool) {
-    const PRESETS: [u32; 4] = [72, 150, 300, 600];
+    const PRESETS: [u32; 4] = DPI_PRESETS;
     let range = crate::export::MIN_DPI..=crate::export::MAX_DPI;
     let mut custom: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| if PRESETS.contains(dpi) { String::new() } else { dpi.to_string() });
-    let mut presets = |ui: &mut egui::Ui| {
+    const FIELD_WIDTH: f32 = 64.0;
+    let custom_field = |ui: &mut egui::Ui, dpi: &mut u32, custom: &mut String| {
+        let active = custom.parse::<u32>().ok() == Some(*dpi);
+        let mut edit = egui::TextEdit::singleline(custom).desired_width(FIELD_WIDTH).hint_text("other");
+        if active {
+            edit = edit.background_color(ui.visuals().selection.bg_fill).text_color(ui.visuals().selection.stroke.color);
+        }
+        let r = ui.add(edit);
+        if r.changed() {
+            custom.retain(|c| c.is_ascii_digit());
+            if let Some(v) = custom.parse::<u32>().ok().filter(|v| range.contains(v)) {
+                *dpi = v;
+            }
+        }
+        if r.lost_focus() {
+            match custom.parse::<u32>() {
+                Ok(v) if v > *range.end() => *dpi = *range.end(),
+                Ok(v) if range.contains(&v) => *dpi = v,
+                _ => custom.clear(),
+            }
+            if custom.is_empty() && !PRESETS.contains(dpi) {
+                *dpi = ExportOptions::default().dpi;
+            }
+            *custom = if PRESETS.contains(dpi) { String::new() } else { dpi.to_string() };
+        }
+    };
+    // Presets then the custom field, in rows that wrap to the width (in a vertical `ui`), or in
+    // `ui`'s row.
+    if presets_row {
+        let labels = PRESETS.map(|d| d.to_string());
+        let mut widths: Vec<f32> = labels.iter().map(|l| packed_width(ui, l, false)).collect();
+        let st = &ui.style().spacing;
+        widths.push(FIELD_WIDTH + 2.0 * st.button_padding.x + st.item_spacing.x);
+        packed_rows_by_width(ui, &widths, |ui, i| {
+            if i < PRESETS.len() {
+                if ui.selectable_value(dpi, PRESETS[i], &labels[i]).clicked() {
+                    custom.clear();
+                }
+            } else {
+                custom_field(ui, dpi, &mut custom);
+            }
+        });
+    } else {
         for d in PRESETS {
             if ui.selectable_value(dpi, d, d.to_string()).clicked() {
                 custom.clear();
             }
         }
-    };
-    // In a row of their own (in a vertical `ui`, with the custom field under them), or in `ui`'s.
-    if presets_row {
-        ui.horizontal(presets);
-    } else {
-        presets(ui);
-    }
-    let active = custom.parse::<u32>().ok() == Some(*dpi);
-    let mut edit = egui::TextEdit::singleline(&mut custom).desired_width(64.0).hint_text("other");
-    if active {
-        edit = edit.background_color(ui.visuals().selection.bg_fill).text_color(ui.visuals().selection.stroke.color);
-    }
-    let r = ui.add(edit);
-    if r.changed() {
-        custom.retain(|c| c.is_ascii_digit());
-        if let Some(v) = custom.parse::<u32>().ok().filter(|v| range.contains(v)) {
-            *dpi = v;
-        }
-    }
-    if r.lost_focus() {
-        match custom.parse::<u32>() {
-            Ok(v) if v > *range.end() => *dpi = *range.end(),
-            Ok(v) if range.contains(&v) => *dpi = v,
-            _ => custom.clear(),
-        }
-        if custom.is_empty() && !PRESETS.contains(dpi) {
-            *dpi = ExportOptions::default().dpi;
-        }
-        custom = if PRESETS.contains(dpi) { String::new() } else { dpi.to_string() };
+        custom_field(ui, dpi, &mut custom);
     }
     ui.data_mut(|d| d.insert_temp(id, custom));
 }
 
+/// Open a new mail message with `files` attached (Mail on macOS). Falls back to a mailto: link
+/// and showing the files, since mailto: can't carry attachments.
 fn open_mail(subject: &str, files: &[PathBuf]) {
     #[cfg(target_os = "macos")]
     {

@@ -1,8 +1,8 @@
-//! A hidden snake game on the page: Ctrl+Option+Cmd+T starts one (or a new one), the arrow keys
-//! steer, and Escape puts it away. The snake and the dot are drawn in whichever of black or white
-//! stands out against the page; the page edge, the snake itself and anything on the slide end
-//! the game. Images obstruct only their visible artwork. Nothing runs while no
-//! game is open (`BioCartoon::snake` is `None`).
+//! A snake game on the page: Snake in the menu or Ctrl+Option+Cmd+T starts one (or a new one),
+//! the arrow keys (or, on a touch screen, the on-screen arrows) steer, and Escape puts it away.
+//! The snake and the dot are drawn in whichever of black or white stands out against the page;
+//! the page edge, the snake itself and anything on the slide end the game. Images obstruct only
+//! their visible artwork. Nothing runs while no game is open (`BioCartoon::snake` is `None`).
 
 use crate::app::BioCartoon;
 use crate::assets::ImageCache;
@@ -63,18 +63,23 @@ pub struct Snake {
     /// When the game ended, and the cell the snake ran into.
     over: Option<f64>,
     won: bool,
+    /// The slide left no room for the snake and a dot when the game began (not a win).
+    no_room: bool,
     crash: Option<(i32, i32)>,
     /// Which cells (row-major) something on the slide covers, as of the last step.
     walls: Vec<bool>,
     rng: u64,
+    /// Played by touch: shows the on-screen arrows (and says to tap them).
+    touch: bool,
 }
 
 impl Snake {
     pub fn new(slide: &Slide, page: Rect, now: f64, images: &mut ImageCache, ctx: &Context) -> Self {
         let cell = CELL;
         let (cols, rows) = (((page.width() / cell) as i32).max(4), ((page.height() / cell) as i32).max(4));
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
-        let mut s = Self { ctx: ctx.clone(), cell, cols, rows, body: VecDeque::new(), dir: Dir::Right, turns: VecDeque::new(), food: (0, 0), score: 0, started: None, next_step: now, over: None, won: false, crash: None, walls: Vec::new(), rng: seed | 1 };
+        // Not SystemTime, which panics in the browser.
+        let seed = u64::from_le_bytes(crate::share::random(8).try_into().unwrap_or([1; 8]));
+        let mut s = Self { ctx: ctx.clone(), cell, cols, rows, body: VecDeque::new(), dir: Dir::Right, turns: VecDeque::new(), food: (0, 0), score: 0, started: None, next_step: now, over: None, won: false, no_room: false, crash: None, walls: Vec::new(), rng: seed | 1, touch: false };
         s.find_walls(slide, images);
         // Start at the middle if three cells there are free, otherwise somewhere that is.
         let free3 = |s: &Snake, x: i32, y: i32| (0..3).all(|i| x - i >= 0 && !s.blocked((x - i, y)));
@@ -89,9 +94,9 @@ impl Snake {
             }
         }
         s.body = (0..3).map(|i| (head.0 - i, head.1)).collect();
-        if !s.place_food() {
+        if s.blocked(head) || !s.place_food() {
             s.over = Some(now);
-            s.won = true;
+            s.no_room = true;
         }
         s
     }
@@ -101,6 +106,12 @@ impl Snake {
             return;
         }
         if self.started.is_none() {
+            // The first press may point back along the snake: turn it around rather than drop
+            // the press and set off the other way.
+            if d == self.dir.opposite() {
+                self.body = self.body.iter().rev().copied().collect();
+                self.dir = d;
+            }
             self.started = Some(now);
             self.next_step = now + STEP;
         }
@@ -117,6 +128,15 @@ impl Snake {
             // Objects moved before the first arrow key still count.
             self.find_walls(slide, images);
             return None;
+        }
+        // Frames stop while the window is hidden; pick up where it left off instead of
+        // replaying every missed step at once (and the clock leaves the gap out).
+        let behind = now - self.next_step;
+        if behind > 2.0 * STEP {
+            self.next_step += behind;
+            if let Some(s) = &mut self.started {
+                *s += behind;
+            }
         }
         while self.over.is_none() && now >= self.next_step {
             self.step(slide, self.next_step, images);
@@ -197,7 +217,9 @@ impl Snake {
         // the cell needs a way in and a different way out. Count the head as a
         // possible entrance, but not the rest of the occupied body.
         if reachable.len() > 1 {
-            reachable.retain(|&(x, y)| {
+            let all = reachable.clone();
+            let mut safe = reachable;
+            safe.retain(|&(x, y)| {
                 [Dir::Up, Dir::Down, Dir::Left, Dir::Right]
                     .into_iter()
                     .map(Dir::delta)
@@ -207,6 +229,11 @@ impl Snake {
                     })
                     .count() >= 2
             });
+            // Every free cell is a dead end: one of them is still better than ending the game.
+            if safe.is_empty() {
+                safe = all;
+            }
+            reachable = safe;
         }
         if reachable.is_empty() {
             return false;
@@ -276,6 +303,13 @@ impl Snake {
         let r = Rect::from_min_max(Pos2::new(right - size.x, bottom - size.y), Pos2::new(right, bottom));
         painter.rect_filled(r.expand2(Vec2::new(8.0, 3.0)), 4.0, bg);
         painter.galley(r.min, galley, fg);
+        if self.started.is_none() && !self.won {
+            let hint = if self.touch { "Tap an arrow to start" } else { "Press an arrow key to start" };
+            let g = painter.layout_no_wrap(hint.into(), FontId::proportional(16.0), fg);
+            let at = Pos2::new(page_s.center().x - g.size().x / 2.0, page_s.top() + page_s.height() * 0.25);
+            painter.rect_filled(Rect::from_min_size(at, g.size()).expand2(Vec2::new(8.0, 4.0)), 4.0, bg);
+            painter.galley(at, g, fg);
+        }
         if let Some(c) = self.crash {
             painter.rect_filled(xf.rect(self.cell_rect(c)), 0.0, Color32::from_rgb(230, 50, 50));
         }
@@ -300,7 +334,13 @@ enum Choice {
 }
 
 impl BioCartoon {
-    /// Ctrl+Option+Cmd+T starts a game (a new one if one is open); while one is, the arrow keys
+    /// Opens a new game on the current slide (replacing one that's open).
+    pub fn start_snake(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        self.snake = Some(Snake::new(&self.doc.slides[self.cur_slide], self.doc.page_rect(), now, &mut self.images, ctx));
+    }
+
+    /// Ctrl+Option+Cmd+T (or Snake in the menu) starts a game (a new one if one is open); while one is, the arrow keys
     /// steer it instead of nudging the selection, Escape closes it, and Enter on the Game Over
     /// popup plays again.
     pub fn snake_keys(&mut self, ctx: &egui::Context) {
@@ -316,7 +356,7 @@ impl BioCartoon {
             i.events.len() != n
         });
         if start {
-            self.snake = Some(Snake::new(&self.doc.slides[self.cur_slide], self.doc.page_rect(), now, &mut self.images, ctx));
+            self.start_snake(ctx);
         }
         let Some(snake) = &mut self.snake else { return };
         if snake.over.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
@@ -349,6 +389,11 @@ impl BioCartoon {
         self.snake_best = self.snake_best.max(snake.score);
         snake.draw(painter, xf, page_s, bg, now, self.snake_best);
         if snake.over.is_none() {
+            let touch = crate::app::phone_width(ui.ctx()) || ui.input(|i| i.any_touches());
+            snake.touch |= touch;
+            if snake.touch && dpad(ui.ctx(), snake, now, page_s) {
+                self.snake = None;
+            }
             return;
         }
         let score = snake.score;
@@ -356,11 +401,11 @@ impl BioCartoon {
         let modal = egui::Modal::new(egui::Id::new("snake_over_modal")).show(ui.ctx(), |ui| {
             ui.set_width(260.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new(if snake.won { "You win" } else { "Game Over" }).size(26.0).strong());
+                ui.label(RichText::new(if snake.won { "You win" } else if snake.no_room { "No room" } else { "Game Over" }).size(26.0).strong());
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("Score: {score}")).size(16.0));
                 ui.add_space(2.0);
-                ui.label(if snake.won { "Congratulations!" } else { praise(score) });
+                ui.label(if snake.won { "Congratulations!" } else if snake.no_room { "The slide is too full to play on. Move things aside and try again." } else { praise(score) });
                 ui.add_space(12.0);
                 let w = ui.available_width();
                 let wide = |text: RichText| egui::Button::new(text).min_size(Vec2::new(w, 30.0)).corner_radius(6);
@@ -378,6 +423,68 @@ impl BioCartoon {
             None => {}
         }
     }
+}
+
+/// The on-screen arrows for touch screens: a cross of four buttons that steer on press (not on
+/// release, which would feel late), a close button until the game starts, and a grip in the
+/// middle to drag it anywhere.
+/// It starts centered below the page and stays where it was dragged until the app restarts.
+/// Returns true when the close button was tapped.
+fn dpad(ctx: &Context, snake: &mut Snake, now: f64, page_s: Rect) -> bool {
+    use egui_phosphor::regular as ph;
+    const B: f32 = 56.0;
+    let id = egui::Id::new("snake_dpad");
+    let screen = ctx.content_rect();
+    let below = Pos2::new(page_s.center().x - 1.5 * B - 6.0, (page_s.bottom() + 16.0).min(screen.bottom() - 3.0 * B - 60.0));
+    let pos = ctx.data(|d| d.get_temp::<Pos2>(id)).unwrap_or(below);
+    let mut close = false;
+    let shown = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .current_pos(pos)
+        .constrain(true)
+        .sense(egui::Sense::drag())
+        .show(ctx, |ui| {
+            egui::Frame::new().fill(theme::panel().gamma_multiply(0.85)).corner_radius(12).inner_margin(6).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let pressed = ui.input(|i| i.pointer.any_pressed());
+                let waiting = snake.started.is_none();
+                let mut key = |ui: &mut egui::Ui, icon: &str, dir: Dir| {
+                    let r = ui.add_sized([B, B], egui::Button::new(RichText::new(icon).size(30.0)).corner_radius(8).sense(egui::Sense::click_and_drag()));
+                    if pressed && r.contains_pointer() {
+                        snake.turn(dir, now);
+                    }
+                };
+                let blank = |ui: &mut egui::Ui| { ui.allocate_space(Vec2::splat(B)); };
+                ui.horizontal(|ui| {
+                    blank(ui);
+                    key(ui, ph::CARET_UP, Dir::Up);
+                    // Only before the first move, where a stray tap mid-game can't end it.
+                    if waiting {
+                        let x = ui.add_sized([B, B], egui::Button::new(RichText::new(ph::X).size(18.0)).frame(false)).on_hover_text("Stop playing");
+                        close = x.clicked();
+                    } else {
+                        blank(ui);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    key(ui, ph::CARET_LEFT, Dir::Left);
+                    ui.add_sized([B, B], egui::Label::new(RichText::new(ph::DOTS_SIX).size(20.0).color(theme::text_dim())).selectable(false))
+                        .on_hover_cursor(egui::CursorIcon::Grab);
+                    key(ui, ph::CARET_RIGHT, Dir::Right);
+                });
+                ui.horizontal(|ui| {
+                    blank(ui);
+                    key(ui, ph::CARET_DOWN, Dir::Down);
+                    blank(ui);
+                });
+            });
+        });
+    if shown.response.dragged() {
+        // Outside data_mut: drag_delta reads the input, and egui's lock isn't reentrant.
+        let to = shown.response.rect.min + shown.response.drag_delta();
+        ctx.data_mut(|d| d.insert_temp(id, to));
+    }
+    close
 }
 
 /// The visible mesh of each laid-out line, in page points. The editor uses the same
@@ -572,9 +679,36 @@ mod tests {
         Snake::new(slide, Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0 * DPI, 4.0 * DPI)), 0.0, images, &ctx)
     }
 
+    /// `steps` steps, a frame at each (as the app draws them while the game runs).
     fn run(s: &mut Snake, slide: &Slide, steps: u32, images: &mut ImageCache) {
-        let now = s.next_step + STEP * (steps as f64 - 1.0) + 1e-6;
-        s.update(slide, now, images);
+        for _ in 0..steps {
+            let now = s.next_step + 1e-6;
+            s.update(slide, now, images);
+        }
+    }
+
+    #[test]
+    fn a_hidden_window_pauses_instead_of_replaying() {
+        let slide = Slide::default();
+        let mut images = ImageCache::new(String::new(), None);
+        let mut s = game(&slide, &mut images);
+        s.turn(Dir::Right, 0.0);
+        let head = s.body[0];
+        // Back after a minute with no frames: at most one step, not hundreds into the edge.
+        s.update(&slide, 60.0, &mut images);
+        assert!(s.over.is_none());
+        assert!(s.body[0].0 - head.0 <= 1);
+    }
+
+    #[test]
+    fn a_first_press_backwards_turns_the_snake_around() {
+        let slide = Slide::default();
+        let mut images = ImageCache::new(String::new(), None);
+        let mut s = game(&slide, &mut images);
+        let tail = *s.body.back().unwrap();
+        s.turn(Dir::Left, 0.0);
+        assert!(s.dir == Dir::Left);
+        assert_eq!(s.body[0], tail);
     }
 
     #[test]

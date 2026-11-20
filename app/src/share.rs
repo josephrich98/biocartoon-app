@@ -144,8 +144,14 @@ pub fn unseal(bytes: &[u8], key: &str) -> Result<Vec<u8>, String> {
     let body = bytes.strip_prefix(MAGIC.as_slice()).filter(|b| b.len() > NONCE_LEN).ok_or("this isn't a shared BioCartoon project")?;
     let (nonce, sealed) = body.split_at(NONCE_LEN);
     let plain = cipher(key)?.decrypt(Nonce::from_slice(nonce), sealed).map_err(|_| "the link's key doesn't open this project (was the link copied in full?)".to_string())?;
+    // Whoever made the link holds its key, so the body may be a gzip bomb: stop well past any
+    // real project instead of inflating it without limit.
+    const LIMIT: u64 = 512 * 1024 * 1024;
     let mut file = Vec::new();
-    flate2::read::GzDecoder::new(plain.as_slice()).read_to_end(&mut file).map_err(|e| e.to_string())?;
+    flate2::read::GzDecoder::new(plain.as_slice()).take(LIMIT + 1).read_to_end(&mut file).map_err(|e| e.to_string())?;
+    if file.len() as u64 > LIMIT {
+        return Err("this shared project is too large to open".into());
+    }
     Ok(file)
 }
 

@@ -54,8 +54,9 @@ pub enum Part<'a> {
     File(&'a str, Vec<u8>, &'static str),
 }
 
-/// POST a multipart form to `<url>/submit`; returns the submission id.
-pub fn submit(url: &str, parts: &[Part]) -> Result<String, String> {
+/// POST a multipart form to `<url>/submit` in the background (desktop: a thread; web: a fetch);
+/// `done` gets the submission id.
+pub fn submit(url: &str, parts: &[Part], done: impl FnOnce(Result<String, String>) + Send + 'static) {
     let boundary = format!("biocartoon-{:x}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let mut body = Vec::new();
     for p in parts {
@@ -73,7 +74,7 @@ pub fn submit(url: &str, parts: &[Part]) -> Result<String, String> {
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    post(url, "submit", &format!("multipart/form-data; boundary={boundary}"), body)
+    post_async(url, "submit", format!("multipart/form-data; boundary={boundary}"), body, done)
 }
 
 /// Kinds of idea the "Submit an idea" form offers: (value sent, label).
@@ -101,13 +102,12 @@ pub fn check_email(s: &str) -> Result<String, String> {
     if ok { Ok(s.to_string()) } else { Err(format!("\"{s}\" doesn't look like an email address")) }
 }
 
-/// POST a suggestion; returns its id.
-pub fn suggest(url: &str, s: &Suggestion) -> Result<String, String> {
-    if cfg!(target_arch = "wasm32") {
-        return Err("Sending ideas isn't available in the web version yet.".into());
+/// POST a suggestion; `done` gets its id. Runs in the background (desktop: a thread; web: a fetch).
+pub fn suggest(url: &str, s: &Suggestion, done: impl FnOnce(Result<String, String>) + Send + 'static) {
+    match serde_json::to_vec(s) {
+        Ok(body) => post_async(url, "suggest", "application/json".into(), body, done),
+        Err(e) => done(Err(e.to_string())),
     }
-    let body = serde_json::to_vec(s).map_err(|e| e.to_string())?;
-    post(url, "suggest", "application/json", body)
 }
 
 /// A request to take an icon out of the BioCartoon library, sent to `<url>/removal`. A reviewer
@@ -124,19 +124,41 @@ pub struct RemovalRequest {
     pub email: String,
 }
 
-/// POST a removal request; returns its id.
-pub fn request_removal(url: &str, r: &RemovalRequest) -> Result<String, String> {
-    if cfg!(target_arch = "wasm32") {
-        return Err("Sending removal requests isn't available in the web version yet.".into());
+/// POST a removal request; `done` gets its id. Runs in the background, as [`suggest`] does.
+pub fn request_removal(url: &str, r: &RemovalRequest, done: impl FnOnce(Result<String, String>) + Send + 'static) {
+    match serde_json::to_vec(r) {
+        Ok(body) => post_async(url, "removal", "application/json".into(), body, done),
+        Err(e) => done(Err(e.to_string())),
     }
-    let body = serde_json::to_vec(r).map_err(|e| e.to_string())?;
-    post(url, "removal", "application/json", body)
 }
 
-/// Web build: submissions run inside blocking jobs, which the browser can't do yet.
+/// POST `body` to `<url>/<path>` in the background; `done` gets the id the Worker answers with.
+#[cfg(not(target_arch = "wasm32"))]
+fn post_async(url: &str, path: &str, content_type: String, body: Vec<u8>, done: impl FnOnce(Result<String, String>) + Send + 'static) {
+    let (url, path) = (url.to_string(), path.to_string());
+    crate::platform::spawn("submit", move || done(post(&url, &path, &content_type, body)));
+}
+
+/// Web: the same with fetch (the Worker answers the app's origin for these routes).
 #[cfg(target_arch = "wasm32")]
-fn post(_url: &str, _path: &str, _content_type: &str, _body: Vec<u8>) -> Result<String, String> {
-    Err("Submitting to the shared library isn't available in the web version yet; it was saved to your own library.".into())
+fn post_async(url: &str, path: &str, content_type: String, body: Vec<u8>, done: impl FnOnce(Result<String, String>) + Send + 'static) {
+    let mut req = ehttp::Request::post(format!("{}/{path}", url.trim_end_matches('/')), body);
+    req.headers.insert("Content-Type", content_type);
+    ehttp::fetch(req, move |res| {
+        done(match res {
+            Err(e) => Err(format!("Couldn't reach the submission server: {e}")),
+            Ok(r) => reply(r.status, &r.bytes),
+        })
+    });
+}
+
+/// The Worker's answer: the new id, or its error message.
+fn reply(status: u16, body: &[u8]) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    if (200..300).contains(&status) {
+        return v["id"].as_str().map(str::to_string).ok_or_else(|| "The submission server sent an unexpected reply".into());
+    }
+    Err(v["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("The submission server answered HTTP {status}")))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -147,13 +169,17 @@ fn post(url: &str, path: &str, content_type: &str, body: Vec<u8>) -> Result<Stri
         .header("Content-Type", content_type)
         .send(&body[..])
         .map_err(|e| format!("Couldn't reach the submission server: {e}"))?;
-    let status = res.status();
+    let status = res.status().as_u16();
     let text = res.body_mut().with_config().limit(64 * 1024).read_to_string().unwrap_or_default();
-    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    if status.is_success() {
-        return v["id"].as_str().map(str::to_string).ok_or_else(|| "The submission server sent an unexpected reply".into());
-    }
-    Err(v["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("The submission server answered HTTP {status}")))
+    reply(status, text.as_bytes())
+}
+
+/// Whether the Worker refused an asset for its SVG's content (scripts, links to other files, not
+/// well-formed, too large), the one refusal its PNG may get past. Its messages for those all name
+/// the SVG (see `checkSvg` in the Worker's validate.ts); a network error, a rate limit or a refused
+/// title would only fail again.
+pub fn is_svg_refusal(e: &str) -> bool {
+    e.starts_with("SVG ") || e.starts_with("Not an SVG")
 }
 
 /// Sliding one-hour window of submission times, so a stuck button can't burn the daily quota.
@@ -177,6 +203,15 @@ impl RateLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn svg_refusals() {
+        assert!(is_svg_refusal("SVG files can't contain scripts"));
+        assert!(is_svg_refusal("SVG is not well-formed XML"));
+        assert!(is_svg_refusal("Not an SVG file (the root element must be <svg>)"));
+        assert!(!is_svg_refusal("Limit reached: 20 submissions a day. Please try again tomorrow."));
+        assert!(!is_svg_refusal("Couldn't reach the submission server: timeout"));
+    }
 
     #[test]
     fn emails() {

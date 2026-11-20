@@ -372,13 +372,39 @@ impl Store {
 
     /// Make an old version current. The current document is kept as a version first, so a
     /// restore can itself be undone from the history. Returns the restored document.
+    /// A current document that won't load (damaged, or from a newer version of the app) doesn't
+    /// stop it: that is when the history is needed most. See [`Self::keep_current`].
     pub fn restore(&self, id: &str, time: i64) -> Result<Document, String> {
         let mut doc = self.load_version(id, time)?;
-        let current = self.load(id)?;
-        self.save(id, &current, Snapshot::IfChanged, "Before restoring")?;
-        doc.title = current.title; // a restore brings back content, not an old name
+        // A restore brings back content, not an old name.
+        if let Some(title) = self.keep_current(id, "Before restoring")? {
+            doc.title = title;
+        }
         self.save(id, &doc, Snapshot::IfChanged, &format!("Restored version from {}", format_time(time)))?;
         Ok(doc)
+    }
+
+    /// Before the project's document is replaced: keep it in the version history and return its
+    /// title. One that won't load is kept beside it as `document.unreadable-<time>.biocartoon`
+    /// instead (its bytes untouched, for recovery by hand), and the title comes from the project's
+    /// name, if that is known.
+    fn keep_current(&self, id: &str, note: &str) -> Result<Option<String>, String> {
+        match self.load(id) {
+            Ok(current) => {
+                self.save(id, &current, Snapshot::IfChanged, note)?;
+                Ok(Some(current.title))
+            }
+            Err(e) => {
+                let p = self.doc_path(id);
+                if storage::exists(&p) {
+                    let aside = self.dir(id).join(format!("document.unreadable-{}.biocartoon", now_ms()));
+                    // Never overwrite the only copy of something we couldn't read.
+                    storage::copy(&p, &aside).map_err(|c| format!("{e}; and it couldn't be set aside: {c}"))?;
+                    log::warn!("{e}: kept as {}", aside.display());
+                }
+                Ok(self.meta(id).ok().map(|m| m.name).filter(|n| !n.is_empty()))
+            }
+        }
     }
 
     pub fn touch_opened(&self, id: &str) {
@@ -413,8 +439,7 @@ impl Store {
     /// Replace the project's document with `doc` from elsewhere (a share link), keeping what was
     /// there in the version history first. Returns the new "last modified".
     pub fn replace_with(&self, id: &str, doc: &Document, note: &str) -> Result<i64, String> {
-        let current = self.load(id)?;
-        self.save(id, &current, Snapshot::IfChanged, "Before loading shared changes")?;
+        self.keep_current(id, "Before loading shared changes")?;
         self.save(id, doc, Snapshot::IfChanged, note)?;
         Ok(self.meta(id)?.modified)
     }
@@ -462,6 +487,9 @@ impl Store {
 pub fn read_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let u16_at = |i: usize| bytes.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or("truncated zip");
     let u32_at = |i: usize| bytes.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).ok_or("truncated zip");
+    if bytes.len() < 22 {
+        return Err("not a zip file".into());
+    }
     // The end record sits in the last 22 bytes plus a comment of up to 64 KB.
     let floor = bytes.len().saturating_sub(22 + 0xffff);
     let end = (floor..=bytes.len().saturating_sub(22)).rev().find(|&i| bytes[i..i + 4] == [0x50, 0x4b, 0x05, 0x06]).ok_or("not a zip file")?;
@@ -565,6 +593,27 @@ mod tests {
         assert_eq!(store.list().len(), 2);
         store.delete(&copy.id).unwrap();
         assert_eq!(store.list().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A version can be restored when the current document won't load, and the unreadable file
+    /// is kept, not overwritten.
+    #[test]
+    fn restore_over_an_unreadable_document() {
+        let root = std::env::temp_dir().join(format!("biocartoon-projects-broken-{}", now_ms()));
+        let store = Store::new(root.clone());
+        let doc = Document { title: "Cells".into(), ..Default::default() };
+        let m = store.create(&doc).unwrap();
+        let first = store.versions(&m.id)[0].time;
+        std::fs::write(store.doc_path(&m.id), b"{ not json").unwrap();
+        assert!(store.load(&m.id).is_err());
+
+        let restored = store.restore(&m.id, first).unwrap();
+        assert_eq!(restored.title, "Cells");
+        assert_eq!(store.load(&m.id).unwrap().title, "Cells");
+        let kept: Vec<_> = std::fs::read_dir(store.dir(&m.id)).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("document.unreadable-")).collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"{ not json");
         let _ = std::fs::remove_dir_all(root);
     }
 

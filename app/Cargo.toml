@@ -113,7 +113,7 @@ category = "GraphicsAndDesign"
 before-packaging-command = "cargo build --release --bin biocartoon-app --bin biocartoon"
 binaries-dir = "target/release"
 out-dir = "target/packages"
-# The icons are made from icon.svg by `cargo run --bin make_icon`. macOS uses the .icns, the AppImage
+# The icons are made from logo.svg by `cargo run --bin make_icon`. macOS uses the .icns, the AppImage
 # the largest .png, and the .deb installs every .png into the hicolor theme by size.
 icons = ["assets/icon.icns", "assets/icon.png", "assets/icon-128.png", "assets/icon-256.png", "assets/icon-512.png"]
 # The command line / MCP server ships next to the app (inside BioCartoon.app/Contents/MacOS on macOS).

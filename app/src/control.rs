@@ -70,12 +70,17 @@ impl ControlServer {
         let info_path = info_path(app_dir);
         let info = serde_json::to_vec(&Info { port, token: token.clone(), pid: std::process::id() }).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(app_dir).map_err(|e| e.to_string())?;
-        std::fs::write(&info_path, info).map_err(|e| format!("{}: {e}", info_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&info_path, std::fs::Permissions::from_mode(0o600));
-        }
+        // Created owner-only, so the token is never readable by other users, even briefly.
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let _ = std::fs::remove_file(&info_path);
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            o.open(&info_path)?.write_all(&info)
+        };
+        write().map_err(|e| format!("{}: {e}", info_path.display()))?;
         let (tx, rx) = channel::<Pending>();
         std::thread::Builder::new()
             .name("control".into())
@@ -420,7 +425,12 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
     if let Some(v) = b(args, "locked") { it.locked = v; }
     if let Some(v) = f(args, "opacity") { it.opacity = v.clamp(0.0, 1.0); }
     if let Some(v) = s(args, "name") { it.name = v.to_string(); }
-    if matches!(it.kind, ItemKind::Text { .. }) {
+    if let ItemKind::Text { text, runs, .. } = &mut it.kind {
+        // New text first, so the styles below cover it rather than the text it replaces.
+        if let Some(v) = s(args, "text") {
+            let old = std::mem::replace(text, v.to_string());
+            *runs = crate::doc::remap_runs(runs, &old, text);
+        }
         // The whole box's colour and decoration, over any its letters had of their own.
         if let Some(v) = color(args, "color") { crate::doc::set_color(&mut it.kind, None, v); }
         if let Some(v) = color(args, "highlight") { crate::doc::set_highlight(&mut it.kind, None, (v[3] > 0).then_some(v)); }
@@ -439,12 +449,8 @@ fn patch_item(it: &mut Item, args: &Value) -> Result<(), String> {
             }
             if let Some(c) = color(args, "overlay") { *overlay = c; }
         }
-        ItemKind::Text { text, size, align, font, line_spacing, valign, runs, fill, .. } => {
+        ItemKind::Text { size, align, font, line_spacing, valign, fill, .. } => {
             if let Some(v) = color(args, "fill") { *fill = v; }
-            if let Some(v) = s(args, "text") {
-                let old = std::mem::replace(text, v.to_string());
-                *runs = crate::doc::remap_runs(runs, &old, text);
-            }
             if let Some(v) = f(args, "font_size") { *size = v.clamp(1.0, MAX_FONT_SIZE); }
             if let Some(v) = s(args, "align") { *align = parse_enum(&TextAlign::ALL, v, "align")?; }
             if let Some(v) = s(args, "valign") { *valign = parse_enum(&TextVAlign::ALL, v, "valign")?; }

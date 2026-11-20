@@ -43,7 +43,7 @@ impl Xform {
 
 pub enum Drag {
     Move { start_rects: Vec<(ItemId, Rect)>, start_ptr: Pos2, sel_rect: Rect },
-    Resize { handle: usize, start_sel: Rect, start_rects: Vec<(ItemId, Rect)>, single: Option<(ItemId, f32, Pos2)>, lock_aspect: bool },
+    Resize { handle: usize, start_sel: Rect, start_rects: Vec<(ItemId, Rect)>, single: Option<(ItemId, f32, Pos2)>, lock_aspect: bool, start_sizes: Vec<(ItemId, f32)> },
     Rotate { id: ItemId, center: Pos2, start_rot: f32, start_angle: f32 },
     /// `path`: a freehand line's points when the drag began (empty for other lines).
     LineEnd { id: ItemId, end: bool, path: Vec<Pos2> },
@@ -195,7 +195,7 @@ fn handle_points(it: Option<&Item>, sel: Rect, xf: &Xform) -> Vec<Pos2> {
     };
     let pts = rect_handles(r);
     let mut v: Vec<Pos2> = pts.iter().map(|p| xf.to_screen(rotate_about(*p, c, a))).collect();
-    if it.is_some() {
+    if it.is_some_and(Item::rotatable) {
         let top = xf.to_screen(rotate_about(Pos2::new(r.center().x, r.min.y), c, a));
         let center = xf.to_screen(c);
         let dir = (top - center).normalized();
@@ -1666,6 +1666,8 @@ impl BioCartoon {
                             start_rects: items.iter().map(|i| (i.id, i.rect())).collect(),
                             single,
                             lock_aspect,
+                            // Text scales from its size when the drag began, not frame by frame.
+                            start_sizes: items.iter().filter_map(|i| if let ItemKind::Text { size, .. } = &i.kind { Some((i.id, *size)) } else { None }).collect(),
                         });
                     }
                 } else if let Some(i) = self.guide_at(p, xf) {
@@ -1811,7 +1813,7 @@ impl BioCartoon {
                             *p = path;
                         }
                     }
-                    Some(Drag::Resize { handle, start_sel, start_rects, single, lock_aspect }) => {
+                    Some(Drag::Resize { handle, start_sel, start_rects, single, lock_aspect, start_sizes }) => {
                         let handle = *handle;
                         let start_sel = *start_sel;
                         let lock = *lock_aspect;
@@ -1864,6 +1866,7 @@ impl BioCartoon {
                             })
                             .collect();
                         let single = *single;
+                        let start_sizes = start_sizes.clone();
                         for (id, mut nr) in updates {
                             if let Some((_, rot, c)) = single {
                                 // Convert local-frame rect back: rotate its center about the old center.
@@ -1873,7 +1876,9 @@ impl BioCartoon {
                             if let Some(it) = self.item_mut(id) {
                                 if let ItemKind::Text { size, .. } = &mut it.kind {
                                     if lock && matches!(handle, 0 | 2 | 4 | 6) {
-                                        *size = (*size * sy).max(4.0);
+                                        if let Some((_, s0)) = start_sizes.iter().find(|(i, _)| *i == id) {
+                                            *size = (s0 * sy).clamp(4.0, crate::doc::MAX_FONT_SIZE);
+                                        }
                                     }
                                 }
                                 it.set_rect(nr);
@@ -1892,8 +1897,11 @@ impl BioCartoon {
                 let r = Rect::from_two_pos(*start, *current);
                 let mut ids: Vec<ItemId> = self.slide().items.iter().filter(|i| r.contains(i.rect().center())).map(|i| i.id).collect();
                 if *additive {
-                    ids.extend(self.selection.iter().copied());
-                    ids.dedup();
+                    for id in self.selection.iter().copied() {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
                 }
                 // Like a click, a marquee only selects; it doesn't open Edit. Catching nothing
                 // clears the selection (and closes Edit) like a click on empty canvas.
@@ -2023,6 +2031,14 @@ impl BioCartoon {
 
     /// The right-click menu for empty canvas, in the Page panel's order.
     fn canvas_menu_ui(&mut self, ui: &mut egui::Ui) {
+        // Something copied comes first, ready to paste.
+        if !self.clipboard.is_empty() {
+            if ui.add(egui::Button::new(format!("{}  Paste", ph::CLIPBOARD)).shortcut_text("⌘V")).clicked() {
+                self.actions.push(Action::Paste);
+                ui.close();
+            }
+            ui.separator();
+        }
         let any = !self.slide().items.is_empty();
         if ui.add_enabled(any, egui::Button::new(format!("{}  Select all", ph::SELECTION_ALL)).shortcut_text("⌘A")).clicked() {
             self.actions.push(Action::Select(self.slide().items.iter().map(|x| x.id).collect()));
@@ -2122,9 +2138,17 @@ impl BioCartoon {
                 ui.close();
             }
         };
+        // Something copied comes first, ready to paste; with nothing copied, Paste waits greyed out
+        // after Copy.
+        let can_paste = !self.clipboard.is_empty();
+        if can_paste {
+            item(ui, true, ph::CLIPBOARD, "Paste", "⌘V", Action::Paste);
+        }
         item(ui, has, ph::SCISSORS, "Cut", "⌘X", Action::Cut);
         item(ui, has, ph::COPY, "Copy", "⌘C", Action::Copy);
-        item(ui, !self.clipboard.is_empty(), ph::CLIPBOARD, "Paste", "⌘V", Action::Paste);
+        if !can_paste {
+            item(ui, false, ph::CLIPBOARD, "Paste", "⌘V", Action::Paste);
+        }
         item(ui, has, ph::COPY_SIMPLE, "Duplicate", "⌘D", Action::Duplicate);
         item(ui, has, ph::TRASH, "Delete", "⌫", Action::Delete);
         ui.separator();

@@ -1,0 +1,14 @@
+# Security headers for biocartoon.com, matching the editor's (app/csp.py) where they apply.
+# The CSP leaves scripts alone: the pages' inline scripts would need hashes, and there's no build
+# step here to keep them current. These directives need none: no framing, no <base>, no forms,
+# no plugins.
+# Referrer-Policy is the browser default, not the editor's no-referrer, so GoatCounter still sees
+# which page a visit came from.
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Strict-Transport-Security: max-age=31536000
+  Cross-Origin-Opener-Policy: same-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
+  Content-Security-Policy: frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'

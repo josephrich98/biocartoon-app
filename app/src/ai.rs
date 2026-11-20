@@ -170,9 +170,9 @@ pub trait AiBackend: Send + Sync {
                 let result = self.generate(&prompt);
                 AiResult::Generated { prompt, result }
             }
-            AiJob::Edit { item, image, svg, op } => {
+            AiJob::Edit { item, doc, image, svg, op } => {
                 let result = self.edit(&image, svg.as_deref(), &op);
-                AiResult::Edited { item, op, result }
+                AiResult::Edited { item, doc, op, result }
             }
             AiJob::Chat { item, history, message } => {
                 let result = self.chat(&history, &message);
@@ -971,9 +971,9 @@ impl<B: HttpBackend> Http<B> {
                 let result = res.and_then(|(status, body)| backend.image(&job, status, &body));
                 AiResult::Generated { prompt: prompt.clone(), result }
             }
-            AiJob::Edit { item, ref op, .. } => {
+            AiJob::Edit { item, doc, ref op, .. } => {
                 let result = res.and_then(|(status, body)| backend.image(&job, status, &body));
-                AiResult::Edited { item, op: op.clone(), result }
+                AiResult::Edited { item, doc, op: op.clone(), result }
             }
             AiJob::Chat { item, .. } => AiResult::ChatReply { item, result: res.and_then(|(status, body)| backend.text(status, &body)) },
         }
@@ -1000,7 +1000,7 @@ impl<B: HttpBackend> AiBackend for Http<B> {
         }
     }
     fn edit(&self, image: &RgbaImage, svg: Option<&str>, op: &AiOp) -> Result<AiImage, String> {
-        match self.block(AiJob::Edit { item: Default::default(), image: image.clone(), svg: svg.map(Into::into), op: op.clone() }) {
+        match self.block(AiJob::Edit { item: Default::default(), doc: 0, image: image.clone(), svg: svg.map(Into::into), op: op.clone() }) {
             AiResult::Edited { result, .. } => result,
             _ => unreachable!(),
         }
@@ -1079,13 +1079,14 @@ pub fn make_backend(kind: BackendKind, model: &str, key: &str, base_url: &str, p
 pub enum AiJob {
     Generate { prompt: String },
     /// `svg` is the image's source when it is an SVG, for the models that draw SVG.
-    Edit { item: crate::doc::ItemId, image: RgbaImage, svg: Option<String>, op: AiOp },
+    /// `doc` tags which open document the item belongs to (item ids restart in every document).
+    Edit { item: crate::doc::ItemId, doc: u64, image: RgbaImage, svg: Option<String>, op: AiOp },
     Chat { item: crate::doc::ItemId, history: Vec<(bool, String)>, message: String },
 }
 
 pub enum AiResult {
     Generated { prompt: String, result: Result<AiImage, String> },
-    Edited { item: crate::doc::ItemId, op: AiOp, result: Result<AiImage, String> },
+    Edited { item: crate::doc::ItemId, doc: u64, op: AiOp, result: Result<AiImage, String> },
     ChatReply { item: crate::doc::ItemId, result: Result<String, String> },
 }
 
@@ -1212,7 +1213,7 @@ mod tests {
         assert_eq!(body["background"], "transparent");
         let mut icon = RgbaImage::new(4, 4);
         icon.put_pixel(1, 1, Rgba([255, 0, 0, 255]));
-        let job = AiJob::Edit { item: 1, image: icon, svg: None, op: AiOp::RemoveText };
+        let job = AiJob::Edit { item: 1, doc: 0, image: icon, svg: None, op: AiOp::RemoveText };
         let req = b.request(&job).unwrap();
         let ct = &req.headers.iter().find(|(k, _)| *k == "content-type").unwrap().1;
         let boundary = ct.strip_prefix("multipart/form-data; boundary=").unwrap();

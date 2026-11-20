@@ -88,7 +88,7 @@ impl ProjectCmd {
             ProjectCmd::Copy => "Make a copy",
             ProjectCmd::History => "Version history",
             ProjectCmd::Export => "Export",
-            ProjectCmd::SaveFile => "Save as .biocartoon file",
+            ProjectCmd::SaveFile => if cfg!(target_arch = "wasm32") { "Download .biocartoon" } else { "Save .biocartoon" },
             ProjectCmd::Email => "Email",
             ProjectCmd::Community => "Add to community",
             ProjectCmd::Delete => "Delete",
@@ -100,7 +100,7 @@ impl ProjectCmd {
             ProjectCmd::Copy => ph::COPY,
             ProjectCmd::History => ph::CLOCK_COUNTER_CLOCKWISE,
             ProjectCmd::Export => ph::DOWNLOAD_SIMPLE,
-            ProjectCmd::SaveFile => ph::FILE_ARROW_DOWN,
+            ProjectCmd::SaveFile => ph::DOWNLOAD_SIMPLE,
             ProjectCmd::Email => ph::ENVELOPE_SIMPLE,
             ProjectCmd::Community => ph::GLOBE,
             ProjectCmd::Delete => ph::TRASH,
@@ -599,7 +599,8 @@ impl BioCartoon {
         let mut cmd = None;
         let mut items = |ui: &mut egui::Ui| {
             ui.set_min_width(sz(210.0));
-            for c in ProjectCmd::MENU {
+            // The browser can't hand a file to a mail app.
+            for c in ProjectCmd::MENU.into_iter().filter(|&c| c != ProjectCmd::Email || !cfg!(target_arch = "wasm32")) {
                 if c == ProjectCmd::Delete {
                     ui.separator();
                 }

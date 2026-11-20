@@ -221,7 +221,8 @@ impl BioCartoon {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(360.0)
+            .default_width(crate::app::dialog_width(ctx, 360.0))
+            .max_width(crate::app::dialog_width(ctx, 360.0))
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new(&title).strong());
@@ -274,7 +275,9 @@ impl BioCartoon {
             .id(egui::Id::new("attributions_window"))
             .open(&mut open)
             .collapsible(false)
-            .default_size([480.0, 460.0])
+            // No wider than the screen (a phone's), where its buttons wrap instead.
+            .default_size([crate::app::dialog_width(ctx, 480.0), 460.0])
+            .max_width(crate::app::dialog_width(ctx, 480.0))
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 action = attributions_ui(ui, &credits, &ai, &mut self.attributions_required_only, &mut all_slides, export_scope.is_some());
@@ -396,7 +399,7 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], ai: &std::collections:
     ui.add_space(4.0);
     let has_required = !list(credits, true).is_empty();
     let has_any = !list(credits, false).is_empty();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.add_enabled(has_any, egui::Button::new(format!("{}  Copy all credits", ph::COPY))).clicked() {
             action = Some(CreditsAction::Copy { required: false });
         }
@@ -404,7 +407,7 @@ fn attributions_ui(ui: &mut egui::Ui, credits: &[Credit], ai: &std::collections:
             action = Some(CreditsAction::Copy { required: true });
         }
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let save_all = egui::RichText::new(format!("{}  Save all credits", ph::FLOPPY_DISK)).color(theme::on_accent());
         // Just after an export, Enter saves them all. (Not when opened from the menu: that window stays
         // open beside the canvas, where Enter edits the selected text.)

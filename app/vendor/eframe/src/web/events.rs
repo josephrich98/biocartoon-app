@@ -351,15 +351,14 @@ fn install_copy_cut_paste(runner_ref: &WebRunner, target: &EventTarget) -> Resul
         {
             let text = text.replace("\r\n", "\n");
 
-            let mut should_stop_propagation = true;
-            let mut should_prevent_default = true;
-            if !text.is_empty() {
-                let egui_event = egui::Event::Paste(text);
-                should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
-                should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
-                runner.input.raw.events.push(egui_event);
-                runner.needs_repaint.repaint_asap();
-            }
+            // PATCHED (biocartoon): pass the paste on even with no text on the clipboard (an image
+            // is there after copying from the canvas), so the app can paste its own clipboard. The
+            // app can't wait for ⌘V's key-up instead: Mac browsers don't send it while ⌘ is held.
+            let egui_event = egui::Event::Paste(text);
+            let should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
+            let should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
+            runner.input.raw.events.push(egui_event);
+            runner.needs_repaint.repaint_asap();
 
             // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
             if should_stop_propagation {

@@ -197,6 +197,7 @@ mod mac_open {
     use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager, NSNotification, NSNotificationCenter, NSString};
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     // Four-character codes: kCoreEventClass, kAEOpenDocuments and keyDirectObject.
     const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
@@ -205,6 +206,8 @@ mod mac_open {
 
     static OPENED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static CTX: OnceLock<egui::Context> = OnceLock::new();
+    /// The last event's files and when it came, to drop an immediate repeat.
+    static LAST: Mutex<Option<(Vec<PathBuf>, Instant)>> = Mutex::new(None);
 
     define_class!(
         #[unsafe(super(NSObject))]
@@ -240,7 +243,23 @@ mod mac_open {
                 if paths.is_empty() {
                     return;
                 }
-                OPENED.lock().unwrap_or_else(|e| e.into_inner()).extend(paths);
+                // Finder can send the same open twice in a row; the repeat is dropped, or the
+                // app would see two files and import them instead of opening one. The window is
+                // short, so opening the same file again on purpose (after closing it) still works.
+                {
+                    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                    if last.as_ref().is_some_and(|(p, t)| *p == paths && t.elapsed() < Duration::from_secs(1)) {
+                        return;
+                    }
+                    *last = Some((paths.clone(), Instant::now()));
+                }
+                let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+                for p in paths {
+                    if !opened.contains(&p) {
+                        opened.push(p);
+                    }
+                }
+                drop(opened);
                 if let Some(ctx) = CTX.get() {
                     ctx.request_repaint();
                 }

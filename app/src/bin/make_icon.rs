@@ -1,10 +1,11 @@
-//! Rasterizes the app icon (assets/icon.svg) into:
+//! Rasterizes the BioCartoon logo (assets/logo.svg, the one source of the brand art) into:
 //!   assets/icon.icns            16-1024 px, the macOS app icon (built with iconutil, so macOS only)
-//!   assets/icon.png             1024 px, the desktop window icon and the AppImage icon
+//!   assets/icon.png             1024 px, the desktop window icon, the AppImage icon, and the site's
+//!                                link-preview image (`./deploy.sh brand` copies it to site/public/logo.png)
 //!   assets/icon-{128,256,512}.png  the Linux package icons (hicolor has no 1024 px size, so the
 //!                                .deb needs these or GNOME shows a generic icon)
 //!   assets/apple-touch-icon.png  180 px, the web build's bookmark / home-screen icon, on white since
-//!                                Safari puts transparent touch icons on a gray backing (copy it to site/public/ too)
+//!                                Safari puts transparent touch icons on a gray backing (`./deploy.sh brand` copies it to site/public/)
 //!   assets/icon.ico              16-256 px, the Windows .exe icon (embedded by build.rs) and installer icon
 //! The web build uses logo.svg itself as the tab favicon (see index.html).
 //! Re-run with `cargo run --bin make_icon` after changing the icon.
@@ -75,8 +76,8 @@ fn render_icns(tree: &usvg::Tree, out: &str) {
 }
 
 fn main() {
-    let svg = std::fs::read("assets/icon.svg").expect("run from app/: assets/icon.svg");
-    let tree = usvg::Tree::from_data(&svg, &usvg::Options::default()).expect("parse assets/icon.svg");
+    let svg = std::fs::read("assets/logo.svg").expect("run from app/: assets/logo.svg");
+    let tree = usvg::Tree::from_data(&svg, &usvg::Options::default()).expect("parse assets/logo.svg");
     render_icns(&tree, "assets/icon.icns");
     render(&tree, 1024, "assets/icon.png");
     for px in [128, 256, 512] {

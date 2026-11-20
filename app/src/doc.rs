@@ -899,6 +899,34 @@ pub fn remap_runs(runs: &[TextRun], old: &str, new: &str) -> Vec<TextRun> {
     pack_runs(&out)
 }
 
+/// Like [`remap_runs`], for an edit that changed each line on its own (a list marker or an indent
+/// added or taken off every line): each line keeps the styles of the characters it still has.
+/// Falls back to [`remap_runs`] when the edit changed the number of lines.
+pub fn remap_runs_by_line(runs: &[TextRun], old: &str, new: &str) -> Vec<TextRun> {
+    if runs.is_empty() || old == new {
+        return runs.to_vec();
+    }
+    let (old_lines, new_lines): (Vec<&str>, Vec<&str>) = (old.split('\n').collect(), new.split('\n').collect());
+    if old_lines.len() != new_lines.len() {
+        return remap_runs(runs, old, new);
+    }
+    let styles = expand_runs(runs, old.chars().count());
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (i, (a, b)) in old_lines.iter().zip(&new_lines).enumerate() {
+        let n = a.chars().count();
+        // This line's styles as runs of its own, moved onto its new text.
+        let line = remap_runs(&pack_runs(&styles[at..at + n]), a, b);
+        out.extend(expand_runs(&line, b.chars().count()));
+        at += n;
+        if i + 1 < old_lines.len() {
+            out.push(styles.get(at).copied().unwrap_or_default()); // the newline
+            at += 1;
+        }
+    }
+    pack_runs(&out)
+}
+
 /// Every character's look in a text box (`kind`, a text item), its runs taken as styling `text`.
 pub fn char_looks(kind: &ItemKind, text: &str) -> Vec<CharLook> {
     let ItemKind::Text { text: own, color, bold, italic, underline, strike, runs, .. } = kind else { return Vec::new() };
@@ -1164,6 +1192,12 @@ impl Item {
         matches!(self.kind, ItemKind::Line { .. })
     }
 
+    /// Whether the item can be turned. Tables and code blocks are drawn (and exported) upright,
+    /// so a rotation would turn only their handles and click area.
+    pub fn rotatable(&self) -> bool {
+        !matches!(self.kind, ItemKind::Line { .. } | ItemKind::Table { .. } | ItemKind::Code { .. })
+    }
+
     /// Put every number back in range: NaN and infinities get a default (see [`fix`]), font
     /// sizes stay within [`MAX_FONT_SIZE`] and coordinates within [`MAX_COORD`].
     pub fn sanitize(&mut self) {
@@ -1176,6 +1210,9 @@ impl Item {
             fix(v, size, c.clone());
         }
         fix(&mut self.rotation, 0.0, -1.0e4..=1.0e4);
+        if matches!(self.kind, ItemKind::Table { .. } | ItemKind::Code { .. }) {
+            self.rotation = 0.0;
+        }
         fix(&mut self.opacity, 1.0, 0.0..=1.0);
         let font = 1.0..=MAX_FONT_SIZE;
         match &mut self.kind {
@@ -1196,7 +1233,14 @@ impl Item {
                     *v = v.clamp(-MAX_COORD, MAX_COORD);
                 }
             }
-            ItemKind::Table { font_size, .. } | ItemKind::Code { font_size, .. } => fix(font_size, 14.0, font),
+            ItemKind::Table { font_size, rows, cols, cells, .. } => {
+                fix(font_size, 14.0, font);
+                // The grid is indexed as rows × cols, so the cell list has to match it.
+                *rows = (*rows).clamp(1, 20);
+                *cols = (*cols).clamp(1, 20);
+                cells.resize(*rows * *cols, String::new());
+            }
+            ItemKind::Code { font_size, .. } => fix(font_size, 14.0, font),
         }
     }
 
@@ -1409,6 +1453,10 @@ impl Document {
     }
 
     fn sanitize_page(&mut self) {
+        // Every screen assumes at least one slide; a hand-edited or foreign file may have none.
+        if self.slides.is_empty() {
+            self.slides.push(Slide::default());
+        }
         let d = Document::default();
         fix(&mut self.width, d.width, MIN_PAGE..=MAX_COORD);
         fix(&mut self.height, d.height, MIN_PAGE..=MAX_COORD);
@@ -1493,6 +1541,17 @@ fn fit_axis(min: f32, len: f32, c0: f32, c1: f32, flip: bool, art: f32, d0: f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_edits_keep_each_lines_styles() {
+        let sub = RunStyle { script: Some(Script::Sub), ..Default::default() };
+        // "H2O\nCO2" with both 2s subscripted, then a bullet put in front of each line.
+        let runs = vec![TextRun { start: 1, end: 2, style: sub }, TextRun { start: 6, end: 7, style: sub }];
+        let new = "• H2O\n• CO2";
+        let out = expand_runs(&remap_runs_by_line(&runs, "H2O\nCO2", new), new.chars().count());
+        let subs: Vec<usize> = out.iter().enumerate().filter(|(_, s)| s.script.is_some()).map(|(i, _)| i).collect();
+        assert_eq!(subs, vec![3, 10]);
+    }
 
     fn bold_chars(kind: &ItemKind) -> String {
         let ItemKind::Text { text, .. } = kind else { return String::new() };
