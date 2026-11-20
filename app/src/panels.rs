@@ -158,6 +158,8 @@ impl BioCartoon {
                 if self.icons.mode == IconsMode::Search {
                     self.search_box(ui);
                     ui.add_space(4.0);
+                    self.filter_sort_row(ui, false);
+                    ui.add_space(2.0);
                     let top = ui.cursor().top();
                     let open = self.icons.show_filters;
                     self.search_filters(ui);
@@ -165,6 +167,8 @@ impl BioCartoon {
                 } else if let Some(hint) = mine {
                     self.mine_search_box(ui, hint);
                     ui.add_space(4.0);
+                    self.filter_sort_row(ui, true);
+                    ui.add_space(2.0);
                     let top = ui.cursor().top();
                     let open = self.icons.mine_show_filters;
                     self.mine_filters(ui);
@@ -719,10 +723,9 @@ impl BioCartoon {
         (cols, ((ui.available_width() - 6.0 * (cols - 1) as f32) / cols as f32).floor().max(32.0))
     }
 
-    /// "Sort [Popular]", for the row under the search box and for Favorites' and Your library's.
-    /// Returns the dropdown's height, for [`control_row`].
+    /// "Sort [Popular]", added right to left (the dropdown, then its label), at the right end of
+    /// [`Self::filter_sort_row`]. Returns the dropdown's height, for [`control_row`].
     fn sort_combo(&mut self, ui: &mut egui::Ui) -> f32 {
-        ui.label(egui::RichText::new("Sort").small().color(theme::text_dim()));
         let (sort, options): (&mut IconSort, &[IconSort]) = if self.icons.mode == IconsMode::Search {
             // Relevance only means something once a query is typed.
             let options: &[IconSort] = if self.icons.query.trim().is_empty() { &IconSort::SEARCH[1..] } else { &IconSort::SEARCH };
@@ -745,25 +748,33 @@ impl BioCartoon {
             self.icons.sort_picked = self.icons.mode == IconsMode::Search;
             self.reload_results();
         }
+        ui.label(egui::RichText::new("Sort").small().color(theme::text_dim()));
         height
     }
 
-    /// Above the results: Sort, and a labeled Filters button (the funnel in the search box opens the
-    /// same filters, and stays in view while the results scroll).
-    fn search_controls(&mut self, ui: &mut egui::Ui) {
-        control_row(ui, "search_controls", |ui| {
-            let height = self.sort_combo(ui);
-            ui.add_space(6.0);
-            let n = self.icons.filter.active();
-            let open = self.icons.show_filters;
+    /// Under the search box (or Favorites' and Your library's): the Filters button, whose filters
+    /// open beneath it so it stays put, and Sort at the right.
+    fn filter_sort_row(&mut self, ui: &mut egui::Ui, mine: bool) {
+        control_row(ui, if mine { "mine_filter_sort" } else { "filter_sort" }, |ui| {
+            let (n, open) = if mine { (self.icons.mine_filter.active(), self.icons.mine_show_filters) } else { (self.icons.filter.active(), self.icons.show_filters) };
             let text = if n > 0 { format!("{}  Filters  {n}", ph::FUNNEL) } else { format!("{}  Filters", ph::FUNNEL) };
             let color = if n > 0 { theme::accent() } else { theme::text() };
             let b = egui::Button::new(egui::RichText::new(text).color(color)).selected(open).stroke(Stroke::new(1.0, theme::border())).corner_radius(6);
-            let tip = if open { "Hide the filters" } else { "Filter by database, author, category, license, tags or artwork type" };
-            if ui.add(b).on_hover_text(tip).clicked() {
-                self.icons.show_filters = !open;
+            let tip = match (open, mine && self.icons.mode == IconsMode::Library) {
+                (true, _) => "Hide the filters",
+                (false, true) => "Filter by category or file type",
+                (false, false) => "Filter by database, author, category, license, tags or artwork type",
+            };
+            let r = ui.add(b).on_hover_text(tip);
+            if r.clicked() {
+                if mine {
+                    self.icons.mine_show_filters = !open;
+                } else {
+                    self.icons.show_filters = !open;
+                }
             }
-            height
+            let sort_h = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.sort_combo(ui)).inner;
+            sort_h.max(r.rect.height())
         });
     }
 
@@ -1114,13 +1125,9 @@ impl BioCartoon {
         if self.icons.loading && self.icons.results.is_empty() {
             ui.label(egui::RichText::new("Searching...").color(theme::text_dim()));
         }
-        // The suggestions, Sort and the Filters button scroll away with the results; the one-line
-        // summary of the set filters above them stays.
+        // The suggestions scroll away with the results (Filters and Sort are above them, in `left_panel`).
         if self.icons.mode == IconsMode::Search {
             self.search_suggestions(ui);
-            self.search_controls(ui);
-        } else {
-            control_row(ui, "sort_controls", |ui| self.sort_combo(ui));
         }
         ui.horizontal(|ui| {
             if let Some(n) = shown_total.filter(|_| self.include().icons() && !(self.icons.loading && self.icons.results.is_empty())) {

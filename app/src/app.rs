@@ -375,7 +375,7 @@ impl Include {
     }
 }
 
-/// The filters under the search box's funnel. Each one keeps what matches any of its entries
+/// The filters under the search box's funnel (and the Filters button below it). Each one keeps what matches any of its entries
 /// (none keeps everything), and a result has to pass all of them.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SearchFilter {
