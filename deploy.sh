@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Deploy BioCartoon. Expects the biocartoon and biocartoon-app checkouts side by side.
 #
-#   ./deploy.sh all "MESSAGE"     db + workers + web + site + desktop, then push both repos
+#   ./deploy.sh all "MESSAGE"     brand + db + workers + web + site + desktop + plugin, then push both repos
+#   ./deploy.sh brand             copy the logo and its renders from app/assets/ to site/public/ and biocartoon/brand/
 #   ./deploy.sh sync [--apply]    new upstream icons -> master DB (dry run without --apply; --apply also runs db)
 #   ./deploy.sh db                master DB -> R2 (also merges approved app uploads, rewrites both READMEs)
-#   ./deploy.sh workers           D1 migrations, then the submit + review Workers
+#   ./deploy.sh workers           D1 migrations, then the submit + review + MCP Workers (regenerates MCP metadata)
+#   ./deploy.sh plugin            build the ChatGPT + Claude plugin ZIPs; warn what needs a release or an upload
+#   ./deploy.sh plugin --uploaded [chatgpt|claude]   mark HEAD as uploaded (moves the portal tag; default both)
 #   ./deploy.sh web               app.biocartoon.com
 #   ./deploy.sh site              biocartoon.com
 #   ./deploy.sh desktop           rebuild and reinstall /Applications/BioCartoon.app
@@ -21,6 +24,30 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# app/assets/ holds the one copy of the brand art that gets edited (logo.svg, the source of every
+# app icon via `cargo run --bin make_icon`, and biocartoon-mono.svg). The site and the catalog repo
+# keep mirrors because each deploys on its own; this refreshes them.
+BRAND_MIRRORS=(
+  "app/assets/logo.svg:site/public/logo.svg"
+  "app/assets/icon.png:site/public/logo.png"
+  "app/assets/apple-touch-icon.png:site/public/apple-touch-icon.png"
+  "app/assets/logo.svg:$CAT/brand/logo.svg"
+  "app/assets/biocartoon-mono.svg:$CAT/brand/biocartoon-mono.svg"
+)
+
+brand() {
+  step "brand art"
+  local pair src dst n=0
+  for pair in "${BRAND_MIRRORS[@]}"; do
+    src="$APP/${pair%%:*}" dst="${pair#*:}"
+    [[ "$dst" = /* ]] || dst="$APP/$dst"
+    if ! cmp -s "$src" "$dst"; then
+      cp "$src" "$dst"; echo "updated ${dst#"$ROOT"/}"; n=$((n + 1))
+    fi
+  done
+  [ "$n" -gt 0 ] || echo "mirrors match app/assets/"
+}
+
 sync_upstream() {
   step "sync upstream icons ($*)"
   (cd "$CAT" && python3 data/sync.py "$@")
@@ -31,9 +58,92 @@ db() {
   (cd "$CAT" && python3 data/publish_catalog.py)
 }
 
+mcp_metadata() {
+  step "MCP tool metadata"
+  # The hosted MCP Worker serves worker/generated/mcp-metadata.json, generated from the Rust server.
+  (cd "$CAT/catalog" && cargo build -q --release --locked --bin biocartoon && python3 ../scripts/build_mcp_metadata.py >/dev/null)
+  if git -C "$CAT" diff --quiet -- worker/generated/mcp-metadata.json; then
+    echo "unchanged"
+  else
+    echo "updated worker/generated/mcp-metadata.json"
+  fi
+}
+
 workers() {
+  mcp_metadata
   step "D1 migrations + Workers"
-  (cd "$CAT/worker" && npm run migrate && npm test && npm run deploy)
+  # deploy:mcp is mcp.biocartoon.com (what the ChatGPT/Claude plugins call); it runs the live check after deploying.
+  (cd "$CAT/worker" && npm run migrate && npm test && npm run deploy && npm run deploy:mcp)
+}
+
+# What each AI-assistant channel freezes. Server-side changes (tools, instructions, gallery) reach
+# every channel live on deploy:mcp; these files only reach users through a release or an upload.
+#   ChatGPT plugin:  ZIP uploaded to the OpenAI portal                     (tag plugin-portal)
+#   Claude plugin:   ZIP uploaded for the Claude apps                       (tag claude-plugin-portal)
+#   Claude Code plugin + `biocartoon install-skills`: the next v* release (plugin.json version, PyPI)
+CHATGPT_FROZEN=(catalog/skills .codex-plugin/plugin.json mcp.json submission/listing.json submission/review-cases.json submission/assets)
+CLAUDE_FROZEN=(catalog/skills .claude-plugin/plugin.json .mcp.json)
+RELEASE_FROZEN=(catalog/skills .claude-plugin .mcp.json)
+
+# Files under the given paths that differ (committed or not) from REF.
+changed_since() {
+  local ref="$1"; shift
+  { git -C "$CAT" diff --name-only "$ref" -- "$@"; git -C "$CAT" ls-files --others --exclude-standard -- "$@"; } | sort -u
+}
+
+have_tag() {
+  git -C "$CAT" rev-parse -q --verify "refs/tags/$1" >/dev/null && return
+  git -C "$CAT" fetch -q origin tag "$1" 2>/dev/null || true
+  git -C "$CAT" rev-parse -q --verify "refs/tags/$1" >/dev/null
+}
+
+plugin() {
+  if [ "${1:-}" = --uploaded ]; then
+    local which="${2:-both}" tags=()
+    case "$which" in
+      chatgpt) tags=(plugin-portal) ;;
+      claude) tags=(claude-plugin-portal) ;;
+      both) tags=(plugin-portal claude-plugin-portal) ;;
+      *) die "usage: ./deploy.sh plugin --uploaded [chatgpt|claude|both]" ;;
+    esac
+    [ -z "$(git -C "$CAT" status --porcelain -- "${CHATGPT_FROZEN[@]}" "${CLAUDE_FROZEN[@]}")" ] \
+      || die "plugin files have uncommitted changes; commit what you uploaded first"
+    for t in "${tags[@]}"; do
+      step "mark $t = $(git -C "$CAT" rev-parse --short HEAD)"
+      git -C "$CAT" tag -f "$t"
+      git -C "$CAT" push -qf origin "refs/tags/$t"
+    done
+    return
+  fi
+  step "assistant plugin packages"
+  (cd "$CAT" && python3 scripts/package_plugin.py && python3 scripts/package_claude_plugin.py)
+  echo "live on deploy:mcp: tools, server instructions, gallery (ChatGPT, Claude, Claude Code, Codex)"
+
+  local warn='\033[33mwarning:\033[0m' changed last
+  last="$(git -C "$CAT" describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || true)"
+  if [ -n "$last" ] && changed="$(changed_since "$last" "${RELEASE_FROZEN[@]}")" && [ -n "$changed" ]; then
+    printf "$warn the skills/Claude plugin changed since %s; Claude Code plugin and install-skills users won't get it until a release:\n" "$last"
+    echo "$changed" | sed 's/^/    /'
+    echo "  Run: ./deploy.sh release X.Y.Z"
+  fi
+
+  local label tag paths file which
+  for label in ChatGPT Claude; do
+    if [ "$label" = ChatGPT ]; then
+      tag=plugin-portal; paths=("${CHATGPT_FROZEN[@]}"); file="dist/biocartoon-<version>.zip -> the OpenAI portal"; which=chatgpt
+    else
+      tag=claude-plugin-portal; paths=("${CLAUDE_FROZEN[@]}"); file="dist/biocartoon-claude-<version>.zip -> the Claude plugin upload"; which=claude
+    fi
+    if ! have_tag "$tag"; then
+      printf '\033[33mnote:\033[0m no %s tag, so changes since the last %s upload are unknown. After uploading, run: ./deploy.sh plugin --uploaded %s\n' "$tag" "$label" "$which"
+    elif changed="$(changed_since "$tag" "${paths[@]}")" && [ -n "$changed" ]; then
+      printf "$warn the %s plugin's bundled files changed since its upload (%s):\n" "$label" "$tag"
+      echo "$changed" | sed 's/^/    /'
+      echo "  Upload biocartoon/$file, then run: ./deploy.sh plugin --uploaded $which"
+    else
+      echo "$label plugin: bundled files match the upload; nothing to upload"
+    fi
+  done
 }
 
 web() {
@@ -43,6 +153,7 @@ web() {
 }
 
 site() {
+  brand
   step "website"
   # The full-size screenshot (for the README) is scaled to 1920px wide for the site, and the
   # <img> width/height are set to match so the page doesn't shift while it loads.
@@ -128,10 +239,11 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   all)
     msg="${1:?usage: ./deploy.sh all \"MESSAGE\"}"
-    db; workers; web; site; desktop; push "$msg" ;;
+    brand; db; workers; web; site; desktop; plugin; push "$msg" ;;
   sync) sync_upstream "$@" ;;
-  db | workers | web | site | desktop) "$cmd" ;;
+  brand | db | workers | web | site | desktop) "$cmd" ;;
+  plugin) plugin "$@" ;;
   push) push "$@" ;;
   release) release "$@" ;;
-  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,/^set -e/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
