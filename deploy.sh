@@ -96,6 +96,9 @@ release() {
   # Rewrites Cargo.lock for the new versions without upgrading any dependency.
   (cd "$CAT/catalog" && cargo metadata --format-version 1 >/dev/null)
   (cd "$APP/app" && cargo metadata --format-version 1 >/dev/null)
+  # The hosted MCP Worker's tool contract carries the version too; CI fails if it is stale.
+  (cd "$CAT/catalog" && cargo build -q --release --locked --bin biocartoon && python3 ../scripts/build_mcp_metadata.py >/dev/null)
+  grep -q "\"version\": \"$v\"" "$CAT/worker/generated/mcp-metadata.json" || die "mcp-metadata.json: version not bumped"
   grep -m1 '^version' "$CAT/catalog/Cargo.toml" "$APP/app/Cargo.toml"
   grep -c "<string>$v</string>" "$APP/app/bundle_mac.sh" | grep -qx 2 || die "bundle_mac.sh: expected 2 version strings"
   for f in "$CAT/.claude-plugin/plugin.json" "$CAT/.codex-plugin/plugin.json"; do
