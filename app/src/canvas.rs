@@ -1968,7 +1968,7 @@ impl BioCartoon {
                 }
             }
         }
-        response.context_menu(|ui| self.context_menu_ui(ui));
+        response.context_menu(|ui| crate::app::menu_scroll(ui, |ui| self.context_menu_ui(ui)));
         let _ = rect;
     }
 

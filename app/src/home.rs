@@ -597,7 +597,7 @@ impl BioCartoon {
     fn project_menu(&mut self, ui: &mut egui::Ui, dots: Rect, p: &ProjectMeta, row: &egui::Response) {
         let btn = ui.put(dots, egui::Button::new(egui::RichText::new(ph::DOTS_THREE).size(sz(22.0))).frame(false)).on_hover_text("More");
         let mut cmd = None;
-        let mut items = |ui: &mut egui::Ui| {
+        let mut items = |ui: &mut egui::Ui| crate::app::menu_scroll(ui, |ui| {
             ui.set_min_width(sz(210.0));
             // The browser can't hand a file to a mail app.
             for c in ProjectCmd::MENU.into_iter().filter(|&c| c != ProjectCmd::Email || !cfg!(target_arch = "wasm32")) {
@@ -611,7 +611,7 @@ impl BioCartoon {
                     ui.close();
                 }
             }
-        };
+        });
         egui::Popup::menu(&btn).show(&mut items);
         egui::Popup::context_menu(row).show(&mut items);
         if let Some(c) = cmd {

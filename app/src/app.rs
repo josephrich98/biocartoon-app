@@ -480,14 +480,8 @@ pub struct IconsState {
     pub mine_query: String,
     pub mine_filter: SearchFilter,
     pub mine_show_filters: bool,
-    /// The filters are open under the search box.
+    /// The filters are open, under the Filters button at the top of the results.
     pub show_filters: bool,
-    /// While the filters are open: the results' scroll offset last frame, and how far the user has
-    /// scrolled them in one direction since (negative: up), which closes the filters once far enough.
-    pub filters_scroll: Option<(f32, f32)>,
-    /// The filters were just closed by scrolling: how tall they were, and the results' offset then,
-    /// so the next frame can scroll the results back by what the filters gave up and keep them still.
-    pub filters_closed: Option<(f32, f32)>,
     pub results: Vec<AssetRow>,
     /// How many colours the `results` that come in several have, by result id (the others are
     /// picked in Edit once one is placed).
@@ -531,8 +525,6 @@ impl Default for IconsState {
             mine_filter: SearchFilter::default(),
             mine_show_filters: false,
             show_filters: false,
-            filters_scroll: None,
-            filters_closed: None,
             results: Vec::new(),
             colors: HashMap::new(),
             results_req: 0,
@@ -645,6 +637,15 @@ pub(crate) fn dialog_body<R>(ui: &mut egui::Ui, id: egui::Id, body: impl FnOnce(
     };
     ui.data_mut(|d| d.insert_temp(id, size));
     r
+}
+
+/// A context menu's content, which scrolls once it is taller than the screen (a long press on a
+/// phone with large text, where the menu would otherwise run off the bottom).
+pub(crate) fn menu_scroll<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    // As tall as it needs, up to the screen's height, however little room there is under the
+    // finger: the menu then moves up to fit, as it does without the scroll area.
+    let max = ui.ctx().content_rect().height() - 24.0;
+    egui::ScrollArea::vertical().max_height(max).min_scrolled_height(max).auto_shrink([true, true]).show(ui, body).inner
 }
 
 /// Widgets laid out in as few rows as fit the width left, for a grid cell (which can't measure a
@@ -1183,14 +1184,31 @@ fn storage_notice(ctx: &egui::Context, title: &str, what: &str, keep: &str, hide
         ui.add_space(6.0);
         ui.label(egui::RichText::new(format!("To keep them safe, {keep}.")).color(theme::text_dim()));
         ui.add_space(12.0);
-        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 30.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(egui::Button::new(egui::RichText::new("Accept").color(theme::on_accent())).fill(theme::accent()).min_size(Vec2::new(90.0, 30.0)).corner_radius(6)).clicked() {
-                accept = true;
-            }
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.checkbox(hide, "Don't show this message again");
+        let label = "Don't show this message again";
+        let accept_button = |ui: &mut egui::Ui| ui.add(egui::Button::new(egui::RichText::new("Accept").color(theme::on_accent())).fill(theme::accent()).min_size(Vec2::new(90.0, 30.0)).corner_radius(6)).clicked();
+        // The checkbox beside Accept, or above it when they don't both fit (a phone with large text).
+        let accept_w = packed_width(ui, "Accept", false).max(90.0 + ui.spacing().item_spacing.x);
+        if packed_width(ui, label, true) + accept_w > ui.available_width() {
+            ui.scope(|ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.checkbox(hide, label);
             });
-        });
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if accept_button(ui) {
+                    accept = true;
+                }
+            });
+        } else {
+            ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 30.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if accept_button(ui) {
+                    accept = true;
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.checkbox(hide, label);
+                });
+            });
+        }
     });
     open && !accept
 }
@@ -4663,50 +4681,81 @@ impl BioCartoon {
         let size = &self.picture_size;
         let format = &mut self.settings.picture_format;
         let dpi = &mut self.settings.picture_dpi;
+        let phone = phone_width(ctx);
+        // Phones (and large text): the dialog fits the screen's width, its rows wrap, and it
+        // scrolls if it is too tall.
+        let width = dialog_width(ctx, 440.0);
         let modal = egui::Modal::new(egui::Id::new("save_picture_modal")).show(ctx, |ui| {
-            // Keep the header aligned when the controls need more than the minimum width.
-            ui.set_min_width(440.0);
-            ui.horizontal(|ui| {
-                ui.heading("Save as picture");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).on_hover_text("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("Format");
-                for f in [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg] {
-                    ui.selectable_value(format, f, f.label());
-                }
-            });
-            ui.add_enabled_ui(format.is_raster(), |ui| {
+            let body = |ui: &mut egui::Ui| {
+                // Keep the header aligned when the controls need more than the minimum width.
+                ui.set_min_width(width);
+                ui.set_max_width(width);
                 ui.horizontal(|ui| {
+                    ui.heading("Save as picture");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(egui::RichText::new(ph::X).size(16.0)).frame(false)).on_hover_text("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                egui::Grid::new("picture_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                    ui.label("Format");
+                    let formats = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg];
+                    packed_rows(ui, &formats.map(|f| f.label()), false, |ui, i| {
+                        ui.selectable_value(format, formats[i], formats[i].label());
+                    });
+                    ui.end_row();
+
                     ui.label("Resolution (dpi)");
-                    dpi_picker(ui, dpi, egui::Id::new("picture_custom_dpi"), false);
-                });
-            });
-            if let Some(r) = region {
-                ui.horizontal(|ui| {
-                    ui.label("Size");
-                    if format.is_raster() {
-                        pixel_size_fields(ui, r, dpi, egui::Id::new("picture_custom_dpi"), egui::Id::new("picture_px"));
-                        ui.label("px");
-                        ui.label(egui::RichText::new(format!("· {}", size.note(&picture_opts).unwrap_or_else(|| "...".into()))).color(theme::text_dim()));
-                    } else {
-                        // Vector files have no pixels of their own: their size at the slide's 96 px per inch.
-                        let dims = format!("{} × {} px", r.width().round() as u32, r.height().round() as u32);
-                        ui.label(egui::RichText::new(size.line(&dims, &picture_opts)).color(theme::text_dim()));
+                    ui.add_enabled_ui(format.is_raster(), |ui| {
+                        let id = egui::Id::new("picture_custom_dpi");
+                        if phone {
+                            ui.vertical(|ui| dpi_picker(ui, dpi, id, true));
+                        } else {
+                            ui.horizontal(|ui| dpi_picker(ui, dpi, id, false));
+                        }
+                    });
+                    ui.end_row();
+
+                    if let Some(r) = region {
+                        ui.label("Size");
+                        if format.is_raster() {
+                            let note = size.note(&picture_opts).unwrap_or_else(|| "...".into());
+                            let fields = |ui: &mut egui::Ui, dpi: &mut u32| {
+                                pixel_size_fields(ui, r, dpi, egui::Id::new("picture_custom_dpi"), egui::Id::new("picture_px"));
+                                ui.label("px");
+                            };
+                            // Phones: the file size goes under the pixels, so the row never runs off the screen.
+                            if phone {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| fields(ui, dpi));
+                                    ui.label(egui::RichText::new(note).color(theme::text_dim()));
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    fields(ui, dpi);
+                                    ui.label(egui::RichText::new(format!("· {note}")).color(theme::text_dim()));
+                                });
+                            }
+                        } else {
+                            // Vector files have no pixels of their own: their size at the slide's 96 px per inch.
+                            let dims = format!("{} × {} px", r.width().round() as u32, r.height().round() as u32);
+                            ui.add(egui::Label::new(egui::RichText::new(size.line(&dims, &picture_opts)).color(theme::text_dim())).wrap());
+                        }
+                        ui.end_row();
                     }
                 });
-            }
-            ui.add_space(10.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (clicked, entered) = theme::press_on_enter(ui, true, |ui| ui.add(egui::Button::new(egui::RichText::new("Save...").color(theme::on_accent())).fill(theme::accent())).clicked());
-                if clicked || entered { go = true; }
-                if ui.button("Cancel").clicked() { cancel = true; }
-            });
+                ui.add_space(10.0);
+                // Top-aligned: in the phone's scroll area, a centred row centres itself in what is
+                // left of the scroll area, which cuts it off.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    let (clicked, entered) = theme::press_on_enter(ui, true, |ui| ui.add(egui::Button::new(egui::RichText::new("Save...").color(theme::on_accent())).fill(theme::accent())).clicked());
+                    if clicked || entered { go = true; }
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                });
+            };
+            dialog_body(ui, egui::Id::new("save_picture_body"), body);
         });
         self.show_save_picture = !(go || cancel || modal.should_close());
         if self.show_save_picture {
@@ -6307,7 +6356,7 @@ impl BioCartoon {
                                     ui.end_row();
                                 }
                                 ui.label("Text size");
-                                egui::ComboBox::from_id_salt("text_size").selected_text(d.text_size.label()).width(160.0).show_ui(ui, |ui| {
+                                egui::ComboBox::from_id_salt("text_size").selected_text(d.text_size.label()).width(ui.available_width().min(160.0)).truncate().show_ui(ui, |ui| {
                                     for t in theme::TextSize::ALL {
                                         ui.selectable_value(&mut d.text_size, t, t.label());
                                     }
@@ -6330,12 +6379,16 @@ impl BioCartoon {
                                 });
                                 ui.end_row();
                                 ui.label("Saving");
-                                ui.checkbox(&mut d.autosave, "Save changes automatically").on_hover_text("Off: changes are saved only with Cmd+S, and BioCartoon asks before you leave a project or quit with unsaved changes");
+                                // Wraps when the screen is narrow (a phone with large text).
+                                ui.scope(|ui| {
+                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                    ui.checkbox(&mut d.autosave, "Save changes automatically").on_hover_text("Off: changes are saved only with Cmd+S, and BioCartoon asks before you leave a project or quit with unsaved changes");
+                                });
                                 ui.end_row();
                             });
                             ui.add_space(10.0);
                             ui.separator();
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("Restore default settings").on_hover_text("Appearance, icons, grid and snapping, export options and AI prompts go back to their defaults").clicked() {
                                     self.confirm_restore_settings = true;
                                 }
@@ -6349,7 +6402,10 @@ impl BioCartoon {
                         SettingsTab::Ai => {
                             ai_fields(ui, &mut d.ai_provider, &mut d.ai_model, &mut d.api_key, &mut d.ai_base_url);
                             ui.add_space(10.0);
-                            ui.checkbox(&mut d.auto_library_generated, "Automatically add images to your library").on_hover_text("Every image generated with AI goes into Your library as soon as it arrives");
+                            ui.scope(|ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                ui.checkbox(&mut d.auto_library_generated, "Automatically add images to your library").on_hover_text("Every image generated with AI goes into Your library as soon as it arrives");
+                            });
                             ui.add_space(10.0);
                             ui.separator();
                             let svg = d.ai_provider.draws_svg(&d.ai_model);
@@ -6444,7 +6500,10 @@ impl BioCartoon {
         // About
         if self.show_about {
             let mut open = true;
-            egui::Window::new("About").open(&mut open).collapsible(false).resizable(false).default_width(500.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            // Phones (and large text): no wider than the screen, with lines that don't fit broken in two.
+            let width = dialog_width(ctx, 500.0);
+            egui::Window::new("About").open(&mut open).collapsible(false).resizable(false).default_width(width).max_width(width).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                ui.set_max_width(width);
                 ui.vertical_centered(|ui| {
                     ui.add(crate::logo(ui.ctx(), 64.0));
                     ui.label(egui::RichText::new("BioCartoon").size(20.0).strong());
@@ -7464,10 +7523,28 @@ fn ai_prompt_fields(ui: &mut egui::Ui, prompts: &mut AiPrompts, svg: bool) {
 
 /// Provider / model / API key fields shared by the AI setup dialog and the AI settings tab.
 fn ai_fields(ui: &mut egui::Ui, provider: &mut BackendKind, model: &mut String, key: &mut String, base_url: &mut String) {
+    // A text field up to 220 wide with `after` (a link or button) beside it, or under it when they
+    // don't both fit (a phone with large text).
+    let row = |ui: &mut egui::Ui, after_w: f32, field: &mut dyn FnMut(&mut egui::Ui, f32), after: &mut dyn FnMut(&mut egui::Ui)| {
+        let avail = ui.available_width();
+        let beside = avail - after_w - ui.spacing().item_spacing.x;
+        if beside >= 160.0 {
+            ui.horizontal(|ui| {
+                field(ui, beside.min(220.0));
+                after(ui);
+            });
+        } else {
+            ui.vertical(|ui| {
+                field(ui, avail.min(220.0));
+                after(ui);
+            });
+        }
+    };
+    let text_w = |ui: &egui::Ui, t: &str| egui::WidgetText::from(t).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x;
     egui::Grid::new(ui.id().with("ai_fields")).num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
         ui.label("Provider");
         let before = *provider;
-        egui::ComboBox::from_id_salt("ai_provider").selected_text(provider.label()).width(220.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("ai_provider").selected_text(provider.label()).width(ui.available_width().min(220.0)).truncate().show_ui(ui, |ui| {
             for k in BackendKind::ALL {
                 ui.selectable_value(provider, k, k.label());
             }
@@ -7480,43 +7557,45 @@ fn ai_fields(ui: &mut egui::Ui, provider: &mut BackendKind, model: &mut String, 
         // vLLM serves the model it was started with and needs no key.
         if provider.self_hosted() {
             ui.label("Server URL");
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(base_url).hint_text("http://localhost:8000").desired_width(220.0));
-                ui.hyperlink_to("Docs", provider.key_url());
-            });
+            let link_w = text_w(ui, "Docs");
+            row(ui, link_w, &mut |ui, w| { ui.add(egui::TextEdit::singleline(base_url).hint_text("http://localhost:8000").desired_width(w)); }, &mut |ui| { ui.hyperlink_to("Docs", provider.key_url()); });
             ui.end_row();
             // The web app's CSP (csp.py) only reaches localhost, and the server must allow its origin.
             if cfg!(target_arch = "wasm32") {
                 ui.label("");
-                ui.label(
+                ui.add(egui::Label::new(
                     egui::RichText::new("Start vLLM with --allowed-origins '[\"https://app.biocartoon.com\"]',\nthen enter http://localhost:8000.")
                         .small()
                         .color(theme::text_dim()),
-                );
+                ).wrap());
                 ui.end_row();
             }
             return;
         }
 
         ui.label("Model");
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(model).desired_width(220.0));
+        let caret_w = text_w(ui, ph::CARET_DOWN) + 2.0 * ui.spacing().button_padding.x;
+        let models = provider.models();
+        let mut picked = None;
+        row(ui, caret_w, &mut |ui, w| { ui.add(egui::TextEdit::singleline(model).desired_width(w)); }, &mut |ui| {
             ui.menu_button(ph::CARET_DOWN, |ui| {
-                for m in provider.models() {
+                for m in models {
                     if ui.button(*m).clicked() {
-                        *model = (*m).into();
+                        picked = Some(*m);
                         ui.close();
                     }
                 }
             });
         });
+        if let Some(m) = picked {
+            *model = m.into();
+        }
         ui.end_row();
 
         ui.label("API key");
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(key).password(true).hint_text("Paste your key").desired_width(220.0));
-            ui.hyperlink_to("Get a key", provider.key_url());
-        });
+        let link_w = text_w(ui, "Get a key");
+        let url = provider.key_url();
+        row(ui, link_w, &mut |ui, w| { ui.add(egui::TextEdit::singleline(key).password(true).hint_text("Paste your key").desired_width(w)); }, &mut |ui| { ui.hyperlink_to("Get a key", url); });
         ui.end_row();
     });
 }
@@ -7530,6 +7609,26 @@ fn linked_line(ui: &mut egui::Ui, text: &str, link: &str, url: &str) {
 fn linked_line_with_suffix(ui: &mut egui::Ui, text: &str, link: &str, url: &str, suffix: &str) {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let w = ui.fonts_mut(|f| f.layout_no_wrap(format!("{text}{link}{suffix}"), font, Color32::WHITE).size().x);
+    // Too wide for one line (a phone, or large text): the text, then the link under it, each centered.
+    if w > ui.available_width() {
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.add(egui::Label::new(text.trim_end()).wrap());
+            if suffix.is_empty() {
+                // On its own, so a link wider than the screen wraps too.
+                ui.hyperlink_to(link, url);
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let lw = ui.fonts_mut(|f| f.layout_no_wrap(format!("{link}{suffix}"), egui::TextStyle::Body.resolve(ui.style()), Color32::WHITE).size().x);
+                    ui.add_space(((ui.available_width() - lw) / 2.0).max(0.0));
+                    ui.hyperlink_to(link, url);
+                    ui.label(suffix);
+                });
+            }
+        });
+        return;
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));

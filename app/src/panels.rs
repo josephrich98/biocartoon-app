@@ -152,36 +152,22 @@ impl BioCartoon {
                     IconsMode::Library => Some("Search your library"),
                     _ => None,
                 };
-                // Where the open filters are, if they are, so scrolling the results can close them.
-                let mut open_filters: Option<Rect> = None;
-                let top = ui.cursor().top();
+                // The set filters' summary stays in view; the open filters head the results (see
+                // `results_grid`), under the Filters button, and scroll away with them.
                 if self.icons.mode == IconsMode::Search {
                     self.search_box(ui);
                     ui.add_space(4.0);
-                    let top = ui.cursor().top();
-                    let open = self.icons.show_filters;
                     self.search_filters(ui);
-                    open_filters = open.then(|| Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top()));
                 } else if let Some(hint) = mine {
                     self.mine_search_box(ui, hint);
                     ui.add_space(4.0);
-                    let top = ui.cursor().top();
-                    let open = self.icons.mine_show_filters;
                     self.mine_filters(ui);
-                    open_filters = open.then(|| Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top()));
                 }
-                let header_h = ui.cursor().top() - top;
                 let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).max_width(ui.available_width());
                 let to = self.icons.scroll_to.take();
-                let closed = self.icons.filters_closed.take();
                 if to == Some(egui::Align::Min) {
                     scroll = scroll.vertical_scroll_offset(0.0);
-                } else if let Some((h, offset)) = closed {
-                    // The results' view grew by what the filters gave up; scroll back by as much.
-                    scroll = scroll.vertical_scroll_offset((offset - (h - header_h)).max(0.0));
                 }
-                // Read first: the scroll area uses up whatever wheel input it acts on.
-                let wheel = ui.input(|i| i.smooth_scroll_delta.y);
                 let out = scroll.show(ui, |ui| {
                     self.icons_panel(ui);
                     if to == Some(egui::Align::Max) {
@@ -189,46 +175,11 @@ impl BioCartoon {
                     }
                 });
                 (scrolled, view_h) = (out.state.offset.y, out.inner_rect.height());
-                let over_results = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| out.inner_rect.contains(p));
-                let wheel = if over_results { wheel } else { 0.0 };
-                let dragging = ui.ctx().dragged_id().is_some() || out.state.velocity().y != 0.0;
-                self.close_filters_on_scroll(ui.ctx(), open_filters, header_h, scrolled, wheel, dragging);
             })
             .response
             .rect
         });
         self.back_to_top(ui.ctx(), panel.inner, scrolled > view_h);
-    }
-
-    /// Scrolling the results up or down past the open filters (`filters`, where they are) closes
-    /// them to their one-line summary, as they're done with; the results keep still as the filters
-    /// shrink (see `filters_closed`). Not while a filter is being edited (a dropdown open, or a
-    /// field typed in). Only the user's scrolling counts (`wheel`, the wheel input over the results,
-    /// or `dragging` them or their scrollbar): the offset also jumps when new results are shorter.
-    fn close_filters_on_scroll(&mut self, ctx: &egui::Context, filters: Option<Rect>, header_h: f32, offset: f32, wheel: f32, dragging: bool) {
-        const DISTANCE: f32 = 24.0;
-        let Some(filters) = filters else {
-            self.icons.filters_scroll = None;
-            return;
-        };
-        let editing = ctx.any_popup_open()
-            || ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id)).is_some_and(|r| filters.intersects(r.rect));
-        let (last, travel) = self.icons.filters_scroll.unwrap_or((offset, 0.0));
-        // The wheel counts even at the end of the list, where the offset can't move.
-        let step = if wheel != 0.0 { -wheel } else if dragging { offset - last } else { 0.0 };
-        let travel = if editing { 0.0 } else { scroll_travel(travel, step) };
-        if travel.abs() < DISTANCE {
-            self.icons.filters_scroll = Some((offset, travel));
-            return;
-        }
-        if self.icons.mode == IconsMode::Search {
-            self.icons.show_filters = false;
-        } else {
-            self.icons.mine_show_filters = false;
-        }
-        self.icons.filters_scroll = None;
-        self.icons.filters_closed = Some((header_h, offset));
-        ctx.request_repaint();
     }
 
     /// A circled up arrow that appears once the Icons panel has scrolled down a screen, and goes
@@ -662,12 +613,6 @@ impl BioCartoon {
                 ui.data_mut(|d| d.insert_temp(row_id, measured));
                 ui.ctx().request_repaint();
             }
-            if f.active() > 0 {
-                ui.add_space(2.0);
-                if ui.small_button(format!("{}  Clear filters", ph::FUNNEL_X)).clicked() {
-                    *f = Default::default();
-                }
-            }
         });
         ui.add_space(4.0);
     }
@@ -749,7 +694,8 @@ impl BioCartoon {
     }
 
     /// At the top of the results, under the search box (or Favorites' and Your library's): the
-    /// Filters button, and Sort at the right. It scrolls away with the results.
+    /// Filters button, whose filters open beneath it so it stays put, and Sort at the right. It
+    /// scrolls away with the results.
     fn filter_sort_row(&mut self, ui: &mut egui::Ui, mine: bool) {
         control_row(ui, if mine { "mine_filter_sort" } else { "filter_sort" }, |ui| {
             let (n, open) = if mine { (self.icons.mine_filter.active(), self.icons.mine_show_filters) } else { (self.icons.filter.active(), self.icons.show_filters) };
@@ -918,16 +864,15 @@ impl BioCartoon {
         }
     }
 
-    /// The search's filters when open, else what they keep, as a reminder; clicking opens them.
+    /// Above the results while any of the search's filters is set, open or closed (so nothing moves
+    /// when they're toggled): what they keep, and Clear filters; clicking the summary toggles them.
     fn search_filters(&mut self, ui: &mut egui::Ui) {
-        if self.icons.show_filters {
-            self.filters_panel(ui, false);
-        } else if self.icons.filter.active() > 0 {
+        if self.icons.filter.active() > 0 {
             let summary = self.filter_summary(false);
             ui.horizontal_wrapped(|ui| {
                 let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
                 if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.icons.show_filters = true;
+                    self.icons.show_filters = !self.icons.show_filters;
                 }
                 let clear = egui::Label::new(egui::RichText::new("Clear filters").small().underline().color(theme::text_dim())).sense(Sense::click());
                 if ui.add(clear).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -937,16 +882,14 @@ impl BioCartoon {
         }
     }
 
-    /// Favorites' or Your library's filters when open, else what they keep, as the search's are.
+    /// Favorites' or Your library's filter summary while any of their filters is set, as the search's is.
     fn mine_filters(&mut self, ui: &mut egui::Ui) {
-        if self.icons.mine_show_filters {
-            self.filters_panel(ui, true);
-        } else if self.icons.mine_filter.active() > 0 {
+        if self.icons.mine_filter.active() > 0 {
             let summary = self.filter_summary(true);
             ui.horizontal_wrapped(|ui| {
                 let l = egui::Label::new(egui::RichText::new(format!("{}  {summary}", ph::FUNNEL)).small().color(theme::text_dim())).sense(Sense::click());
                 if ui.add(l).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.icons.mine_show_filters = true;
+                    self.icons.mine_show_filters = !self.icons.mine_show_filters;
                 }
                 let clear = egui::Label::new(egui::RichText::new("Clear filters").small().underline().color(theme::text_dim())).sense(Sense::click());
                 if ui.add(clear).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -1115,10 +1058,16 @@ impl BioCartoon {
             self.icons.results.clone()
         };
         let shown_total = if mine { Some(shown.len() as i64) } else { self.icons.total };
-        // Filters and Sort head the results and scroll away with them; the funnel in the search box
-        // (and the summary of the set filters) stays in view above.
-        self.filter_sort_row(ui, self.icons.mode != IconsMode::Search);
+        // Filters and Sort head the results, with the open filters beneath them so the buttons stay
+        // put, and all scroll away with the results; the funnel in the search box (and the summary
+        // of the set filters) stays in view above.
+        let mine_filters = self.icons.mode != IconsMode::Search;
+        self.filter_sort_row(ui, mine_filters);
         ui.add_space(2.0);
+        if (mine_filters && self.icons.mine_show_filters) || (!mine_filters && self.icons.show_filters) {
+            self.filters_panel(ui, mine_filters);
+            ui.add_space(4.0);
+        }
         if let Some(e) = &self.icons.error {
             ui.label(egui::RichText::new(e).color(Color32::from_rgb(230, 120, 120)));
         }
@@ -1410,7 +1359,7 @@ impl BioCartoon {
         if r.clicked() {
             self.actions.push(if on_star { Action::ToggleFavorite(row.meta.id.clone()) } else { Action::UseSavedTemplate(row.clone()) });
         }
-        r.context_menu(|ui| {
+        r.context_menu(|ui| crate::app::menu_scroll(ui, |ui| {
             info(ui);
             ui.separator();
             if ui.button(format!("{}  {}", ph::STAR, if fav { "Unfavorite" } else { "Favorite" })).clicked() {
@@ -1437,7 +1386,7 @@ impl BioCartoon {
                 self.actions.push(Action::RemoveTemplate(row.meta.id.clone()));
                 ui.close();
             }
-        });
+        }));
     }
 
     /// Thumbnail of a built-in slide format, as shown in the new-slide dropdown.
@@ -1752,11 +1701,13 @@ impl BioCartoon {
 
     fn shapes_panel(&mut self, ui: &mut egui::Ui) {
         let per_row = 3;
+        // Narrower tiles when three don't fit (a phone with large text, whose wider rail leaves less room).
+        let tile = ((ui.available_width() - 6.0 * (per_row - 1) as f32) / per_row as f32).floor().clamp(48.0, TILE);
         egui::Grid::new("shapes").spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, k) in ShapeKind::ALL.iter().enumerate() {
-                let (rect, r) = ui.allocate_exact_size(Vec2::new(TILE, 80.0), Sense::click());
+                let (rect, r) = ui.allocate_exact_size(Vec2::new(tile, 80.0), Sense::click());
                 ui.painter().rect_filled(rect, 8.0, if r.hovered() { theme::hover() } else { theme::panel_raised() });
-                let it = crate::doc::Item::new(0, "", ItemKind::Shape { shape: *k, fill: [120, 170, 230, 255], stroke: [200, 220, 255, 255], stroke_width: 1.5 }, Pos2::new(24.0, 8.0), Vec2::new(TILE - 48.0, 48.0));
+                let it = crate::doc::Item::new(0, "", ItemKind::Shape { shape: *k, fill: [120, 170, 230, 255], stroke: [200, 220, 255, 255], stroke_width: 1.5 }, Pos2::new((tile - 48.0) / 2.0, 8.0), Vec2::splat(48.0));
                 let xf = Xform { origin: rect.min, zoom: 1.0 };
                 crate::canvas::draw_item(&ui.painter_at(rect), &xf, &it, &mut self.images, None);
                 ui.painter().text(Pos2::new(rect.center().x, rect.max.y - 10.0), egui::Align2::CENTER_CENTER, k.label(), FontId::proportional(10.0), theme::text_dim());
@@ -2612,11 +2563,6 @@ impl BioCartoon {
 // ---------- widgets ----------
 
 /// A full-width on/off row: highlighted while on, with its icon crossed out while off.
-/// How far a scroll has gone in one direction after a `step` more: turning back starts over.
-fn scroll_travel(travel: f32, step: f32) -> f32 {
-    if step * travel < 0.0 { step } else { travel + step }
-}
-
 fn toggle_row(ui: &mut egui::Ui, icon: &str, label: &str, on: bool) -> egui::Response {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), font.size + 18.0), Sense::click());
@@ -3004,7 +2950,7 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, images: &mut crate::
     };
     // A long press opens the context menu too, so the info goes there for touch screens.
     let r = r.on_hover_ui(info);
-    r.context_menu(|ui| {
+    r.context_menu(|ui| crate::app::menu_scroll(ui, |ui| {
         info(ui);
         ui.separator();
         if ui.button(format!("{}  {}", ph::STAR, if fav { "Unfavorite" } else { "Favorite" })).clicked() {
@@ -3054,7 +3000,7 @@ fn asset_tile(ui: &mut egui::Ui, size: f32, row: &AssetRow, images: &mut crate::
                 ui.close();
             }
         }
-    });
+    }));
     if let ImgState::Failed(e) = images.get(&crate::assets::ImageCache::tile_key(row)).unwrap_or(&ImgState::Loading) {
         let e = e.clone();
         return (r.on_hover_text(e), act);
@@ -4241,15 +4187,6 @@ pub fn layer_grid(ui: &mut egui::Ui, id_salt: &str, rows: &mut Vec<EditLayer>, u
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scroll_travel_adds_up_one_way_and_restarts_on_turning_back() {
-        assert_eq!(scroll_travel(10.0, 5.0), 15.0);
-        assert_eq!(scroll_travel(-10.0, -5.0), -15.0);
-        assert_eq!(scroll_travel(20.0, -3.0), -3.0);
-        assert_eq!(scroll_travel(-20.0, 3.0), 3.0);
-        assert_eq!(scroll_travel(7.0, 0.0), 7.0);
-    }
 
     fn fav(id: &str, title: &str, source: &str, svg: bool, taxa: Vec<crate::taxonomy::Taxon>, tags: &[&str]) -> AssetRow {
         AssetRow {

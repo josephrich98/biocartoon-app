@@ -4,7 +4,7 @@
 
 # BioCartoon app
 
-BioCartoon is a free and open-source tool for creating biology figures with illustrations. We compile existing open biology-focused illustration resources and introduce our own illustrations in a single database with a graphical interface for search and figure generation.
+BioCartoon is a free and open-source tool for creating bio cartoons and biology figures. We compile existing open biology-focused illustration resources and introduce our own illustrations in a single database with a graphical interface for search and figure generation.
 
 This repository holds the source code for the desktop app, web app, and website. The icon database and the `biocartoon` command-line interface are in [biocartoon](https://github.com/josephrich98/biocartoon).
 
