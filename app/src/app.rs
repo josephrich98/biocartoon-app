@@ -4684,7 +4684,7 @@ impl BioCartoon {
         let phone = phone_width(ctx);
         // Phones (and large text): the dialog fits the screen's width, its rows wrap, and it
         // scrolls if it is too tall.
-        let width = dialog_width(ctx, 440.0);
+        let width = dialog_width(ctx, 480.0);
         let modal = egui::Modal::new(egui::Id::new("save_picture_modal")).show(ctx, |ui| {
             let body = |ui: &mut egui::Ui| {
                 // Keep the header aligned when the controls need more than the minimum width.
