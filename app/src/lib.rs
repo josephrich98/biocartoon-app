@@ -16,6 +16,7 @@ pub mod credits;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control;
 pub mod doc;
+pub mod eps;
 pub mod export;
 pub mod home;
 pub mod latex;

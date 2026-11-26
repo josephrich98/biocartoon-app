@@ -655,6 +655,13 @@ pub(crate) fn packed_rows(ui: &mut egui::Ui, texts: &[&str], checkbox: bool, add
     packed_rows_by_width(ui, &widths, add);
 }
 
+/// A format button's tooltip, for the formats with a catch.
+fn format_hint(r: egui::Response, format: ExportFormat) {
+    if format == ExportFormat::Eps {
+        r.on_hover_text("Encapsulated PostScript, for journals that ask for it. PostScript has no transparency: faded items are drawn at full strength.");
+    }
+}
+
 /// The room a button (or checkbox) labelled `text` takes in `packed_rows`, spacing included.
 fn packed_width(ui: &egui::Ui, text: &str, checkbox: bool) -> f32 {
     let st = &ui.style().spacing;
@@ -4701,9 +4708,9 @@ impl BioCartoon {
                 ui.add_space(8.0);
                 egui::Grid::new("picture_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                     ui.label("Format");
-                    let formats = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg];
+                    let formats = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Eps];
                     packed_rows(ui, &formats.map(|f| f.label()), false, |ui, i| {
-                        ui.selectable_value(format, formats[i], formats[i].label());
+                        format_hint(ui.selectable_value(format, formats[i], formats[i].label()), formats[i]);
                     });
                     ui.end_row();
 
@@ -4944,7 +4951,7 @@ impl BioCartoon {
                     // In as many rows as the dialog's width needs (on a phone, or with large text).
                     let formats = ExportFormat::ALL;
                     packed_rows(ui, &formats.map(|f| f.label()), false, |ui, i| {
-                        ui.selectable_value(&mut opts.format, formats[i], formats[i].label());
+                        format_hint(ui.selectable_value(&mut opts.format, formats[i], formats[i].label()), formats[i]);
                     });
                     ui.end_row();
 
@@ -5018,7 +5025,10 @@ impl BioCartoon {
                     if !opts.format.is_raster() && !deck {
                         let note = if opts.format == ExportFormat::Pdf && opts.pdf_raster { "Vector text and shapes; images at the resolution above." } else { "Vector output: scales to any size." };
                         ui.label("");
-                        ui.label(egui::RichText::new(note).color(theme::text_dim()));
+                        // Wrap within the dialog's width instead of stretching it (phones).
+                        ui.allocate_ui(egui::vec2((width - 110.0).min(360.0), 0.0), |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(note).color(theme::text_dim())).wrap());
+                        });
                         ui.end_row();
                     }
 

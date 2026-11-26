@@ -1,6 +1,6 @@
 //! Slide export. The slide (or each image on it) is written out as SVG, which is then either saved
-//! as-is, rasterised with resvg (PNG / JPEG / TIFF at any DPI) or converted with svg2pdf (PDF;
-//! several slides go into one PDF, a page each).
+//! as-is, rasterised with resvg (PNG / JPEG / TIFF at any DPI), converted with svg2pdf (PDF;
+//! several slides go into one PDF, a page each) or written as PostScript (EPS, see `crate::eps`).
 //! Geometry mirrors `canvas::draw_item` at zoom 1, and text is laid out with egui's own fonts so
 //! line breaks match the canvas. Runs on a worker thread.
 
@@ -27,6 +27,8 @@ pub enum ExportFormat {
     Tif,
     Pdf,
     Svg,
+    /// Encapsulated PostScript, for journals that ask for it (see [`crate::eps`]).
+    Eps,
     /// A PowerPoint deck, every item a picture of its own (see [`crate::pptx`]).
     Pptx,
     /// The editable project file (see [`crate::projects::to_file`]), written by the app rather than
@@ -37,9 +39,9 @@ pub enum ExportFormat {
 impl ExportFormat {
     /// Whether a file of this type can leave the background out (a JPEG can't).
     pub fn can_be_transparent(self) -> bool {
-        matches!(self, ExportFormat::Png | ExportFormat::Tif | ExportFormat::Pdf | ExportFormat::Svg)
+        matches!(self, ExportFormat::Png | ExportFormat::Tif | ExportFormat::Pdf | ExportFormat::Svg | ExportFormat::Eps)
     }
-    pub const ALL: [ExportFormat; 7] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Pptx, ExportFormat::Biocartoon];
+    pub const ALL: [ExportFormat; 8] = [ExportFormat::Png, ExportFormat::Jpg, ExportFormat::Tif, ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Eps, ExportFormat::Pptx, ExportFormat::Biocartoon];
     pub fn label(self) -> &'static str {
         match self {
             ExportFormat::Png => "PNG",
@@ -47,6 +49,7 @@ impl ExportFormat {
             ExportFormat::Tif => "TIFF",
             ExportFormat::Pdf => "PDF",
             ExportFormat::Svg => "SVG",
+            ExportFormat::Eps => "EPS",
             ExportFormat::Pptx => "PPTX",
             ExportFormat::Biocartoon => "BioCartoon",
         }
@@ -58,6 +61,7 @@ impl ExportFormat {
             ExportFormat::Tif => "tif",
             ExportFormat::Pdf => "pdf",
             ExportFormat::Svg => "svg",
+            ExportFormat::Eps => "eps",
             ExportFormat::Pptx => "pptx",
             ExportFormat::Biocartoon => "biocartoon",
         }
@@ -72,6 +76,7 @@ impl ExportFormat {
             "tif" | "tiff" => Some(ExportFormat::Tif),
             "pdf" => Some(ExportFormat::Pdf),
             "svg" => Some(ExportFormat::Svg),
+            "eps" => Some(ExportFormat::Eps),
             "pptx" => Some(ExportFormat::Pptx),
             "biocartoon" => Some(ExportFormat::Biocartoon),
             _ => None,
@@ -85,7 +90,7 @@ pub struct ExportOptions {
     pub format: ExportFormat,
     /// Raster formats, and PDF images when `pdf_raster` is on.
     pub dpi: u32,
-    /// Leave the slide background out (formats that can be see-through: PNG, TIFF, PDF, SVG).
+    /// Leave the slide background out (formats that can be see-through: PNG, TIFF, PDF, SVG, EPS).
     pub transparent: bool,
     /// One file per image item, cropped to its bounding box, instead of the whole slide.
     pub individual: bool,
@@ -346,10 +351,22 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
     if opts.format == ExportFormat::Pptx {
         return render_pptx(ctx, job, &images, missing, out);
     }
+    // EPS has no transparency: items are drawn at full strength (see crate::eps).
+    let opaque: Vec<(usize, Slide)>;
+    let slides = if opts.format == ExportFormat::Eps {
+        opaque = job.slides.iter().map(|(n, s)| {
+            let mut s = s.clone();
+            s.items.iter_mut().for_each(|it| it.opacity = 1.0);
+            (*n, s)
+        }).collect();
+        &opaque
+    } else {
+        &job.slides
+    };
     let transparent = opts.format.can_be_transparent() && opts.transparent;
     let raster = (opts.format == ExportFormat::Pdf && opts.pdf_raster).then(|| opts.dpi.clamp(MIN_DPI, MAX_DPI));
     let mut written = Vec::new();
-    let multi = job.slides.len() > 1;
+    let multi = slides.len() > 1;
     let dir = job.path.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = job.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
     // One PDF with a page per slide: collect the pages, write them after the loop.
@@ -358,11 +375,11 @@ fn render(ctx: &egui::Context, job: &ExportJob, max_pixels: Option<u64>, out: &m
         1
     } else {
         let count = |s: &Slide| s.items.iter().filter(|it| matches!(it.kind, ItemKind::Image { .. })).count();
-        job.slides.iter().map(|(_, s)| if opts.individual { count(s) } else if opts.crop { (count(s) > 0) as usize } else { 1 }).sum()
+        slides.iter().map(|(_, s)| if opts.individual { count(s) } else if opts.crop { (count(s) > 0) as usize } else { 1 }).sum()
     };
     job.progress.total.store(total, Ordering::Relaxed);
     let mut pages = Vec::new();
-    for (n, slide) in &job.slides {
+    for (n, slide) in slides {
         if job.progress.cancelled() {
             return Err(CANCELLED.into());
         }
@@ -1798,6 +1815,7 @@ fn encode(svg: &str, region: Rect, opts: &ExportOptions, dpi: u32, credits: &str
         ExportFormat::Svg => svg.as_bytes().to_vec(),
         ExportFormat::Biocartoon => return Err("A .biocartoon file is a project, not a rendered slide".into()),
         ExportFormat::Pptx => return Err("A deck is written by render_pptx".into()),
+        ExportFormat::Eps => crate::eps::from_tree(&parse(svg)?, credits),
         ExportFormat::Pdf => {
             let tree = parse(svg)?;
             svg2pdf::to_pdf(&tree, svg2pdf::ConversionOptions::default(), svg2pdf::PageOptions { dpi: DPI }).map_err(|e| err(&e))?
