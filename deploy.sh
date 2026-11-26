@@ -116,7 +116,10 @@ plugin() {
     return
   fi
   step "assistant plugin packages"
-  (cd "$CAT" && python3 scripts/package_plugin.py && python3 scripts/package_claude_plugin.py)
+  # The -public-draft ZIP is the ChatGPT portal upload: the plugin plus submission/'s listing, review
+  # cases and assets. The plain biocartoon-<version>.zip is the bare plugin.
+  (cd "$CAT" && python3 scripts/package_plugin.py && python3 scripts/package_plugin.py --submission \
+    && python3 scripts/package_claude_plugin.py)
   echo "live on deploy:mcp: tools, server instructions, gallery (ChatGPT, Claude, Claude Code, Codex)"
 
   local warn='\033[33mwarning:\033[0m' changed last
@@ -130,7 +133,7 @@ plugin() {
   local label tag paths file which
   for label in ChatGPT Claude; do
     if [ "$label" = ChatGPT ]; then
-      tag=plugin-portal; paths=("${CHATGPT_FROZEN[@]}"); file="dist/biocartoon-<version>.zip -> the OpenAI portal"; which=chatgpt
+      tag=plugin-portal; paths=("${CHATGPT_FROZEN[@]}"); file="dist/biocartoon-<version>-public-draft.zip -> the OpenAI portal"; which=chatgpt
     else
       tag=claude-plugin-portal; paths=("${CLAUDE_FROZEN[@]}"); file="dist/biocartoon-claude-<version>.zip -> the Claude plugin upload"; which=claude
     fi
