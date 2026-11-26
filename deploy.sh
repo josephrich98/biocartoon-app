@@ -4,7 +4,7 @@
 #   ./deploy.sh all "MESSAGE"     brand + db + workers + web + site + desktop + plugin, then push both repos
 #   ./deploy.sh brand             copy the logo and its renders from app/assets/ to site/public/ and biocartoon/brand/
 #   ./deploy.sh sync [--apply]    new upstream icons -> master DB (dry run without --apply; --apply also runs db)
-#   ./deploy.sh db                master DB -> R2 (also merges approved app uploads, rewrites both READMEs)
+#   ./deploy.sh db                master DB -> R2 (also merges approved app uploads, rewrites the READMEs, site table and icon counts)
 #   ./deploy.sh workers           D1 migrations, then the submit + review + MCP Workers (regenerates MCP metadata)
 #   ./deploy.sh plugin            build the ChatGPT + Claude plugin ZIPs; warn what needs a release or an upload
 #   ./deploy.sh plugin --uploaded [chatgpt|claude]   mark HEAD as uploaded (moves the portal tag; default both)

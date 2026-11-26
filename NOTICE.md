@@ -36,9 +36,11 @@ creator for CC BY items and share adaptations of CC BY-SA items under CC BY-SA.
 | [Health Icons](https://healthicons.org) | CC0 |
 | [Noto Emoji](https://github.com/googlefonts/noto-emoji) | Apache 2.0 (flags: Public Domain) |
 | [OpenMoji](https://openmoji.org) | CC BY-SA 4.0 |
+| [PhyloPic](https://www.phylopic.org) | CC0 / Public Domain / CC BY / CC BY-SA (per image; the non-commercial ones are left out) |
 | [Reactome icon library](https://reactome.org/icon-lib) | CC BY 4.0 |
 | [SciDraw](https://scidraw.io) | CC BY / CC0 (per item) |
 | [Servier Medical Art](https://smart.servier.com) | CC BY 4.0 |
+| [TogoTV (DBCLS)](https://togotv.dbcls.jp/en/pics.html) | CC BY 4.0 |
 
 ## User-contributed artwork
 

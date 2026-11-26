@@ -469,6 +469,8 @@ pub fn source_badge(source: &str) -> (&'static str, Color32, &'static str) {
         "scidraw" => Color32::from_rgb(0xe6, 0x7e, 0x22),
         "healthicons" => Color32::from_rgb(0x16, 0xa0, 0x85),
         "reactome" => Color32::from_rgb(0xc0, 0x39, 0x2b),
+        "togotv" => Color32::from_rgb(0x00, 0xac, 0xc1),
+        "phylopic" => Color32::from_rgb(0x6d, 0x4c, 0x41),
         "openmoji" => Color32::from_rgb(0xf1, 0xc4, 0x0f),
         "noto" => Color32::from_rgb(0xe9, 0x1e, 0x63),
         "user" => Color32::from_rgb(0x9e, 0x9e, 0x9e),
